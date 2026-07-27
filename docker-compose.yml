@@ -1,0 +1,49 @@
+# Local development services. Production uses managed equivalents — but the Redis
+# settings below are requirements, not local conveniences. See .claude/skills/queues-redis/SKILL.md §1.
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: mer-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mer
+      POSTGRES_PASSWORD: mer_local_dev
+      POSTGRES_DB: mer
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U mer -d mer']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: mer-redis
+    restart: unless-stopped
+    # --appendonly yes       BullMQ keeps delayed jobs in Redis. Without persistence,
+    #                        a restart silently drops every scheduled follow-up. No error.
+    # --maxmemory-policy     Default eviction on managed Redis is often allkeys-lru, which
+    #   noeviction           evicts job data under memory pressure. noeviction turns memory
+    #                        pressure into a loud failure instead of silent data loss.
+    command: >
+      redis-server
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory-policy noeviction
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  postgres-data:
+  redis-data:

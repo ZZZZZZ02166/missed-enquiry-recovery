@@ -40,10 +40,10 @@ Submit early. Approval is not instant and is the critical path for everything do
 
 ## 4. Numbers
 
-| Purpose | Type | Approx. cost |
-|---|---|---|
-| Inbound forwarded calls | AU local, voice-capable | ~US$3/mo |
-| Two-way SMS | AU mobile, SMS-capable | ~US$8.25/mo |
+| Purpose                 | Type                    | Approx. cost |
+| ----------------------- | ----------------------- | ------------ |
+| Inbound forwarded calls | AU local, voice-capable | ~US$3/mo     |
+| Two-way SMS             | AU mobile, SMS-capable  | ~US$8.25/mo  |
 
 - [ ] **Verify capabilities before buying.** Not every AU number does both voice and SMS, and the
       inventory changes.
@@ -55,12 +55,12 @@ Submit early. Approval is not instant and is the critical path for everything do
 
 Per number:
 
-| Event | URL | Method |
-|---|---|---|
-| Voice — a call comes in | `https://api.<domain>/webhooks/twilio/voice/incoming` | POST |
-| Voice — status callback | `https://api.<domain>/webhooks/twilio/voice/status` | POST |
-| Messaging — a message comes in | `https://api.<domain>/webhooks/twilio/messages/incoming` | POST |
-| Messaging — status callback | set per-message via `statusCallback` | POST |
+| Event                          | URL                                                      | Method |
+| ------------------------------ | -------------------------------------------------------- | ------ |
+| Voice — a call comes in        | `https://api.<domain>/webhooks/twilio/voice/incoming`    | POST   |
+| Voice — status callback        | `https://api.<domain>/webhooks/twilio/voice/status`      | POST   |
+| Messaging — a message comes in | `https://api.<domain>/webhooks/twilio/messages/incoming` | POST   |
+| Messaging — status callback    | set per-message via `statusCallback`                     | POST   |
 
 - [ ] Set the **primary handler fallback URL** too. Without it, a deploy blip means the caller hears a
       Twilio error tone instead of our greeting.

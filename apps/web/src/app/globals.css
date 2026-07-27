@@ -1,0 +1,56 @@
+/* Minimal reset. Visual design is deliberately deferred until there are real
+   screens to design — see .claude/skills/frontend/SKILL.md §4 for the MVP routes. */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+* {
+  margin: 0;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  min-height: 100dvh;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+  font-family:
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    sans-serif;
+}
+
+img,
+picture,
+video,
+canvas,
+svg {
+  display: block;
+  max-width: 100%;
+}
+
+input,
+button,
+textarea,
+select {
+  font: inherit;
+}
+
+/* Primary actions are tapped by a thumb, outdoors, in a hurry. 44px is the floor. */
+button,
+a[role='button'] {
+  min-height: 44px;
+}
+
+@media (prefers-color-scheme: dark) {
+  body {
+    background: #0b0d0e;
+    color: #e8eaed;
+  }
+}

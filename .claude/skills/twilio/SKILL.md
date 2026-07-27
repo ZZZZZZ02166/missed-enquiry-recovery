@@ -15,12 +15,12 @@ qualification.** Assumes the locked decisions in `CLAUDE.md` — no voicemail, n
 A missed call reaches us because the business's carrier forwarded it. Twilio sees an ordinary inbound
 call:
 
-| Param | Value |
-|---|---|
-| `From` | the original caller — **verify per carrier**, this is the go/no-go assumption (`docs/carrier-forwarding-test.md`) |
-| `To` | our Twilio number |
-| `ForwardedFrom` | the business's number *when the carrier supplies a diversion header* — inconsistently populated on AU PSTN. Never depend on it. |
-| `CallSid` | idempotency key for the call |
+| Param           | Value                                                                                                                           |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `From`          | the original caller — **verify per carrier**, this is the go/no-go assumption (`docs/carrier-forwarding-test.md`)               |
+| `To`            | our Twilio number                                                                                                               |
+| `ForwardedFrom` | the business's number _when the carrier supplies a diversion header_ — inconsistently populated on AU PSTN. Never depend on it. |
+| `CallSid`       | idempotency key for the call                                                                                                    |
 
 Respond immediately with TwiML. One line, then hang up:
 
@@ -74,6 +74,7 @@ Pinning `PUBLIC_API_URL` in env and building the URL from that is more predictab
 Whichever you choose, log the reconstructed URL on failure — otherwise this costs an afternoon.
 
 Other requirements:
+
 - The `urlencoded` body parser must have run; `req.body` must be the parsed params.
 - Configure `rawBody: true` on the Nest app. Not needed for form-encoded webhooks, but required for
   Twilio payloads that arrive as JSON with a `bodySHA256` query param, and for Stripe later. Cheap
@@ -97,7 +98,7 @@ validate signature
 
 Never send an SMS, call an LLM, or hit an external API inside the request.
 
-**Idempotency keys:** `CallSid` for voice, `MessageSid` for messaging. Twilio *will* deliver duplicates —
+**Idempotency keys:** `CallSid` for voice, `MessageSid` for messaging. Twilio _will_ deliver duplicates —
 this isn't defensive programming, it's the documented behaviour. Replaying a payload three times must
 produce exactly one call, one SMS, one lead.
 
@@ -111,9 +112,7 @@ Status callbacks arrive out of order. Guard status transitions rather than blind
 Call Lookup v2 once per new caller, before the first SMS:
 
 ```ts
-const n = await client.lookups.v2
-  .phoneNumbers(e164)
-  .fetch({ fields: 'line_type_intelligence' });
+const n = await client.lookups.v2.phoneNumbers(e164).fetch({ fields: 'line_type_intelligence' });
 n.lineTypeIntelligence?.type; // mobile | landline | voip | fixedVoip | nonFixedVoip | tollFree | ...
 ```
 
@@ -148,14 +147,15 @@ This means our database can believe a number is fine while Twilio blocks it. So:
 Cost is per **segment**, not per message. Encoding decides the segment size:
 
 | Encoding | Single | Per segment when concatenated |
-|---|---|---|
-| GSM-7 | 160 | 153 |
-| UCS-2 | 70 | 67 |
+| -------- | ------ | ----------------------------- |
+| GSM-7    | 160    | 153                           |
+| UCS-2    | 70     | 67                            |
 
 **One non-GSM-7 character switches the whole message to UCS-2.** A curly apostrophe (`'`) pasted from a
 doc turns a 1-segment message into 3. This is the single easiest way to triple the SMS bill.
 
 Rules for every outbound template:
+
 - **ASCII apostrophes and quotes only.** No em dashes, no smart quotes, no emoji, no `…`.
 - GSM-7 extended characters (`^ { } \ [ ] ~ | €`) count as **two**.
 - Assert charset and expected segment count in CI. A template that silently grows to two segments is a
@@ -183,17 +183,17 @@ Rules for every outbound template:
 
 ### Error codes worth recognising
 
-| Code | Meaning |
-|---|---|
-| 21408 | Permission to send to this region not enabled — **geo permissions** |
-| 21610 | Recipient unsubscribed (STOP) |
-| 21211 | Invalid `To` number — usually an E.164 normalisation bug |
-| 21606 | `From` is not a valid, SMS-capable number on this account |
-| 21614 | `To` is not a valid mobile number — landline that got past Lookup |
-| 30003 / 30005 | Unreachable / unknown handset |
-| 30006 | Landline or unreachable carrier |
-| 30007 | Carrier filtering — content flagged as spam |
-| 63038 | Account daily message cap exceeded |
+| Code          | Meaning                                                             |
+| ------------- | ------------------------------------------------------------------- |
+| 21408         | Permission to send to this region not enabled — **geo permissions** |
+| 21610         | Recipient unsubscribed (STOP)                                       |
+| 21211         | Invalid `To` number — usually an E.164 normalisation bug            |
+| 21606         | `From` is not a valid, SMS-capable number on this account           |
+| 21614         | `To` is not a valid mobile number — landline that got past Lookup   |
+| 30003 / 30005 | Unreachable / unknown handset                                       |
+| 30006         | Landline or unreachable carrier                                     |
+| 30007         | Carrier filtering — content flagged as spam                         |
+| 63038         | Account daily message cap exceeded                                  |
 
 **30007 is the one to watch.** Carrier filtering is silent from the sender's side and correlates with
 promotional-looking content. It's an operational reason to keep messages strictly transactional, on top

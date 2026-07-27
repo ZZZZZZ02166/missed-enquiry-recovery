@@ -9,7 +9,7 @@
 The entire product assumes that when a business's carrier forwards an unanswered call to our Twilio
 number, Twilio's `From` parameter holds **the original caller's number**.
 
-If AU carriers instead present the *forwarding party* — the business's own number — then we have nobody
+If AU carriers instead present the _forwarding party_ — the business's own number — then we have nobody
 to text, and the product as designed does not exist. There is no authoritative public answer to this; it
 varies by carrier, plan and service type, so it has to be measured.
 
@@ -47,11 +47,11 @@ Set it as the **A Call Comes In** handler on the number. Parameters appear in th
 
 Dial these from the SIM under test. `<number>` is the Twilio number in full E.164 (`+61...`).
 
-| Condition | Set | Clear | Fires when |
-|---|---|---|---|
-| No reply | `**61*<number>*11*20#` | `##61#` | Rings out (here: after 20s) |
-| Busy | `**67*<number>#` | `##67#` | Caller declines, or line busy |
-| Unreachable | `**62*<number>#` | `##62#` | Phone off / no coverage |
+| Condition   | Set                    | Clear   | Fires when                    |
+| ----------- | ---------------------- | ------- | ----------------------------- |
+| No reply    | `**61*<number>*11*20#` | `##61#` | Rings out (here: after 20s)   |
+| Busy        | `**67*<number>#`       | `##67#` | Caller declines, or line busy |
+| Unreachable | `**62*<number>#`       | `##62#` | Phone off / no coverage       |
 
 Check current state with `*#61#`, `*#67#`, `*#62#`.
 
@@ -65,29 +65,29 @@ how long a caller waits before our greeting.
 
 Fill in every row. Nine tests: three carriers × three conditions.
 
-| Carrier | Condition | `From` = original caller? | `ForwardedFrom` value | `To` correct? | Forwarding leg billed? | Notes |
-|---|---|---|---|---|---|---|
-| Telstra | No reply | | | | | |
-| Telstra | Busy (decline) | | | | | |
-| Telstra | Unreachable | | | | | |
-| Optus | No reply | | | | | |
-| Optus | Busy (decline) | | | | | |
-| Optus | Unreachable | | | | | |
-| Vodafone | No reply | | | | | |
-| Vodafone | Busy (decline) | | | | | |
-| Vodafone | Unreachable | | | | | |
+| Carrier  | Condition      | `From` = original caller? | `ForwardedFrom` value | `To` correct? | Forwarding leg billed? | Notes |
+| -------- | -------------- | ------------------------- | --------------------- | ------------- | ---------------------- | ----- |
+| Telstra  | No reply       |                           |                       |               |                        |       |
+| Telstra  | Busy (decline) |                           |                       |               |                        |       |
+| Telstra  | Unreachable    |                           |                       |               |                        |       |
+| Optus    | No reply       |                           |                       |               |                        |       |
+| Optus    | Busy (decline) |                           |                       |               |                        |       |
+| Optus    | Unreachable    |                           |                       |               |                        |       |
+| Vodafone | No reply       |                           |                       |               |                        |       |
+| Vodafone | Busy (decline) |                           |                       |               |                        |       |
+| Vodafone | Unreachable    |                           |                       |               |                        |       |
 
 ### Additional checks
 
-| Check | Carrier notes |
-|---|---|
-| Does the no-reply timer (`*11*20#`) actually apply, or is it ignored? | |
-| Does **declining** fire busy (`**67*`) or no-reply (`**61*`)? | |
-| Is carrier voicemail fully bypassed once forwarding is set? | |
-| Prepaid vs postpaid difference? | |
-| What does the caller hear, and for how long, before our greeting? | |
-| Withheld caller ID — what arrives in `From`? | |
-| Cost of the forwarding leg on the business's plan (check the bill, not the brochure) | |
+| Check                                                                                | Carrier notes |
+| ------------------------------------------------------------------------------------ | ------------- |
+| Does the no-reply timer (`*11*20#`) actually apply, or is it ignored?                |               |
+| Does **declining** fire busy (`**67*`) or no-reply (`**61*`)?                        |               |
+| Is carrier voicemail fully bypassed once forwarding is set?                          |               |
+| Prepaid vs postpaid difference?                                                      |               |
+| What does the caller hear, and for how long, before our greeting?                    |               |
+| Withheld caller ID — what arrives in `From`?                                         |               |
+| Cost of the forwarding leg on the business's plan (check the bill, not the brochure) |               |
 
 ---
 

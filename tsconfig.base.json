@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json.schemastore.org/tsconfig",
+  "compilerOptions": {
+    "target": "ES2023",
+    "strict": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "forceConsistentCasingInFileNames": true,
+    "resolveJsonModule": true,
+
+    // Money is integer cents and tenancy depends on exact where-clauses, so the
+    // stricter checks earn their noise here. noUncheckedIndexedAccess in particular
+    // catches `arr[0]` being possibly-undefined, which is how optional Twilio params
+    // become runtime crashes.
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true
+  }
+}

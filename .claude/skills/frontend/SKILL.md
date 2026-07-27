@@ -26,7 +26,7 @@ cookie: Domain=.yourdomain.com; HttpOnly; Secure; SameSite=Lax
 ```
 
 The distinction people get wrong: **same-site is not same-origin.** `app.yourdomain.com` calling
-`api.yourdomain.com` is cross-*origin* but same-*site* — same registrable domain — so a `SameSite=Lax`
+`api.yourdomain.com` is cross-_origin_ but same-_site_ — same registrable domain — so a `SameSite=Lax`
 cookie **is** sent. You still need CORS (`Access-Control-Allow-Credentials: true`, explicit origin, not
 `*`) and `credentials: 'include'` on the fetch, but the cookie itself works.
 
@@ -58,7 +58,7 @@ direct Postgres, no duplicated business rules.
 // server component
 const res = await fetch(`${API_URL}/leads`, {
   headers: { cookie: (await cookies()).toString() },
-  cache: 'no-store',   // lead data is never cacheable
+  cache: 'no-store', // lead data is never cacheable
 });
 ```
 
@@ -83,13 +83,13 @@ const res = await fetch(`${API_URL}/leads`, {
 
 ## 4. Screens in the MVP
 
-| Route | Purpose |
-|---|---|
-| `/l/[token]` | Magic-link exchange, then redirect |
-| `/leads` | Inbox — filterable by status, newest first |
-| `/leads/[id]` | **The screen that matters.** Details, SMS thread, reply, status, quote |
-| `/settings/services` | The service catalogue and pricing — our differentiator |
-| `/settings/messages` | Templates, business hours, after-hours behaviour |
+| Route                | Purpose                                                                |
+| -------------------- | ---------------------------------------------------------------------- |
+| `/l/[token]`         | Magic-link exchange, then redirect                                     |
+| `/leads`             | Inbox — filterable by status, newest first                             |
+| `/leads/[id]`        | **The screen that matters.** Details, SMS thread, reply, status, quote |
+| `/settings/services` | The service catalogue and pricing — our differentiator                 |
+| `/settings/messages` | Templates, business hours, after-hours behaviour                       |
 
 Nothing else ships in the MVP. No analytics page (a strip of numbers on `/leads` is enough), no staff
 management, no billing.
@@ -129,7 +129,11 @@ The owner opens this from an SMS, mid-job. In priority order:
 new Intl.NumberFormat('en-AU', { style: 'currency', currency: 'AUD' }).format(cents / 100);
 
 // Dates — the business's timezone, never the browser's
-new Intl.DateTimeFormat('en-AU', { timeZone: business.timezone, dateStyle: 'medium', timeStyle: 'short' });
+new Intl.DateTimeFormat('en-AU', {
+  timeZone: business.timezone,
+  dateStyle: 'medium',
+  timeStyle: 'short',
+});
 ```
 
 Using the browser's timezone looks correct until an owner checks leads from Bali and every appointment

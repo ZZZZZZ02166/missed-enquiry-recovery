@@ -1,0 +1,74 @@
+// Schema grows table by table (CLAUDE.md build protocol), not all twelve at once.
+// Landed so far: businesses, users.
+// Remaining: phone_numbers, services, customers, calls, conversations, messages,
+//            leads, attachments, suppressions, webhook_events.
+//
+// Conventions (.claude/skills/backend/SKILL.md §4):
+//   camelCase fields, snake_case tables and columns via @map/@@map
+//   cuid() ids — sequential integers leak volume and enable cross-tenant enumeration
+//   createdAt / updatedAt on every table
+//   money as integer cents, never Float
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+  // CommonJS to match the API's tsconfig — Nest's DI needs emitDecoratorMetadata,
+  // and mixing an ESM client into that toolchain is avoidable pain.
+  moduleFormat = "cjs"
+}
+
+// Prisma 7 removed `url` from the datasource block. The connection string lives in
+// prisma.config.ts for the CLI, and reaches the client via a driver adapter.
+datasource db {
+  provider = "postgresql"
+}
+
+/// A customer organisation. The tenant boundary — almost every other table
+/// carries businessId, and the assertion extension enforces it (D8).
+model Business {
+  id   String  @id @default(cuid())
+  name String
+  abn  String?
+
+  /// IANA zone. All scheduling derives from this, never server local time
+  /// (CLAUDE.md rule 12) — otherwise DST breaks follow-ups twice a year.
+  timezone String @default("Australia/Melbourne")
+
+  /// How the owner entered their prices. Caller-facing figures are always
+  /// GST-inclusive regardless (ACL single-price rule, docs/compliance.md §5).
+  pricesIncludeGst Boolean @default(false)
+
+  /// Opening hours per weekday. JSON while there is one shape; promote to a
+  /// table if per-service or per-staff hours ever land.
+  hours Json?
+
+  /// Message templates, follow-up timing, after-hours behaviour. JSON rather
+  /// than an automation_rules table until a second business needs something
+  /// genuinely different (docs/decisions.md, Part 3 cuts).
+  automationConfig Json?
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  users User[]
+
+  @@map("businesses")
+}
+
+/// A person who logs into the dashboard. One role for the MVP — roles and
+/// invitations are deferred, tenant scoping is not.
+model User {
+  id         String @id @default(cuid())
+  businessId String @map("business_id")
+
+  email String  @unique
+  name  String?
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+  @@map("users")
+}

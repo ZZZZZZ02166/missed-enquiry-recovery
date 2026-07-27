@@ -77,16 +77,16 @@ than building it in.
 
 **In practice:**
 
-| Principle | What we do |
-|---|---|
-| Collect only what's needed | Only fields required to quote or route the job. No date of birth, no ID, no payment details. |
+| Principle                           | What we do                                                                                                           |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------- |
+| Collect only what's needed          | Only fields required to quote or route the job. No date of birth, no ID, no payment details.                         |
 | Never collect sensitive information | No health, no biometric, no government identifiers. Health-adjacent industries stay off the roadmap for this reason. |
-| No call recording | (D2) Metadata only: from, to, start, end, outcome, provider SIDs. |
-| Transparency | Published privacy policy naming subprocessors (§6). |
-| Access control | Tenant isolation enforced in code (D8), least privilege on infrastructure. |
-| Encryption | TLS in transit; encryption at rest on database and object storage. |
-| Retention | See §7. |
-| Breach response | Documented plan; notify affected individuals and the OAIC where an eligible breach is likely to cause serious harm. |
+| No call recording                   | (D2) Metadata only: from, to, start, end, outcome, provider SIDs.                                                    |
+| Transparency                        | Published privacy policy naming subprocessors (§6).                                                                  |
+| Access control                      | Tenant isolation enforced in code (D8), least privilege on infrastructure.                                           |
+| Encryption                          | TLS in transit; encryption at rest on database and object storage.                                                   |
+| Retention                           | See §7.                                                                                                              |
+| Breach response                     | Documented plan; notify affected individuals and the OAIC where an eligible breach is likely to cause serious harm.  |
 
 **Access, correction and deletion (APP 12/13).** A real process, not a policy paragraph: a caller can
 request their data or its deletion. Needed — an email address that reaches a human, a documented lookup
@@ -117,13 +117,13 @@ does.
 
 Name these in the privacy policy and keep the list current:
 
-| Processor | Purpose | Data |
-|---|---|---|
-| Twilio | Voice and SMS | Phone numbers, message content, call metadata |
-| *(hosting — D15)* | Application and database | All application data |
-| *(object storage)* | Customer photos | Uploaded images |
-| *(LLM provider)* | Field extraction from replies | Message text |
-| Sentry | Error monitoring | Scrub PII before send |
+| Processor          | Purpose                       | Data                                          |
+| ------------------ | ----------------------------- | --------------------------------------------- |
+| Twilio             | Voice and SMS                 | Phone numbers, message content, call metadata |
+| _(hosting — D15)_  | Application and database      | All application data                          |
+| _(object storage)_ | Customer photos               | Uploaded images                               |
+| _(LLM provider)_   | Field extraction from replies | Message text                                  |
+| Sentry             | Error monitoring              | Scrub PII before send                         |
 
 **The LLM row deserves attention.** Customer message text leaves our infrastructure. Check the
 provider's data-retention and training terms, disclose it, and never send more of the conversation than
@@ -133,14 +133,14 @@ extraction requires.
 
 ## 7. Retention
 
-| Data | Retention | Why |
-|---|---|---|
-| Messages and conversations | 24 months from last activity | Dispute evidence and repeat-customer context |
-| Call metadata | 24 months | Same |
-| Leads | Life of the business account + 12 months | The owner's own records |
-| Attachments (photos) | 12 months | Storage cost, and lower value over time |
-| Suppressions / opt-outs | **Indefinite** | Deleting an opt-out re-enables messaging someone who said stop |
-| Webhook events | 90 days | Idempotency only — no value after that |
+| Data                       | Retention                                | Why                                                            |
+| -------------------------- | ---------------------------------------- | -------------------------------------------------------------- |
+| Messages and conversations | 24 months from last activity             | Dispute evidence and repeat-customer context                   |
+| Call metadata              | 24 months                                | Same                                                           |
+| Leads                      | Life of the business account + 12 months | The owner's own records                                        |
+| Attachments (photos)       | 12 months                                | Storage cost, and lower value over time                        |
+| Suppressions / opt-outs    | **Indefinite**                           | Deleting an opt-out re-enables messaging someone who said stop |
+| Webhook events             | 90 days                                  | Idempotency only — no value after that                         |
 
 Opt-outs are the deliberate exception to data minimisation: keeping them is what honours the request.
 

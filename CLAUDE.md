@@ -23,7 +23,7 @@ choose the order — do not create it unprompted.
 and generated artifacts — Prisma migrations, Prisma client, lockfiles — plus the commands that produce
 them. Still name any generated artifact before running the command.
 
-The user may override per message (*"do steps 2–4"*, *"continue ×3"*). The default is always one.
+The user may override per message (_"do steps 2–4"_, _"continue ×3"_). The default is always one.
 
 ---
 
@@ -31,13 +31,13 @@ The user may override per message (*"do steps 2–4"*, *"continue ×3"*). The de
 
 Full reasoning in `docs/decisions.md`. Do not relitigate these without being asked.
 
-| Area | Decision |
-|---|---|
-| **Caller experience** | Twilio answers the forwarded call, plays one TTS line announcing the incoming text, hangs up. **No voicemail, no call recording.** |
-| **Phone connection** | Conditional call forwarding from the business's existing number (all three GSM conditions: no-reply, busy, unreachable). They never change their advertised number. |
-| **Pricing** | Owner-configured service catalogue, four pricing types: `FIXED`, `STARTING_FROM`, `PER_UNIT`, `MANUAL_QUOTE`. The advanced beds × baths × carpet × suburb matrix is a post-pilot fast-follow, but the schema must accept it additively. |
-| **Owner surface** | Structured lead **SMS + magic link** is primary. The dashboard is the review surface, not the main one. |
-| **A call is not a lead** | `leads` are created lazily, on the customer's **first reply**. Calls that never get a response stay as `calls`. |
+| Area                     | Decision                                                                                                                                                                                                                                |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Caller experience**    | Twilio answers the forwarded call, plays one TTS line announcing the incoming text, hangs up. **No voicemail, no call recording.**                                                                                                      |
+| **Phone connection**     | Conditional call forwarding from the business's existing number (all three GSM conditions: no-reply, busy, unreachable). They never change their advertised number.                                                                     |
+| **Pricing**              | Owner-configured service catalogue, four pricing types: `FIXED`, `STARTING_FROM`, `PER_UNIT`, `MANUAL_QUOTE`. The advanced beds × baths × carpet × suburb matrix is a post-pilot fast-follow, but the schema must accept it additively. |
+| **Owner surface**        | Structured lead **SMS + magic link** is primary. The dashboard is the review surface, not the main one.                                                                                                                                 |
+| **A call is not a lead** | `leads` are created lazily, on the customer's **first reply**. Calls that never get a response stay as `calls`.                                                                                                                         |
 
 ---
 
@@ -104,13 +104,13 @@ missed-enquiry-recovery/
 
 ## Documentation
 
-| File | Contents |
-|---|---|
-| `docs/codebase.md` | **Every file gets an entry** — what it does and why it's built that way. Written at the same time as the file so it can't drift. Build log at the top. |
-| `docs/decisions.md` | Choices that span files, with dates and reasoning. `codebase.md` links here rather than restating. |
-| `docs/twilio-setup.md` | Account, AU regulatory bundle, numbers, webhook URLs, error codes. |
-| `docs/carrier-forwarding-test.md` | Telstra/Optus/Vodafone results matrix. **Go/no-go gate — fill in before product code.** |
-| `docs/compliance.md` | Spam Act, opt-out, GST/single-price, privacy, retention. |
+| File                              | Contents                                                                                                                                               |
+| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `docs/codebase.md`                | **Every file gets an entry** — what it does and why it's built that way. Written at the same time as the file so it can't drift. Build log at the top. |
+| `docs/decisions.md`               | Choices that span files, with dates and reasoning. `codebase.md` links here rather than restating.                                                     |
+| `docs/twilio-setup.md`            | Account, AU regulatory bundle, numbers, webhook URLs, error codes.                                                                                     |
+| `docs/carrier-forwarding-test.md` | Telstra/Optus/Vodafone results matrix. **Go/no-go gate — fill in before product code.**                                                                |
+| `docs/compliance.md`              | Spam Act, opt-out, GST/single-price, privacy, retention.                                                                                               |
 
 Full plan and review: `~/.claude/plans/i-m-building-a-missed-enquiry-soft-finch.md`.
 
@@ -118,12 +118,49 @@ Full plan and review: `~/.claude/plans/i-m-building-a-missed-enquiry-soft-finch.
 
 ## Commands
 
-Filled in as the scaffolding lands — do not guess at commands that don't exist yet.
+```bash
+pnpm install                 # first run; also after pulling
+cp .env.example .env         # then set SESSION_SECRET: openssl rand -base64 32
+
+pnpm db:up                   # Postgres + Redis (docker compose)
+pnpm db:check                # asserts Redis appendonly=yes, maxmemory-policy=noeviction
+pnpm prisma migrate dev      # create + apply a migration
+pnpm prisma generate         # regenerate the client after a schema edit
+
+pnpm dev                     # api + web in parallel
+pnpm dev:api                 # API only          → http://localhost:3101
+pnpm dev:worker              # BullMQ worker only (separate process, D7)
+pnpm dev:web                 # dashboard only    → http://localhost:3000
+
+pnpm typecheck && pnpm lint && pnpm test && pnpm build   # full sweep
+```
+
+Health: `curl http://localhost:3101/health` (liveness) · `/health/ready` (database reachable).
+
+**Environment notes**
+
+- **Node.** `.nvmrc` pins **24**. This machine runs 25.8.0, which Prisma warns about (it supports
+  20.19+, 22.12+, 24.x). Everything works today, but 25 is a non-LTS odd release Prisma doesn't test
+  against — production should run 24.
+- **Ports.** The API is on **3101**, not 3001: 3001 is taken by an unrelated project on this machine.
+- **ESLint.** The API is on ESLint 10; `apps/web` is pinned to **9** because `eslint-plugin-react`
+  (transitive via `eslint-config-next`) is not yet ESLint 10 compatible.
 
 ---
 
 ## Current stage
 
-**Week 0 — scaffolding.** No product code yet. The carrier forwarding test is an unresolved go/no-go
-gate on the entire design: if AU carriers don't preserve the original caller's number on a forwarded
-leg, there is no one to text and the architecture changes.
+**Week 0 — scaffolding complete.** The skeleton runs end to end: both apps build, 26 tests pass,
+Prisma is migrated against a live Postgres, and API and worker both boot from the same module graph.
+
+**No product code yet.** Two things gate what comes next:
+
+1. **The carrier forwarding test** (`docs/carrier-forwarding-test.md`) is unresolved and is a go/no-go
+   on the entire design. If AU carriers don't preserve the original caller's number on a forwarded leg,
+   there is nobody to text and the architecture changes.
+2. **The D8 tenancy assertion extension is not applied yet.** It lands with `phone_numbers`, the first
+   genuinely tenant-scoped model. `businesses` and `users` are the tenant root and are legitimately
+   queried unscoped.
+
+Next module order: `auth` → `businesses` → `telephony` → `calls` → `conversations` → `services` →
+`leads` → `notifications`.

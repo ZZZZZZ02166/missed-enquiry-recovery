@@ -1,0 +1,38 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // node16 rather than the deprecated commonjs/node10 pair. apps/api/package.json
+    // has no "type" field, so it defaults to CommonJS and node16 emits CJS — which is
+    // what NestJS wants. ESM + decorators + emitDecoratorMetadata is still avoidable
+    // pain, so we stay on CJS deliberately, just via the non-deprecated setting.
+    "module": "node16",
+    "moduleResolution": "node16",
+    "lib": ["ES2023"],
+
+    "experimentalDecorators": true,
+    "emitDecoratorMetadata": true,
+
+    // Nest injects into declared properties, so TS cannot see them being assigned.
+    "strictPropertyInitialization": false,
+
+    // Required by ts-jest under the node16 module kind, and correct regardless: it
+    // enforces that every file can be transpiled independently, which is what any
+    // single-file transformer (ts-jest, esbuild, swc) actually does.
+    "isolatedModules": true,
+
+    "rootDir": "./src",
+    "outDir": "./dist",
+
+    // The build info must live inside outDir. nest-cli.json sets deleteOutDir, so if
+    // .tsbuildinfo sat outside dist it would survive the delete, tell tsc everything
+    // was up to date, and emit nothing — a build that reports success and produces an
+    // empty dist. Deleting dist now clears both together.
+    "incremental": true,
+    "tsBuildInfoFile": "./dist/.tsbuildinfo",
+    "sourceMap": true,
+    "declaration": false,
+    "types": ["node", "jest"]
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}

@@ -1,0 +1,31 @@
+# Monorepo layout. See CLAUDE.md for what lives where.
+#
+#   apps/api   NestJS — main.ts (HTTP) + worker.ts (BullMQ processors)
+#   apps/web   Next.js dashboard
+#   packages/  shared code (shared-types first)
+
+packages:
+  - 'apps/*'
+  - 'packages/*'
+
+# pnpm blocks dependency install scripts by default — a postinstall is arbitrary code
+# from a transitive dependency. Each entry below is an explicit decision, not a default.
+#
+# The one that matters: Prisma's postinstall is what generates the client. Without it you
+# get "@prisma/client did not initialize yet" from code that reads as completely correct,
+# and the cause is three layers from the error.
+allowBuilds:
+  prisma: true # generates the Prisma client
+  '@prisma/engines': true # fetches the query engine binary
+  esbuild: true # ships a prebuilt binary it must place
+  unrs-resolver: true # native module resolver used by the ESLint toolchain
+
+  # Optional native accelerator for msgpackr, which BullMQ uses to serialise job data.
+  # msgpackr falls back to a pure-JS path without it. Declined: our payloads are small
+  # (ids, not blobs), so the speedup is irrelevant and a native build step is not worth
+  # the supply-chain surface.
+  msgpackr-extract: false
+
+  # Next.js image optimisation. Needs its native binaries placed at install time,
+  # otherwise next build falls back or fails depending on the route.
+  sharp: true

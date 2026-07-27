@@ -54,7 +54,7 @@ BullMQ requires these; it throws or misbehaves otherwise:
 
 ```ts
 new IORedis(url, {
-  maxRetriesPerRequest: null,   // required — BullMQ manages its own retries
+  maxRetriesPerRequest: null, // required — BullMQ manages its own retries
   enableReadyCheck: false,
 });
 ```
@@ -66,16 +66,16 @@ connection can't also serve queue commands.
 
 ## 2. Topology
 
-One NestJS codebase, two entrypoints (`CLAUDE.md`). `main.ts` only *produces* jobs; `worker.ts`
+One NestJS codebase, two entrypoints (`CLAUDE.md`). `main.ts` only _produces_ jobs; `worker.ts`
 registers the processors. Same modules, same image, different start command.
 
-| Queue | Job | Trigger |
-|---|---|---|
-| `recovery` | Send the first recovery SMS | Missed-call webhook |
-| `inbound-message` | Extract fields, pick next question, send reply | Inbound SMS webhook |
-| `notify-owner` | Owner lead SMS + magic link | Lead reaches QUALIFIED, or needsHuman is set |
-| `followup` | Nudge a silent conversation; expire it | Scheduled with `delay` at conversation start |
-| `maintenance` | Expiry sweep, Friday owner close-out nudge | Repeatable |
+| Queue             | Job                                            | Trigger                                      |
+| ----------------- | ---------------------------------------------- | -------------------------------------------- |
+| `recovery`        | Send the first recovery SMS                    | Missed-call webhook                          |
+| `inbound-message` | Extract fields, pick next question, send reply | Inbound SMS webhook                          |
+| `notify-owner`    | Owner lead SMS + magic link                    | Lead reaches QUALIFIED, or needsHuman is set |
+| `followup`        | Nudge a silent conversation; expire it         | Scheduled with `delay` at conversation start |
+| `maintenance`     | Expiry sweep, Friday owner close-out nudge     | Repeatable                                   |
 
 Keep queues narrow and named after the work, not the module. A queue per side effect makes rate limits,
 retry policy and failure isolation independently tunable — one shared `default` queue makes all three
@@ -94,7 +94,7 @@ state checks inside the processor:
 
 ```ts
 // inside the processor, not the producer
-if (conversation.recoverySentAt) return;   // already done, exit clean
+if (conversation.recoverySentAt) return; // already done, exit clean
 ```
 
 Every processor must be safe to run twice. Assume it will be: workers get killed mid-job, jobs stall and
@@ -121,12 +121,12 @@ at which point §1's eviction policy is the only thing standing between you and 
 
 **Do not retry** these — they will fail identically every time and each attempt costs money:
 
-| Condition | Action |
-|---|---|
-| Twilio 21610 (unsubscribed) | Write suppression, exit clean |
-| Twilio 21211 / 21614 (invalid or landline `To`) | Write suppression, exit clean |
-| Twilio 21408 (geo permissions) | Fail loudly and alert — configuration bug, not transient |
-| Validation / schema errors | Fail immediately, no attempts |
+| Condition                                       | Action                                                   |
+| ----------------------------------------------- | -------------------------------------------------------- |
+| Twilio 21610 (unsubscribed)                     | Write suppression, exit clean                            |
+| Twilio 21211 / 21614 (invalid or landline `To`) | Write suppression, exit clean                            |
+| Twilio 21408 (geo permissions)                  | Fail loudly and alert — configuration bug, not transient |
+| Validation / schema errors                      | Fail immediately, no attempts                            |
 
 Use BullMQ's `UnrecoverableError` to skip remaining attempts:
 
@@ -144,7 +144,11 @@ wasted send into five, and hides the real cause behind a stack of timeouts.
 **Delayed** — the follow-up nudge and conversation expiry:
 
 ```ts
-await followupQueue.add('nudge', { conversationId }, { delay: ms, jobId: `nudge:${conversationId}` });
+await followupQueue.add(
+  'nudge',
+  { conversationId },
+  { delay: ms, jobId: `nudge:${conversationId}` },
+);
 ```
 
 Compute the delay in the **business's** timezone, never the server's (`CLAUDE.md` rule 12). A nudge must
@@ -171,7 +175,7 @@ explicitly on deploy, or you will have two.
 new Worker('recovery', processor, {
   connection,
   concurrency: 5,
-  limiter: { max: 10, duration: 1000 },   // protects the provider, not us
+  limiter: { max: 10, duration: 1000 }, // protects the provider, not us
 });
 ```
 
@@ -182,7 +186,7 @@ Keep `concurrency` low for LLM-calling processors — they're slow and the failu
 not latency.
 
 **Never block the event loop in a processor.** BullMQ detects stalled jobs by missed heartbeats; a
-synchronous blocking call gets the job marked stalled and re-run *while the first run is still going* —
+synchronous blocking call gets the job marked stalled and re-run _while the first run is still going_ —
 the most confusing duplicate-execution bug in the stack.
 
 ---
@@ -203,7 +207,7 @@ the most confusing duplicate-execution bug in the stack.
 
 ```ts
 process.on('SIGTERM', async () => {
-  await worker.close();   // stops taking new jobs, finishes in-flight
+  await worker.close(); // stops taking new jobs, finishes in-flight
   await connection.quit();
 });
 ```

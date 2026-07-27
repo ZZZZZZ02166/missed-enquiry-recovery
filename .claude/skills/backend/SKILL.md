@@ -19,21 +19,23 @@ product that is a genuine incident rather than an inconvenience.
 
 Two sources, never the client:
 
-| Context | Source |
-|---|---|
-| Dashboard requests | The authenticated session, via a guard |
-| Twilio webhooks | Looked up from the `To` number in `phone_numbers` — there is no session |
-| Job processors | Read from `job.data`, put there by the producer that already resolved it |
+| Context            | Source                                                                   |
+| ------------------ | ------------------------------------------------------------------------ |
+| Dashboard requests | The authenticated session, via a guard                                   |
+| Twilio webhooks    | Looked up from the `To` number in `phone_numbers` — there is no session  |
+| Job processors     | Read from `job.data`, put there by the producer that already resolved it |
 
 **Never accept `businessId` in a DTO, query param, or request body.** Not "validate it against the
 session" — don't accept it at all. A field that doesn't exist can't be forgotten.
 
 ```ts
-app.useGlobalPipes(new ValidationPipe({
-  whitelist: true,            // strips unknown fields
-  forbidNonWhitelisted: true, // 400 if the client sends one
-  transform: true,
-}));
+app.useGlobalPipes(
+  new ValidationPipe({
+    whitelist: true, // strips unknown fields
+    forbidNonWhitelisted: true, // 400 if the client sends one
+    transform: true,
+  }),
+);
 ```
 
 `whitelist` alone silently drops an injected `businessId`; `forbidNonWhitelisted` makes the attempt an
@@ -49,8 +51,15 @@ Assert instead. An unscoped query on a tenant model becomes a **runtime error**,
 
 ```ts
 const TENANT_MODELS = new Set([
-  'PhoneNumber', 'Service', 'Customer', 'Call', 'Conversation',
-  'Message', 'Lead', 'Attachment', 'Suppression',
+  'PhoneNumber',
+  'Service',
+  'Customer',
+  'Call',
+  'Conversation',
+  'Message',
+  'Lead',
+  'Attachment',
+  'Suppression',
 ]);
 
 prisma.$extends({
@@ -69,7 +78,7 @@ prisma.$extends({
 
 Provide one explicit escape hatch — `prisma.unscoped()` — for the handful of legitimate cross-tenant
 reads (resolving a webhook's `To` number, magic-link token lookup, maintenance sweeps). Escape hatches
-are fine; *invisible* escape hatches are not. Every call site of `unscoped()` should be greppable and
+are fine; _invisible_ escape hatches are not. Every call site of `unscoped()` should be greppable and
 few.
 
 ### Cross-tenant access returns 404, not 403
@@ -167,7 +176,7 @@ One helper in `common/phone.ts`, applied at every ingress point before anything 
 ```ts
 import { parsePhoneNumberFromString } from 'libphonenumber-js';
 const parsed = parsePhoneNumberFromString(raw, 'AU');
-return parsed?.isValid() ? parsed.number : null;   // E.164
+return parsed?.isValid() ? parsed.number : null; // E.164
 ```
 
 - `04xx xxx xxx`, `+614xxxxxxxx`, `(03) 9xxx xxxx` all arrive. Store E.164 only.
@@ -195,8 +204,10 @@ return parsed?.isValid() ? parsed.number : null;   // E.164
 ```ts
 // main.ts — HTTP
 const app = await NestFactory.create(AppModule, { rawBody: true });
-app.set('trust proxy', 1);            // signature validation depends on this
-app.useGlobalPipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }));
+app.set('trust proxy', 1); // signature validation depends on this
+app.useGlobalPipes(
+  new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }),
+);
 
 // worker.ts — jobs
 const app = await NestFactory.createApplicationContext(AppModule);
@@ -216,4 +227,4 @@ health-checked and restarted by a platform that thinks it's a web service.
 - **The tenancy suite** (§1) is table-driven over every tenant model.
 - **Never mock Prisma.** Mocked query builders assert the shape of a call, not that the query is correct
   — they pass while the SQL is wrong.
-- Assert on error *types*, not message strings.
+- Assert on error _types_, not message strings.
