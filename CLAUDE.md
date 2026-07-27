@@ -63,8 +63,10 @@ modules, same image, different start command. Never a separate worker package.
 5. **Outbound SMS is GSM-7 only.** One curly apostrophe or emoji drops the segment limit from 160 to 70
    characters and can triple the bill. Templates are charset- and segment-asserted in CI.
 6. **Phone numbers are E.164, normalised at the edge**, before any lookup, dedup, or storage.
-7. **Twilio webhooks need the raw body** for signature validation — Nest's parser consumes it otherwise
-   and signatures fail with an unhelpful error.
+7. **Twilio signatures validate over URL + alphabetically sorted params**, not the raw body — and the
+   **URL** is what breaks: behind a proxy `req.protocol` is `http` while Twilio called `https`, so every
+   signature fails silently. Pin the public base URL in env. Set `rawBody: true` anyway, for JSON
+   `bodySHA256` payloads and for Stripe later.
 8. **Webhooks: validate → persist → enqueue → return.** Twilio times out around 15s. Never send an SMS
    or call an LLM inside the request.
 9. **Every external event is idempotent** via `webhook_events` unique `(provider, externalEventId)`.
