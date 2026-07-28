@@ -48,6 +48,8 @@ decision rather than restating the argument.
 | 11  | 2026-07-27 | `.claude/settings.json`                | Permission allowlist, and denies for the destructive Prisma commands               |
 | 12  | 2026-07-27 | `pnpm-workspace.yaml`                  | Monorepo shape, and the pnpm build-script allowlist Prisma needs                   |
 | 13  | 2026-07-27 | Scaffolding batch                      | Root config, both apps, Prisma + first migration, health, phone helper — see below |
+| 14  | 2026-07-27 | `apps/api/src/prisma/tenant-guard.ts`  | D8 — throws when a query on a tenant model isn't scoped by businessId              |
+| 15  | 2026-07-27 | `apps/api/src/prisma/tenant-guard.spec.ts` | 71 tests pinning the guard's behaviour, including the OR trap                  |
 
 ---
 
@@ -724,3 +726,105 @@ flat configs** as subpath exports; the `FlatCompat` bridge not only isn't needed
 config (circular reference during schema serialisation). And `eslint-plugin-react@7.37.5`, pulled in
 transitively, is **incompatible with ESLint 10** (`contextOrFilename.getFilename is not a function`), so
 the web app is pinned to **ESLint 9** while the API runs ESLint 10. Revisit when the plugin catches up.
+
+---
+
+### API
+
+#### `apps/api/src/prisma/tenant-guard.ts`
+
+**Step 14** · 2026-07-27
+
+**What it does.** A Prisma client extension that throws `TenantScopeError` when a query against a
+tenant-scoped model does not constrain by `businessId`. Implements D8.
+
+**Why it's written this way.**
+
+- **It asserts; it does not auto-inject.** The tempting design silently adds `where: { businessId }` to
+  every query. Rejected because it *hides* missing scoping rather than surfacing it — the first query
+  shape the extension doesn't cover fails **open**, silently, in production. It also cannot work for
+  Twilio webhooks or job processors, where the tenant comes from a phone-number lookup or `job.data`
+  rather than a session; auto-injecting from an empty session would scope to nothing. Asserting behaves
+  identically in all three contexts.
+- **`TENANT_MODELS` lists models that don't exist yet.** A model is guarded from its first line rather
+  than from whenever someone remembers to add it. Names absent from the schema are simply never queried,
+  so listing them early costs nothing and closes the window where a new table is briefly unguarded.
+- **`Business` and `User` are deliberately excluded.** `Business` *is* the tenant, and both are
+  legitimately read before a tenant is known — login and the magic-link exchange both happen without a
+  `businessId` in hand.
+- **`findUnique` is banned on tenant models — the least obvious decision here.** A unique lookup takes
+  only unique fields, so `findUnique({ where: { id } })` cannot express a tenant constraint at all. The
+  check then has to happen *after* the query, in application code, which is exactly where it gets
+  forgotten. `findFirst({ where: { id, businessId } })` pushes the constraint into the query and returns
+  `null` for another tenant's row — which is the 404-not-403 behaviour the backend skill requires,
+  achieved for free rather than by remembering to write it.
+- **`businessId` must be top-level in `where`.** A shallow check is correct, not lazy: a `businessId`
+  buried in an `OR` does not scope anything — `OR: [{ businessId }, { status: 'NEW' }]` matches every
+  business's NEW rows. Requiring it at the top level makes that mistake impossible to express.
+- **Unrecognised operations throw.** The default is fail-closed, so a Prisma upgrade that introduces a
+  new operation breaks loudly here instead of quietly routing around the guard. The error names the two
+  constants to edit.
+- **`assertTenantScoped` is exported separately from the extension.** The check is pure — `(model,
+operation, args) → void | throw` — so it is unit-testable without a database, a client, or a schema.
+  That is what makes step 15's test suite cheap enough to be exhaustive.
+- **Empty `createMany` arrays pass.** Writing zero rows leaks nothing, and throwing there would be noise.
+
+**Connects to.** `docs/decisions.md` D8. `.claude/skills/backend/SKILL.md` §1 (the rule this enforces).
+`prisma.service.ts` applies it (step 16). Every tenant model in `schema.prisma` is governed by it.
+
+**Watch out for — three real gaps, none of them accidental.**
+
+1. **Raw SQL bypasses this entirely.** `$queryRaw` / `$executeRaw` are not model operations, so the
+   extension never sees them. Any raw query against a tenant table must carry its own
+   `WHERE business_id = ...`, and there should be very few. The health check's `SELECT 1` is fine
+   precisely because it touches no tenant table.
+2. **The guard checks that a `businessId` is *present*, not that it is the *right* one.** It cannot know
+   which tenant the current request belongs to. Passing a `businessId` the user doesn't own still
+   passes — which is why services take `businessId` explicitly from the session or the webhook's
+   phone-number lookup, never from client input, and why `forbidNonWhitelisted` rejects an injected one
+   at the DTO boundary. This is a net, not a wall.
+3. **`prisma.unscoped` (step 16) is a deliberate hole.** Resolving a webhook's `To` number and looking
+   up a magic-link token both happen before a tenant is known. Every call site must stay greppable and
+   few — a growing list means the assertion is being worked around rather than satisfied.
+
+#### `apps/api/src/prisma/tenant-guard.spec.ts`
+
+**Step 15** · 2026-07-27
+
+**What it does.** 71 tests over `assertTenantScoped`, covering non-tenant models, banned operations,
+every where-scoped and data-scoped operation, the `OR` trap, upsert's two halves, unknown operations,
+error diagnosability, and the model list itself. Total suite is now 97.
+
+**Why it's written this way.**
+
+- **No database, no Prisma client, no schema.** Step 14 exported the check as a pure
+  `(model, operation, args) → void | throw` precisely so this suite could be exhaustive for near-zero
+  cost. A test that needed a live Postgres per case would have been sampled instead of complete, and
+  sampling a security boundary is how the uncovered case becomes the incident.
+- **Real model names (`Lead`, `Business`) rather than fixtures.** Renaming a model should break these
+  tests. A model that silently drops out of `TENANT_MODELS` during a rename is exactly the regression
+  worth catching, and a fixture name would hide it.
+- **The `OR` trap gets its own describe block.** It is the reason the check is shallow rather than
+  recursive, so it is tested as behaviour rather than left as a comment. The `AND` case is tested too,
+  and documents that we reject a query that *would* actually be safe — the trade is that the rule stays
+  one sentence long instead of requiring the guard to walk boolean trees and decide which branches are
+  load-bearing.
+- **Upsert is tested as two independent halves.** Scoping the `where` but not the `create` is the
+  dangerous asymmetry: the insert branch is the one that writes a row into the wrong tenant, and it is
+  easy to scope the lookup and forget the insert.
+- **Error *messages* are asserted, not just error types.** `findUnique` must name `findFirst` in its
+  message, and an unknown operation must name `WHERE_SCOPED`. When this guard fires, it fires on someone
+  who does not yet know the rule — the message is the documentation they will actually read.
+- **The last block tests `TENANT_MODELS` itself.** It guards the guard: it fails if someone prunes the
+  list back to "only the models that exist today", which would silently unprotect every table added
+  after that.
+
+**Connects to.** `tenant-guard.ts` (the only thing under test). Runs under `apps/api/jest.config.js`.
+
+**Watch out for.** These tests prove the guard *rejects unscoped queries*. They cannot prove the
+application passes the *correct* `businessId` — that needs integration tests authenticating as business
+A and requesting business B's records (`.claude/skills/backend/SKILL.md` §8). Green here is necessary,
+not sufficient.
+
+Also: `expect.assertions(5)` in the diagnosability test is doing real work — it proves the `catch` block
+ran at all. Without it, a version of `assertTenantScoped` that never threw would pass that test silently.
