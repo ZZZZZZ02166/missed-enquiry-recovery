@@ -52,6 +52,7 @@ decision rather than restating the argument.
 | 15  | 2026-07-27 | `apps/api/src/prisma/tenant-guard.spec.ts` | 71 tests pinning the guard's behaviour, including the OR trap                  |
 | 16  | 2026-07-29 | `apps/api/src/prisma/prisma.service.ts` | Applies the guard; three surfaces — `db`, `unscoped`, raw                          |
 | 17  | 2026-07-29 | `apps/api/prisma/schema.prisma`        | `phone_numbers` — first tenant model; guard proven 8/8 against a live database     |
+| 18  | 2026-07-29 | `apps/api/prisma/schema.prisma`        | `webhook_events` — idempotency backbone, keyed on a handler-built `dedupeKey`      |
 
 ---
 
@@ -781,6 +782,73 @@ database, 8/8:
 Third, for later: releasing a number and reassigning it to another business will collide with
 `e164 @unique`, since a `RELEASED` row keeps its value. Not a problem yet — worth a deliberate decision
 before the first offboarding, not an improvised one.
+
+#### `apps/api/prisma/schema.prisma` — `webhook_events` added
+
+**Step 18** · 2026-07-29
+
+**What it does.** Records every raw provider delivery. This is the table that makes replaying a payload
+three times produce one call, one SMS, one lead.
+
+**Why it's written this way.**
+
+- **The uniqueness key is `dedupeKey`, built by the handler — this corrects the plan.** Both the plan
+  and `.claude/skills/twilio/SKILL.md` §3 specified a compound unique on
+  `(provider, externalEventId)`. **That is wrong, and would have caused silent data loss.** A `CallSid`
+  is not unique per delivery: one call produces an incoming webhook *plus* several status callbacks, all
+  sharing it. A compound unique on those two columns would have accepted the first and silently rejected
+  every subsequent status callback for that call — meaning we would never learn a call completed.
+  Instead each handler constructs its own key and owns what "the same event" means:
+
+  ```
+  twilio:voice:incoming:CAxxxx
+  twilio:voice:status:CAxxxx:completed
+  twilio:message:incoming:SMxxxx
+  twilio:message:status:SMxxxx:delivered
+  ```
+
+  `externalEventId` is kept as a plain indexed column so "show me everything about this call" is still
+  one query — it just isn't load-bearing for correctness.
+
+- **Not a tenant model, and the reasoning is in the schema.** The row is written *before* the tenant is
+  known and looked up by `dedupeKey` with no `businessId` in hand, so it cannot satisfy the guard.
+  `businessId` is nullable and forensic only. The comment states the condition under which that must
+  change: if this table is ever exposed through the API, it joins `TENANT_MODELS` and the column becomes
+  required.
+
+- **`signatureValid` is stored, and failed rows are kept.** The instinct is to reject an invalid
+  signature and write nothing. But a burst of failures is either a misconfigured `PUBLIC_API_URL` or
+  someone probing the endpoint — and both are completely invisible if rejected requests leave no trace.
+  The row is the only evidence.
+
+- **`IGNORED` is distinct from `FAILED`.** A spam caller or a suppressed number is a deliberate
+  non-action, not an error. Collapsing them would make "failure rate" meaningless as an alert signal,
+  which is the one thing that metric is for.
+
+- **`payload` holds verbatim provider parameters** for replay — and therefore caller phone numbers and
+  message text. That personal information is why this table has the shortest retention of anything we
+  store, 90 days (`docs/compliance.md` §7); past that it has no value beyond idempotency.
+
+- **Three indexes, each with a stated purpose:** `externalEventId` for support, `(status, receivedAt)`
+  for finding unprocessed work oldest-first, `receivedAt` for the retention sweep.
+
+**Connects to.** `.claude/skills/twilio/SKILL.md` §3 (the validate → persist → enqueue → return
+contract this implements — **and whose uniqueness key it corrects**). `docs/compliance.md` §7.
+`tenant-guard.ts` (deliberately absent from `TENANT_MODELS`). Migration
+`20260729103928_add_webhook_events`.
+
+**Verified against the live database:**
+
+- Inserting the same `dedupeKey` twice → rejected by
+  `webhook_events_dedupe_key_key`, at the database rather than in application code.
+- Two different status callbacks on the **same** `CallSid`
+  (`...status:CA123:ringing`, `...status:CA123:completed`) → both inserted, 2 rows. This is precisely
+  the case the originally-planned compound key would have swallowed.
+
+**Watch out for.** The dedupe key's correctness now lives in the *handlers*, not the schema. A handler
+that builds a key without the distinguishing field — `twilio:voice:status:CA123` with no status —
+recreates exactly the collision this design avoids, and the failure is silent: events simply stop being
+recorded. Every handler that writes here needs a test asserting two distinct deliveries produce two rows.
 
 #### `apps/api/src/common/phone.ts` · `phone.spec.ts`
 

@@ -1,7 +1,7 @@
 // Schema grows table by table (CLAUDE.md build protocol), not all twelve at once.
-// Landed so far: businesses, users, phone_numbers.
+// Landed so far: businesses, users, phone_numbers, webhook_events.
 // Remaining: services, customers, calls, conversations, messages,
-//            leads, attachments, suppressions, webhook_events.
+//            leads, attachments, suppressions.
 //
 // Conventions (.claude/skills/backend/SKILL.md §4):
 //   camelCase fields, snake_case tables and columns via @map/@@map
@@ -159,4 +159,95 @@ model PhoneNumber {
   @@index([businessId])
   @@index([businessId, purpose])
   @@map("phone_numbers")
+}
+
+enum WebhookProvider {
+  TWILIO
+  STRIPE
+
+  @@map("webhook_provider")
+}
+
+enum WebhookEventStatus {
+  RECEIVED
+  PROCESSED
+  /// Recognised, deliberately not acted on — a spam caller, a suppressed number,
+  /// a status transition we don't care about. Distinct from FAILED so that a rising
+  /// failure count means something is broken.
+  IGNORED
+  FAILED
+
+  @@map("webhook_event_status")
+}
+
+/// Raw provider deliveries. The idempotency backbone: Twilio retries on any
+/// non-timely 200, and duplicate delivery is documented behaviour rather than an
+/// edge case. Replaying a payload three times must produce one call, one SMS,
+/// one lead.
+///
+/// NOT a tenant model, deliberately — see the note on businessId below.
+model WebhookEvent {
+  id String @id @default(cuid())
+
+  provider WebhookProvider
+
+  /// The identity of *this delivery*, constructed by the handler rather than taken
+  /// from a single provider field. A CallSid is not unique per delivery: one call
+  /// produces an incoming webhook plus several status callbacks, all sharing it.
+  /// Each handler therefore builds its own key and owns what "the same event" means:
+  ///
+  ///   twilio:voice:incoming:CAxxxx
+  ///   twilio:voice:status:CAxxxx:completed
+  ///   twilio:message:incoming:SMxxxx
+  ///   twilio:message:status:SMxxxx:delivered
+  ///
+  /// A compound unique on (provider, externalEventId) would collide across the
+  /// status callbacks of a single call and silently drop all but the first.
+  dedupeKey String @unique @map("dedupe_key")
+
+  /// CallSid / MessageSid. Not unique — kept so that everything about one call can
+  /// be pulled up in one query when supporting a business.
+  externalEventId String @map("external_event_id")
+
+  /// e.g. voice.incoming, voice.status, message.incoming, message.status
+  eventType String @map("event_type")
+
+  /// Resolved from the `To` number after the fact, and null when it could not be —
+  /// an unrecognised number, or a signature that failed before any lookup.
+  ///
+  /// This nullability is why WebhookEvent is absent from TENANT_MODELS: the row is
+  /// written *before* the tenant is known, and is looked up by dedupeKey with no
+  /// businessId in hand. It is an internal forensics table and is never exposed
+  /// through the API. If that ever changes, it must be added to TENANT_MODELS and
+  /// this column made required.
+  businessId String? @map("business_id")
+
+  /// Verbatim provider parameters, for replay and for reconstructing what happened.
+  /// Contains caller phone numbers and message text — personal information, and the
+  /// reason this table has the shortest retention of anything we store: 90 days
+  /// (docs/compliance.md §7). It has no value beyond idempotency after that.
+  payload Json
+
+  /// False rows are kept on purpose. A burst of failed signatures is either a
+  /// misconfigured PUBLIC_API_URL or someone probing the endpoint, and both are
+  /// invisible if rejected requests leave no trace.
+  signatureValid Boolean @map("signature_valid")
+
+  status      WebhookEventStatus @default(RECEIVED)
+  attempts    Int                @default(0)
+  processedAt DateTime?          @map("processed_at")
+
+  /// Last failure, for triage. Not a stack trace — a short reason.
+  error String?
+
+  receivedAt DateTime @default(now()) @map("received_at")
+  updatedAt  DateTime @updatedAt @map("updated_at")
+
+  /// Support: "show me everything about this call".
+  @@index([externalEventId])
+  /// Ops: unprocessed or failed work, oldest first.
+  @@index([status, receivedAt])
+  /// Retention sweep.
+  @@index([receivedAt])
+  @@map("webhook_events")
 }
