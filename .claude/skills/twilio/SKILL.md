@@ -20,7 +20,7 @@ call:
 | `From`          | the original caller — **verify per carrier**, this is the go/no-go assumption (`docs/carrier-forwarding-test.md`)               |
 | `To`            | our Twilio number                                                                                                               |
 | `ForwardedFrom` | the business's number _when the carrier supplies a diversion header_ — inconsistently populated on AU PSTN. Never depend on it. |
-| `CallSid`       | idempotency key for the call                                                                                                    |
+| `CallSid`       | identifies the call — but **not** a dedupe key on its own; every status callback repeats it (§3)                                |
 
 Respond immediately with TwiML. One line, then hang up:
 
@@ -90,20 +90,47 @@ Twilio times out around 15 seconds and retries. Handlers must be fast and idempo
 
 ```
 validate signature
-  → INSERT INTO webhook_events (provider, externalEventId, type, payload)   -- unique (provider, externalEventId)
-  → on conflict: return 200 immediately, do nothing
+  → INSERT INTO webhook_events (provider, dedupeKey, externalEventId, eventType, payload, signatureValid)
+  → on unique-violation of dedupeKey: return 200 immediately, do nothing
   → enqueue BullMQ job
   → return TwiML / 200
 ```
 
 Never send an SMS, call an LLM, or hit an external API inside the request.
 
-**Idempotency keys:** `CallSid` for voice, `MessageSid` for messaging. Twilio _will_ deliver duplicates —
-this isn't defensive programming, it's the documented behaviour. Replaying a payload three times must
-produce exactly one call, one SMS, one lead.
+Twilio _will_ deliver duplicates — this isn't defensive programming, it's documented behaviour.
+Replaying a payload three times must produce exactly one call, one SMS, one lead.
 
-Status callbacks arrive out of order. Guard status transitions rather than blindly overwriting:
-`queued → sent → delivered`, and `undelivered` / `failed` are terminal.
+### The dedupe key is built by the handler, not taken from a provider field
+
+**`CallSid` alone is not a valid uniqueness key, and using it as one loses data silently.** A single
+call produces an incoming webhook _plus_ several status callbacks, all carrying the same `CallSid`. A
+unique constraint on `(provider, externalEventId)` accepts the first and rejects every status callback
+that follows — so the call never appears to complete, and nothing errors.
+
+Each handler constructs its own key and decides what "the same event" means:
+
+| Webhook           | `dedupeKey`                                            |
+| ----------------- | ------------------------------------------------------ |
+| Voice, incoming   | `twilio:voice:incoming:${CallSid}`                     |
+| Voice, status     | `twilio:voice:status:${CallSid}:${CallStatus}`         |
+| Message, incoming | `twilio:message:incoming:${MessageSid}`                |
+| Message, status   | `twilio:message:status:${MessageSid}:${MessageStatus}` |
+
+The rule: **the key must include every field that distinguishes one legitimate delivery from another.**
+Omitting the status from a status-callback key recreates the collision, and the symptom is events
+quietly not being recorded rather than an error.
+
+`externalEventId` is stored separately as a plain indexed column — useful for "show me everything about
+this call", but not load-bearing for correctness.
+
+Every handler that writes here needs a test asserting two distinct deliveries produce two rows.
+
+### Status callbacks arrive out of order
+
+Guard transitions rather than blindly overwriting: `queued → sent → delivered`, with `undelivered` and
+`failed` terminal. Storing each status as its own `webhook_events` row makes the true ordering
+recoverable after the fact, which is why the key includes the status rather than upserting one row.
 
 ---
 

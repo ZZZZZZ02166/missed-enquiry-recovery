@@ -32,27 +32,33 @@ decision rather than restating the argument.
 
 ## Build log
 
-| #   | Date       | File                                   | In one line                                                                        |
-| --- | ---------- | -------------------------------------- | ---------------------------------------------------------------------------------- |
-| 1   | 2026-07-27 | `CLAUDE.md`                            | Project brief, build protocol, and the 12 engineering invariants                   |
-| 2   | 2026-07-27 | `docs/codebase.md`                     | This file — the running per-file explanation                                       |
-| 3   | 2026-07-27 | `.claude/skills/twilio/SKILL.md`       | Telephony reference: webhooks, Lookup, opt-out, SMS segments, testing              |
-| —   | 2026-07-27 | `CLAUDE.md`                            | Amended rule 7 — signatures validate over URL + sorted params, not raw body        |
-| 4   | 2026-07-27 | `.claude/skills/queues-redis/SKILL.md` | BullMQ and Redis: persistence, idempotency, retries, delayed work                  |
-| 5   | 2026-07-27 | `.claude/skills/backend/SKILL.md`      | NestJS + Prisma: tenancy assertion, modules, auth, migrations, money               |
-| 6   | 2026-07-27 | `.claude/skills/frontend/SKILL.md`     | Next.js dashboard: cookie domain, magic link, mobile-first, en-AU formatting       |
-| 7   | 2026-07-27 | `docs/decisions.md`                    | ADR-lite: 12 locked decisions with rejected alternatives, 5 pending                |
-| 8   | 2026-07-27 | `docs/carrier-forwarding-test.md`      | The go/no-go gate — protocol and empty results matrix                              |
-| 9   | 2026-07-27 | `docs/twilio-setup.md`                 | Account runbook: bundle, geo permissions, numbers, webhooks, usage triggers        |
-| 10  | 2026-07-27 | `docs/compliance.md`                   | Spam Act position, sender split, privacy posture, price representations, retention |
-| 11  | 2026-07-27 | `.claude/settings.json`                | Permission allowlist, and denies for the destructive Prisma commands               |
-| 12  | 2026-07-27 | `pnpm-workspace.yaml`                  | Monorepo shape, and the pnpm build-script allowlist Prisma needs                   |
-| 13  | 2026-07-27 | Scaffolding batch                      | Root config, both apps, Prisma + first migration, health, phone helper — see below |
-| 14  | 2026-07-27 | `apps/api/src/prisma/tenant-guard.ts`  | D8 — throws when a query on a tenant model isn't scoped by businessId              |
-| 15  | 2026-07-27 | `apps/api/src/prisma/tenant-guard.spec.ts` | 71 tests pinning the guard's behaviour, including the OR trap                  |
-| 16  | 2026-07-29 | `apps/api/src/prisma/prisma.service.ts` | Applies the guard; three surfaces — `db`, `unscoped`, raw                          |
-| 17  | 2026-07-29 | `apps/api/prisma/schema.prisma`        | `phone_numbers` — first tenant model; guard proven 8/8 against a live database     |
-| 18  | 2026-07-29 | `apps/api/prisma/schema.prisma`        | `webhook_events` — idempotency backbone, keyed on a handler-built `dedupeKey`      |
+| #   | Date       | File                                                    | In one line                                                                        |
+| --- | ---------- | ------------------------------------------------------- | ---------------------------------------------------------------------------------- |
+| 1   | 2026-07-27 | `CLAUDE.md`                                             | Project brief, build protocol, and the 12 engineering invariants                   |
+| 2   | 2026-07-27 | `docs/codebase.md`                                      | This file — the running per-file explanation                                       |
+| 3   | 2026-07-27 | `.claude/skills/twilio/SKILL.md`                        | Telephony reference: webhooks, Lookup, opt-out, SMS segments, testing              |
+| —   | 2026-07-27 | `CLAUDE.md`                                             | Amended rule 7 — signatures validate over URL + sorted params, not raw body        |
+| 4   | 2026-07-27 | `.claude/skills/queues-redis/SKILL.md`                  | BullMQ and Redis: persistence, idempotency, retries, delayed work                  |
+| 5   | 2026-07-27 | `.claude/skills/backend/SKILL.md`                       | NestJS + Prisma: tenancy assertion, modules, auth, migrations, money               |
+| 6   | 2026-07-27 | `.claude/skills/frontend/SKILL.md`                      | Next.js dashboard: cookie domain, magic link, mobile-first, en-AU formatting       |
+| 7   | 2026-07-27 | `docs/decisions.md`                                     | ADR-lite: 12 locked decisions with rejected alternatives, 5 pending                |
+| 8   | 2026-07-27 | `docs/carrier-forwarding-test.md`                       | The go/no-go gate — protocol and empty results matrix                              |
+| 9   | 2026-07-27 | `docs/twilio-setup.md`                                  | Account runbook: bundle, geo permissions, numbers, webhooks, usage triggers        |
+| 10  | 2026-07-27 | `docs/compliance.md`                                    | Spam Act position, sender split, privacy posture, price representations, retention |
+| 11  | 2026-07-27 | `.claude/settings.json`                                 | Permission allowlist, and denies for the destructive Prisma commands               |
+| 12  | 2026-07-27 | `pnpm-workspace.yaml`                                   | Monorepo shape, and the pnpm build-script allowlist Prisma needs                   |
+| 13  | 2026-07-27 | Scaffolding batch                                       | Root config, both apps, Prisma + first migration, health, phone helper — see below |
+| 14  | 2026-07-27 | `apps/api/src/prisma/tenant-guard.ts`                   | D8 — throws when a query on a tenant model isn't scoped by businessId              |
+| 15  | 2026-07-27 | `apps/api/src/prisma/tenant-guard.spec.ts`              | 71 tests pinning the guard's behaviour, including the OR trap                      |
+| 16  | 2026-07-29 | `apps/api/src/prisma/prisma.service.ts`                 | Applies the guard; three surfaces — `db`, `unscoped`, raw                          |
+| 17  | 2026-07-29 | `apps/api/prisma/schema.prisma`                         | `phone_numbers` — first tenant model; guard proven 8/8 against a live database     |
+| 18  | 2026-07-29 | `apps/api/prisma/schema.prisma`                         | `webhook_events` — idempotency backbone, keyed on a handler-built `dedupeKey`      |
+| 19  | 2026-07-29 | `.claude/skills/twilio/SKILL.md`                        | Corrected §3 — `CallSid` alone is not a valid uniqueness key                       |
+| 20  | 2026-07-29 | `apps/api/src/telephony/twilio-signature.guard.ts`      | Rejects forged webhooks; URL pinned to PUBLIC_API_URL. 11/11 verified              |
+| 21  | 2026-07-29 | `apps/api/src/telephony/twilio-signature.guard.spec.ts` | 24 tests: forgery, replay, diagnostics, unconfigured token                         |
+| 22  | 2026-07-29 | `apps/api/src/telephony/webhook-events.service.ts`      | Idempotent recording; 5 deliveries for one CallSid → 3 rows                        |
+| 23  | 2026-07-29 | `apps/api/src/telephony/webhook-events.service.spec.ts` | First integration suite — real Postgres, incl. a concurrency race                  |
+| —   | 2026-07-29 | `apps/api/package.json`                                 | `NODE_OPTIONS=--experimental-vm-modules` — Prisma 7 needs it under Jest            |
 
 ---
 
@@ -181,6 +187,23 @@ so the parsed body is what's needed, and the **URL** is what usually breaks. `ra
 Second: the `From` parameter is assumed to be the original caller. **That assumption is unverified** and
 is the go/no-go gate for the product. If AU carriers present the forwarding party instead, §1 of this
 skill and the architecture both change.
+
+**Amended at step 19 — §3 rewritten.** The original text specified a unique constraint on
+`(provider, externalEventId)` and called `CallSid` an idempotency key. That is wrong in a way that loses
+data silently: one call emits an incoming webhook plus several status callbacks sharing a `CallSid`, so
+the constraint would accept the first and reject the rest — the call would never appear to complete, and
+nothing would error.
+
+§3 now specifies a handler-constructed `dedupeKey` with a table of the four shapes, states the rule
+(_the key must include every field that distinguishes one legitimate delivery from another_), and
+requires each handler to carry a test asserting two distinct deliveries produce two rows. Also added:
+why storing each status as its own row makes true ordering recoverable, given callbacks arrive out of
+order.
+
+**Why this was worth its own step.** The skill is what loads when a future session writes telephony
+code. `schema.prisma` had already been corrected, but a stale skill would have actively instructed
+someone to reimplement the collision against a schema that no longer matched — worse than no guidance,
+because it reads as authoritative.
 
 #### `.claude/skills/queues-redis/SKILL.md`
 
@@ -676,7 +699,7 @@ SQL).
 
 **Why it's written this way.**
 
-- **It no longer extends `PrismaClient`, and that is the whole point.** `$extends` returns a *new*
+- **It no longer extends `PrismaClient`, and that is the whole point.** `$extends` returns a _new_
   client rather than mutating the instance, so with inheritance `this` would remain the **unguarded**
   base — the default surface would be the unsafe one, which is exactly backwards. Composition makes the
   guarded client the default and forces `unscoped` to be asked for by name. The structural change was
@@ -691,7 +714,7 @@ SQL).
 - **`base` is private; `unscoped` is a getter.** There is one way to reach the unguarded client and it
   is spelled `unscoped`, so `grep -rn 'unscoped' src/` is a complete audit of every bypass.
 - **Raw SQL sits on the root, not under `db` — deliberately.** The extension only sees model
-  operations, so `$queryRaw` is outside the guard *by nature, not by omission*. Placing it beside the
+  operations, so `$queryRaw` is outside the guard _by nature, not by omission_. Placing it beside the
   guarded surface would imply a protection that does not apply. It also happens to be why
   `health.controller.ts` compiled unchanged through this rewrite: its `SELECT 1` never went through the
   guarded path in the first place.
@@ -729,11 +752,11 @@ the table that resolves tenancy for every inbound webhook: Twilio gives us `To`,
   number would route one business's callers to the other — the worst failure this system has. The
   database refuses to represent it, rather than relying on application code to prevent it.
 - **This model justifies `prisma.unscoped` for the first time**, exactly as predicted in step 16. The
-  `To` → business lookup happens *before* a tenant is known, so it cannot be guarded — there is no
+  `To` → business lookup happens _before_ a tenant is known, so it cannot be guarded — there is no
   `businessId` to scope by yet. The escape hatch exists for this shape of query, and it is good that its
   first real use is one line in one place.
 - **`status` has four values, and `SUSPENDED` is an offboarding grace state, not a synonym for
-  disabled.** When a business cancels, their carrier is *still* forwarding calls to us. Cutting the
+  disabled.** When a business cancels, their carrier is _still_ forwarding calls to us. Cutting the
   number dead sends **their customers** to a dead line — a harm that lands on people who never chose us
   (`docs/compliance.md` §8). Modelling the grace state in the enum means the safe behaviour is
   representable rather than depending on someone remembering the policy.
@@ -756,16 +779,16 @@ guarded). `docs/twilio-setup.md` §4–5. `docs/carrier-forwarding-test.md` (D13
 **Verified — the guard is now demonstrated, not just installed.** A throwaway script against the live
 database, 8/8:
 
-| Case | Result |
-|---|---|
-| `findMany({})` unscoped | `TenantScopeError` ✓ |
-| `findMany({ where: { businessId } })` | succeeds ✓ |
-| `findUnique({ where: { e164 } })` | `TenantScopeError` ✓ |
-| `businessId` nested inside `OR` | `TenantScopeError` ✓ |
-| `create` with no `businessId` | `TenantScopeError` ✓ |
-| `unscoped.findFirst({ where: { e164 } })` — the webhook lookup | succeeds ✓ |
-| `Business.findMany({})` — not a tenant model | succeeds ✓ |
-| scoping to the **wrong** tenant | allowed, returns 0 rows — confirming the guard is a net, not a wall |
+| Case                                                           | Result                                                              |
+| -------------------------------------------------------------- | ------------------------------------------------------------------- |
+| `findMany({})` unscoped                                        | `TenantScopeError` ✓                                                |
+| `findMany({ where: { businessId } })`                          | succeeds ✓                                                          |
+| `findUnique({ where: { e164 } })`                              | `TenantScopeError` ✓                                                |
+| `businessId` nested inside `OR`                                | `TenantScopeError` ✓                                                |
+| `create` with no `businessId`                                  | `TenantScopeError` ✓                                                |
+| `unscoped.findFirst({ where: { e164 } })` — the webhook lookup | succeeds ✓                                                          |
+| `Business.findMany({})` — not a tenant model                   | succeeds ✓                                                          |
+| scoping to the **wrong** tenant                                | allowed, returns 0 rows — confirming the guard is a net, not a wall |
 
 **Watch out for — two toolchain traps found the hard way in this step.**
 
@@ -775,7 +798,7 @@ database, 8/8:
 2. **`importFileExtension` had to be pinned to `""`.** Left unset, the generator emitted ESM-style
    `"./internal/class.js"` specifiers, which tsc resolves but **Jest does not** — the entire tenant-guard
    suite failed to load with `Cannot find module './internal/class.js'`. Worse, the output was
-   *non-deterministic*: the first generation emitted extensionless imports and a later one did not, so
+   _non-deterministic_: the first generation emitted extensionless imports and a later one did not, so
    the suite broke without any source change. Pinning it makes codegen independent of which command
    triggered it.
 
@@ -795,7 +818,7 @@ three times produce one call, one SMS, one lead.
 - **The uniqueness key is `dedupeKey`, built by the handler — this corrects the plan.** Both the plan
   and `.claude/skills/twilio/SKILL.md` §3 specified a compound unique on
   `(provider, externalEventId)`. **That is wrong, and would have caused silent data loss.** A `CallSid`
-  is not unique per delivery: one call produces an incoming webhook *plus* several status callbacks, all
+  is not unique per delivery: one call produces an incoming webhook _plus_ several status callbacks, all
   sharing it. A compound unique on those two columns would have accepted the first and silently rejected
   every subsequent status callback for that call — meaning we would never learn a call completed.
   Instead each handler constructs its own key and owns what "the same event" means:
@@ -810,7 +833,7 @@ three times produce one call, one SMS, one lead.
   `externalEventId` is kept as a plain indexed column so "show me everything about this call" is still
   one query — it just isn't load-bearing for correctness.
 
-- **Not a tenant model, and the reasoning is in the schema.** The row is written *before* the tenant is
+- **Not a tenant model, and the reasoning is in the schema.** The row is written _before_ the tenant is
   known and looked up by `dedupeKey` with no `businessId` in hand, so it cannot satisfy the guard.
   `businessId` is nullable and forensic only. The comment states the condition under which that must
   change: if this table is ever exposed through the API, it joins `TENANT_MODELS` and the column becomes
@@ -845,10 +868,232 @@ contract this implements — **and whose uniqueness key it corrects**). `docs/co
   (`...status:CA123:ringing`, `...status:CA123:completed`) → both inserted, 2 rows. This is precisely
   the case the originally-planned compound key would have swallowed.
 
-**Watch out for.** The dedupe key's correctness now lives in the *handlers*, not the schema. A handler
+**Watch out for.** The dedupe key's correctness now lives in the _handlers_, not the schema. A handler
 that builds a key without the distinguishing field — `twilio:voice:status:CA123` with no status —
 recreates exactly the collision this design avoids, and the failure is silent: events simply stop being
 recorded. Every handler that writes here needs a test asserting two distinct deliveries produce two rows.
+
+---
+
+### API — telephony
+
+#### `apps/api/src/telephony/twilio-signature.guard.ts`
+
+**Step 20** · 2026-07-29
+
+**What it does.** A Nest guard that rejects any request to a Twilio webhook without a valid
+`X-Twilio-Signature`. Exports `buildWebhookUrl` separately so URL reconstruction can be tested on its
+own.
+
+**Why it's written this way.**
+
+- **The threat is concrete, not theoretical.** These endpoints are unauthenticated and publicly
+  reachable — they have to be, so Twilio can reach them. The signature is the only thing separating a
+  real delivery from anyone who can guess the URL. A forged one creates leads, triggers SMS at our cost,
+  and puts text in front of a business's customers under their name.
+- **The URL is built from the pinned `PUBLIC_API_URL`, not from `req.protocol`/`req.host`.** This is the
+  §2 trap made concrete: behind Railway, Render or ngrok, `req.protocol` reports `http` while Twilio
+  called `https`, so a header-derived URL differs by one character and _every_ signature fails with no
+  useful error. `trust proxy` fixes that in principle, but it makes correctness depend on a forwarded
+  header we do not control. A pinned value is deterministic — and it is the same string
+  `docs/twilio-setup.md` tells you to configure in the Twilio console, so the two cannot drift.
+- **`originalUrl`, not `path`.** Twilio includes the query string in the signed string; `path` drops it.
+- **A missing `TWILIO_AUTH_TOKEN` refuses traffic rather than passing it through.** The token is optional
+  in `env.ts` so the app can boot before the AU regulatory bundle clears (that wait is days to weeks).
+  That convenience must not become an open door: with no token there is nothing to verify against, so
+  the guard fails closed and logs at ERROR.
+- **No test bypass exists, deliberately.** The obvious convenience — an env flag that skips validation in
+  development — is a permanent hole one misconfiguration away from production. Tests instead _sign_
+  their payloads with a dummy token, which is both safer and a better test, since it exercises the real
+  code path.
+- **403 with an empty body.** Nothing about why it failed goes back over the wire. The reason belongs in
+  our logs, not in a response to someone probing the endpoint.
+- **The failure log includes the reconstructed URL.** When this fires in a new environment the cause is
+  almost always that this exact string does not match what Twilio called. Without it in the log the
+  failure is opaque; with it, the diagnosis is immediate.
+
+**Connects to.** `.claude/skills/twilio/SKILL.md` §2. `config/env.ts` (`TWILIO_AUTH_TOKEN`,
+`PUBLIC_API_URL`). `main.ts` (`trust proxy` remains set as defence in depth, but this guard does not rely
+on it). Will be applied to every controller under `telephony/`.
+
+**Verified, 11/11.** Payloads were signed by an _independent_ implementation of Twilio's algorithm
+(HMAC-SHA1 over URL + params sorted by key, concatenated as key+value) and validated by the guard, so the
+test cross-checks the algorithm rather than round-tripping one library against itself:
+
+| Case                                                                   | Result    |
+| ---------------------------------------------------------------------- | --------- |
+| Valid signature                                                        | allowed ✓ |
+| Tampered param (`From` changed)                                        | 403 ✓     |
+| Extra param injected                                                   | 403 ✓     |
+| Param dropped                                                          | 403 ✓     |
+| Missing signature header                                               | 403 ✓     |
+| Valid signature replayed at a different path                           | 403 ✓     |
+| Empty body with matching signature                                     | allowed ✓ |
+| Params in a different order                                            | allowed ✓ |
+| URL: trailing slash on base / no leading slash / query string retained | correct ✓ |
+
+**Watch out for — an env-initialisation trap that will hit the spec file.** `config/env.ts` snapshots
+`process.env` at module-evaluation time, and ES module imports are **hoisted**. Setting
+`process.env.TWILIO_AUTH_TOKEN` at the top of a test file and then statically importing the guard does
+_not_ work — the import runs first, and every case fails with "TWILIO_AUTH_TOKEN is not set". This cost a
+run during verification. Tests must either set the variable before the module graph loads (a Jest setup
+file) or reach the guard through a dynamic `await import()`.
+
+Second: this guard does **not** record failed signatures to `webhook_events`, despite that table having
+a `signatureValid` column. Writing a row per rejected request is an unauthenticated, unbounded write
+path — a trivial amplification vector. Failures are logged at WARN instead, which preserves the "a burst
+of failures is visible" property. The column stays for when a recording path lands behind rate limiting.
+
+#### `apps/api/src/telephony/twilio-signature.guard.spec.ts`
+
+**Step 21** · 2026-07-29
+
+**What it does.** 24 tests over the guard: genuine deliveries, forged and tampered ones, diagnostic
+logging, URL reconstruction, and the unconfigured-token path. Total suite is now 121.
+
+**Why it's written this way.**
+
+- **Payloads are signed by an independent implementation of Twilio's algorithm**, not by the `twilio`
+  package's own signing helper. Using one library to both sign and verify round-trips an implementation
+  against itself and would pass even if our understanding of the algorithm were wrong. Signing by hand
+  makes the test an actual cross-check.
+- **It solves the env-hoisting trap flagged in step 20, in one file.** `config/env.ts` snapshots
+  `process.env` at module-evaluation time and ES imports are hoisted, so a static import of the guard
+  evaluates `env.ts` first and every case fails with "TWILIO_AUTH_TOKEN is not set". A CommonJS
+  `require` is _not_ hoisted, so it runs after the assignments. That kept this to a single file instead
+  of also needing a Jest `setupFiles` entry — worth the one lint-disable, and the comment explains it.
+- **Replay across paths is tested explicitly.** The URL is part of the signed string, so a signature
+  captured from the voice webhook must not validate against the messaging one. That is a real attack
+  shape, not a hypothetical.
+- **Diagnostics are asserted, not assumed.** Step 20 claimed the failure log contains the reconstructed
+  URL, and that it never leaks the reason in the response body or the token in a log line. Claims in
+  documentation decay; these are now tests.
+- **`tolerates a missing body`** guards a boring but real failure: a clean 403 rather than a `TypeError`
+  on `undefined`, which would surface as a 500 and look like our bug rather than a rejected forgery.
+- **The unconfigured-token case runs in its own top-level describe** with `jest.resetModules()`, because
+  it needs a different `env` snapshot than every other test. It asserts that even a _perfectly valid_
+  signature is rejected — the point being that with no token there is nothing to verify against.
+
+**Connects to.** `twilio-signature.guard.ts` (the only thing under test). `config/env.ts` (the module
+whose evaluation timing dictates this file's structure).
+
+**Watch out for — a Prettier/ESLint interaction.** `require(...)` and its `as typeof import(...)` cast
+are kept as **separate statements** deliberately. Combined, the line exceeds the print width, Prettier
+wraps it, and the `eslint-disable-next-line` comment then points at the wrapped line rather than the
+`require` — so lint fails with both "unused disable directive" _and_ "require is forbidden" at once, in
+a way that looks unrelated to whatever change triggered the reformat. Splitting the statements keeps the
+comment adjacent to what it suppresses regardless of formatting.
+
+**Watch out for — a `resetModules` subtlety that cost a run.** `jest.resetModules()` re-instantiates the
+**whole** module graph, including `@nestjs/common`. The reloaded guard therefore closes over a
+_different_ `Logger` class than the one imported at the top of the spec, so
+`jest.spyOn(Logger.prototype, 'error')` silently spies on the wrong object and asserts zero calls while
+the real logger writes to stdout. The fix is to `require('@nestjs/common')` _after_ the reset and spy on
+that copy. Any future test that combines `resetModules` with a spy on a library class needs the same
+treatment.
+
+#### `apps/api/src/telephony/webhook-events.service.ts`
+
+**Step 22** · 2026-07-29
+
+**What it does.** Records every provider delivery exactly once, and owns the lifecycle of those rows:
+`record`, `markProcessed`, `markIgnored`, `markFailed`, plus the 90-day retention sweep. Exports
+`dedupeKeys`, the four key shapes.
+
+**Why it's written this way.**
+
+- **`createManyAndReturn` with `skipDuplicates`, not a caught P2002.** Two reasons. The database decides
+  atomically in a single round trip, with no window between a "does it exist" check and the insert — the
+  race that a `findFirst`-then-`create` would open is exactly the concurrent-retry case this table
+  exists to handle. And it keeps duplicates off the exception path, which matters because **a duplicate
+  is normal traffic here, not an error**. An empty result array means the unique index rejected the row.
+- **The duplicate log is `debug`, not `warn`.** A Twilio retry is expected behaviour. Logging it as a
+  warning would train everyone to ignore warnings from this service, which is where a real problem would
+  eventually appear.
+- **`dedupeKeys` centralises the four shapes without taking the choice away from handlers.** §3 requires
+  each handler to own what "the same event" means; this just stops one inventing a fifth shape or
+  omitting a distinguishing field. The doc comment states the rule again at the point of use, because
+  the failure it prevents — omitting `callStatus` and silently collapsing every status callback into the
+  first — is invisible when it happens.
+- **`signatureValid: true` is written as a column rather than assumed.** Only validly-signed requests
+  reach this service, so it is constant today. It stays a column so the rate-limited failure-recording
+  path flagged in step 20 can populate it without a migration.
+- **`markIgnored` is separate from `markFailed`.** A spam caller is a deliberate non-action. Collapsing
+  the two would make failure rate useless as an alert signal, which is the one thing it is for.
+- **`markFailed` increments `attempts`** so a row that keeps failing reads as such rather than looking
+  like one stuck event.
+- **Errors truncate to 500 characters.** The schema says the column is for triage, not stack traces;
+  enforcing that here stops a caller quietly making it a log sink.
+- **`deleteOlderThan` exists before the job that calls it.** The 90-day retention rule is a documented
+  obligation (`docs/compliance.md` §7) covering caller phone numbers and message text. Writing the
+  method now means the obligation is implemented rather than remembered.
+
+**Connects to.** `prisma/schema.prisma` (`WebhookEvent`, step 18). `.claude/skills/twilio/SKILL.md` §3
+(the contract it implements). `twilio-signature.guard.ts` (runs first; nothing unsigned reaches here).
+Will be called by the voice and messaging webhook controllers.
+
+**Verified against the live database, 11/11.** The headline case: **five deliveries for one `CallSid`
+produced exactly three rows** — the two retries of the incoming webhook collapsed, and the two distinct
+status callbacks were both kept. That is simultaneously the property step 18 designed for and the bug
+the original `(provider, externalEventId)` key would have caused. Also confirmed: `attempts` increments
+across repeated failures, a 5,000-character error truncates to 500, and a 90-day sweep leaves fresh rows
+untouched.
+
+**Watch out for.** `skipDuplicates` makes a duplicate indistinguishable from a _lost_ insert at the call
+site — both return an empty array. That is correct here because the unique index is the only thing that
+can reject the row, but it means any future change adding another rejection path (a check constraint, a
+partial index) would be silently reported as "duplicate". If one is added, this method needs to
+distinguish them explicitly.
+
+Second: `record` hardcodes `provider: 'TWILIO'`. The enum already has `STRIPE` for billing webhooks
+later, and this service is otherwise provider-agnostic — the parameter should be lifted before a second
+provider arrives, not after.
+
+#### `apps/api/src/telephony/webhook-events.service.spec.ts`
+
+**Step 23** · 2026-07-29
+
+**What it does.** 17 tests: three pure ones over `dedupeKeys`, and fourteen integration tests against the
+real docker-compose Postgres covering idempotency, concurrency, lifecycle transitions and retention.
+Total suite is now 138.
+
+**Why it's written this way.**
+
+- **Not mocked, deliberately.** The behaviour under test _is_ the unique index and `skipDuplicates`. A
+  mocked Prisma client would assert the shape of a call rather than that the constraint holds, and would
+  pass just as happily against a schema with no unique index at all. This is the concrete case behind
+  "never mock Prisma" in `.claude/skills/backend/SKILL.md` §8.
+- **The concurrency test is the one that justifies the design.** Five identical deliveries fired through
+  `Promise.all` produce exactly one `recorded` and four `duplicate`, and one row. Twilio can retry
+  before the first request has committed, so a `findFirst`-then-`create` would let several through —
+  and that race is not expressible against a mock at all.
+- **Cleanup is prefix-scoped, not `TRUNCATE`.** Every row carries a per-run `TEST<pid>_<timestamp>`
+  prefix and only those are deleted. Truncating would work locally but would quietly destroy a
+  developer's inspection data and make two concurrent runs interfere.
+- **A failed connection is rewritten into an instruction.** Without the try/catch in `beforeAll` the
+  failure is a raw `ECONNREFUSED` that reads like a code bug; it now says "run `pnpm db:up` first". The
+  original error is attached as `cause` rather than stringified, so the stack survives — ESLint's
+  `preserve-caught-error` rule caught the first version, which had thrown it away.
+- **`dedupeKeys` gets its own pure describe block.** Those four strings are the correctness boundary of
+  the whole idempotency design, and they can be pinned without a database.
+
+**Connects to.** `webhook-events.service.ts` (under test). `docker-compose.yml` (requires it running).
+`prisma/schema.prisma` (the unique index it exercises).
+
+**Watch out for — this step forced a sibling change to `apps/api/package.json`.** Prisma 7's client uses
+a dynamic `import()` internally, which Jest's CJS sandbox rejects with
+`A dynamic import callback was invoked without --experimental-vm-modules`. The suite could not run
+without it, so the `test` and `test:watch` scripts now set
+`NODE_OPTIONS=--experimental-vm-modules`. Consequences worth knowing:
+
+- Node prints an `ExperimentalWarning` on every test run. It is noise, not a problem.
+- The `VAR=value cmd` prefix is POSIX shell syntax and will not work on Windows `cmd`. If a Windows
+  contributor ever appears, this needs `cross-env`.
+
+Second: `pnpm test` now **requires Postgres to be running**. Unit and integration tests share one
+command and one `.spec.ts` suffix. That matches the backend skill's guidance and keeps the setup simple,
+but it means CI must start docker-compose. If the split ever becomes painful, the fix is a separate
+`.int-spec.ts` suffix and a second Jest project — not mocking the database.
 
 #### `apps/api/src/common/phone.ts` · `phone.spec.ts`
 
@@ -930,7 +1175,7 @@ tenant-scoped model does not constrain by `businessId`. Implements D8.
 **Why it's written this way.**
 
 - **It asserts; it does not auto-inject.** The tempting design silently adds `where: { businessId }` to
-  every query. Rejected because it *hides* missing scoping rather than surfacing it — the first query
+  every query. Rejected because it _hides_ missing scoping rather than surfacing it — the first query
   shape the extension doesn't cover fails **open**, silently, in production. It also cannot work for
   Twilio webhooks or job processors, where the tenant comes from a phone-number lookup or `job.data`
   rather than a session; auto-injecting from an empty session would scope to nothing. Asserting behaves
@@ -938,12 +1183,12 @@ tenant-scoped model does not constrain by `businessId`. Implements D8.
 - **`TENANT_MODELS` lists models that don't exist yet.** A model is guarded from its first line rather
   than from whenever someone remembers to add it. Names absent from the schema are simply never queried,
   so listing them early costs nothing and closes the window where a new table is briefly unguarded.
-- **`Business` and `User` are deliberately excluded.** `Business` *is* the tenant, and both are
+- **`Business` and `User` are deliberately excluded.** `Business` _is_ the tenant, and both are
   legitimately read before a tenant is known — login and the magic-link exchange both happen without a
   `businessId` in hand.
 - **`findUnique` is banned on tenant models — the least obvious decision here.** A unique lookup takes
   only unique fields, so `findUnique({ where: { id } })` cannot express a tenant constraint at all. The
-  check then has to happen *after* the query, in application code, which is exactly where it gets
+  check then has to happen _after_ the query, in application code, which is exactly where it gets
   forgotten. `findFirst({ where: { id, businessId } })` pushes the constraint into the query and returns
   `null` for another tenant's row — which is the 404-not-403 behaviour the backend skill requires,
   achieved for free rather than by remembering to write it.
@@ -967,7 +1212,7 @@ operation, args) → void | throw` — so it is unit-testable without a database
    extension never sees them. Any raw query against a tenant table must carry its own
    `WHERE business_id = ...`, and there should be very few. The health check's `SELECT 1` is fine
    precisely because it touches no tenant table.
-2. **The guard checks that a `businessId` is *present*, not that it is the *right* one.** It cannot know
+2. **The guard checks that a `businessId` is _present_, not that it is the _right_ one.** It cannot know
    which tenant the current request belongs to. Passing a `businessId` the user doesn't own still
    passes — which is why services take `businessId` explicitly from the session or the webhook's
    phone-number lookup, never from client input, and why `forbidNonWhitelisted` rejects an injected one
@@ -995,13 +1240,13 @@ error diagnosability, and the model list itself. Total suite is now 97.
   worth catching, and a fixture name would hide it.
 - **The `OR` trap gets its own describe block.** It is the reason the check is shallow rather than
   recursive, so it is tested as behaviour rather than left as a comment. The `AND` case is tested too,
-  and documents that we reject a query that *would* actually be safe — the trade is that the rule stays
+  and documents that we reject a query that _would_ actually be safe — the trade is that the rule stays
   one sentence long instead of requiring the guard to walk boolean trees and decide which branches are
   load-bearing.
 - **Upsert is tested as two independent halves.** Scoping the `where` but not the `create` is the
   dangerous asymmetry: the insert branch is the one that writes a row into the wrong tenant, and it is
   easy to scope the lookup and forget the insert.
-- **Error *messages* are asserted, not just error types.** `findUnique` must name `findFirst` in its
+- **Error _messages_ are asserted, not just error types.** `findUnique` must name `findFirst` in its
   message, and an unknown operation must name `WHERE_SCOPED`. When this guard fires, it fires on someone
   who does not yet know the rule — the message is the documentation they will actually read.
 - **The last block tests `TENANT_MODELS` itself.** It guards the guard: it fails if someone prunes the
@@ -1010,8 +1255,8 @@ error diagnosability, and the model list itself. Total suite is now 97.
 
 **Connects to.** `tenant-guard.ts` (the only thing under test). Runs under `apps/api/jest.config.js`.
 
-**Watch out for.** These tests prove the guard *rejects unscoped queries*. They cannot prove the
-application passes the *correct* `businessId` — that needs integration tests authenticating as business
+**Watch out for.** These tests prove the guard _rejects unscoped queries_. They cannot prove the
+application passes the _correct_ `businessId` — that needs integration tests authenticating as business
 A and requesting business B's records (`.claude/skills/backend/SKILL.md` §8). Green here is necessary,
 not sufficient.
 

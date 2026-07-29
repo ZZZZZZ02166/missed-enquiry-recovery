@@ -8,8 +8,8 @@
     "build": "nest build",
     "start": "node dist/main.js",
     "start:worker": "node dist/worker.js",
-    "test": "jest",
-    "test:watch": "jest --watch",
+    "test": "NODE_OPTIONS=--experimental-vm-modules jest",
+    "test:watch": "NODE_OPTIONS=--experimental-vm-modules jest --watch",
     "lint": "eslint src",
     "typecheck": "tsc --noEmit"
   },
