@@ -1,6 +1,6 @@
 // Schema grows table by table (CLAUDE.md build protocol), not all twelve at once.
-// Landed so far: businesses, users.
-// Remaining: phone_numbers, services, customers, calls, conversations, messages,
+// Landed so far: businesses, users, phone_numbers.
+// Remaining: services, customers, calls, conversations, messages,
 //            leads, attachments, suppressions, webhook_events.
 //
 // Conventions (.claude/skills/backend/SKILL.md §4):
@@ -8,13 +8,27 @@
 //   cuid() ids — sequential integers leak volume and enable cross-tenant enumeration
 //   createdAt / updatedAt on every table
 //   money as integer cents, never Float
+//
+// AFTER EDITING THIS FILE, RUN BOTH:
+//   pnpm prisma migrate dev --name <change>
+//   pnpm prisma generate
+// `migrate dev` does NOT regenerate the client for this generator + custom output
+// path. Skip the second command and the new model is simply absent from the client:
+// `db.phoneNumber` is undefined, which reads as a TypeScript problem rather than a
+// stale-codegen one.
 
 generator client {
-  provider = "prisma-client"
-  output   = "../src/generated/prisma"
+  provider            = "prisma-client"
+  output              = "../src/generated/prisma"
   // CommonJS to match the API's tsconfig — Nest's DI needs emitDecoratorMetadata,
   // and mixing an ESM client into that toolchain is avoidable pain.
-  moduleFormat = "cjs"
+  moduleFormat        = "cjs"
+  // Emit extensionless relative imports. Left unset, the generator emits ESM-style
+  // "./internal/class.js" specifiers, which tsc resolves but Jest does not — the
+  // whole tenant-guard suite fails to even load with "Cannot find module
+  // './internal/class.js'". Pinning it here keeps codegen deterministic instead of
+  // depending on which command happened to trigger generation.
+  importFileExtension = ""
 }
 
 // Prisma 7 removed `url` from the datasource block. The connection string lives in
@@ -50,7 +64,8 @@ model Business {
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
 
-  users User[]
+  users        User[]
+  phoneNumbers PhoneNumber[]
 
   @@map("businesses")
 }
@@ -71,4 +86,77 @@ model User {
 
   @@index([businessId])
   @@map("users")
+}
+
+/// What a provisioned number is for. A business has one of each: the local voice
+/// number their carrier forwards missed calls to, and the mobile number the
+/// two-way recovery conversation runs on (docs/twilio-setup.md §4).
+enum PhoneNumberPurpose {
+  VOICE_INBOUND
+  SMS_TWO_WAY
+
+  @@map("phone_number_purpose")
+}
+
+/// SUSPENDED is the offboarding grace state, not a synonym for disabled. When a
+/// business cancels, their carrier is still forwarding calls to us — cutting the
+/// number dead sends *their customers* to a dead line. We keep answering with
+/// "please call the main line" for 30 days (docs/compliance.md §8).
+enum PhoneNumberStatus {
+  PENDING
+  ACTIVE
+  SUSPENDED
+  RELEASED
+
+  @@map("phone_number_status")
+}
+
+/// A Twilio number we own on a business's behalf.
+///
+/// This is the table that resolves tenancy for every inbound webhook: Twilio gives
+/// us `To`, and this maps it to a businessId. That lookup necessarily happens
+/// *before* a tenant is known, so it is the primary legitimate caller of
+/// `prisma.unscoped` (D8).
+model PhoneNumber {
+  id         String @id @default(cuid())
+  businessId String @map("business_id")
+
+  /// Our Twilio number, E.164. Globally unique — this is a safety constraint, not a
+  /// convenience one. Two businesses sharing an inbound number would route one
+  /// business's callers to the other, which is the worst failure this system has.
+  e164 String @unique
+
+  /// Null until the number is actually provisioned — an AU regulatory bundle can
+  /// take days, so a business record exists before its numbers do.
+  twilioSid String? @unique @map("twilio_sid")
+
+  purpose PhoneNumberPurpose
+  status  PhoneNumberStatus  @default(PENDING)
+
+  statusChangedAt DateTime? @map("status_changed_at")
+
+  /// The number the business advertises and forwards *from* — their own mobile.
+  /// Needed to write correct offboarding instructions, and to recognise the
+  /// business's own staff calling in.
+  forwardsFromE164 String? @map("forwards_from_e164")
+
+  /// Underlying carrier, free text because MVNOs resell all three networks. Stored
+  /// because D13 may restrict us to carriers that preserve the caller's number on a
+  /// forwarded leg — in which case this becomes a support and eligibility field,
+  /// not a curiosity.
+  forwardingCarrier String? @map("forwarding_carrier")
+
+  /// Set only when a real test call has arrived through this number end to end.
+  /// Onboarding must not activate an account on the assumption that dialling the
+  /// MMI codes worked; forwarding fails silently and often.
+  forwardingVerifiedAt DateTime? @map("forwarding_verified_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+  @@index([businessId, purpose])
+  @@map("phone_numbers")
 }

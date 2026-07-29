@@ -51,6 +51,7 @@ decision rather than restating the argument.
 | 14  | 2026-07-27 | `apps/api/src/prisma/tenant-guard.ts`  | D8 — throws when a query on a tenant model isn't scoped by businessId              |
 | 15  | 2026-07-27 | `apps/api/src/prisma/tenant-guard.spec.ts` | 71 tests pinning the guard's behaviour, including the OR trap                  |
 | 16  | 2026-07-29 | `apps/api/src/prisma/prisma.service.ts` | Applies the guard; three surfaces — `db`, `unscoped`, raw                          |
+| 17  | 2026-07-29 | `apps/api/prisma/schema.prisma`        | `phone_numbers` — first tenant model; guard proven 8/8 against a live database     |
 
 ---
 
@@ -712,6 +713,74 @@ then, "guard active" means "installed", not "demonstrated".
 
 Second: class field initialisation order matters here. `db` is initialised from `this.base`, so `base`
 must be declared first. Reordering the fields would break it at construction time, not at compile time.
+
+#### `apps/api/prisma/schema.prisma` — `phone_numbers` added
+
+**Step 17** · 2026-07-29
+
+**What it does.** Adds `PhoneNumber` plus two enums (`PhoneNumberPurpose`, `PhoneNumberStatus`). This is
+the table that resolves tenancy for every inbound webhook: Twilio gives us `To`, and this maps it to a
+`businessId`.
+
+**Why it's written this way.**
+
+- **`e164 @unique` is a safety constraint, not a convenience one.** Two businesses sharing an inbound
+  number would route one business's callers to the other — the worst failure this system has. The
+  database refuses to represent it, rather than relying on application code to prevent it.
+- **This model justifies `prisma.unscoped` for the first time**, exactly as predicted in step 16. The
+  `To` → business lookup happens *before* a tenant is known, so it cannot be guarded — there is no
+  `businessId` to scope by yet. The escape hatch exists for this shape of query, and it is good that its
+  first real use is one line in one place.
+- **`status` has four values, and `SUSPENDED` is an offboarding grace state, not a synonym for
+  disabled.** When a business cancels, their carrier is *still* forwarding calls to us. Cutting the
+  number dead sends **their customers** to a dead line — a harm that lands on people who never chose us
+  (`docs/compliance.md` §8). Modelling the grace state in the enum means the safe behaviour is
+  representable rather than depending on someone remembering the policy.
+- **`status` defaults to `PENDING`, and `forwardingVerifiedAt` is separate.** Onboarding must not
+  activate an account on the assumption that dialling the MMI codes worked — forwarding fails silently
+  and often. `forwardingVerifiedAt` is set only when a real test call has arrived end to end, which is
+  the plan's "only activate after the full test succeeds" expressed as a column.
+- **`twilioSid` is nullable.** The AU regulatory bundle can take days, so a business record legitimately
+  exists before its numbers do.
+- **`forwardingCarrier` is free text, not an enum.** MVNOs resell all three networks, so the value space
+  is open. It is stored because D13 may restrict us to carriers that preserve the caller's number — in
+  which case this becomes an eligibility field, not a curiosity.
+- **`forwardsFromE164` records the business's own advertised number.** Needed to write correct
+  offboarding instructions, and to recognise the business's own staff calling in.
+
+**Connects to.** `tenant-guard.ts` (`PhoneNumber` was already in `TENANT_MODELS`, so it arrived
+guarded). `docs/twilio-setup.md` §4–5. `docs/carrier-forwarding-test.md` (D13 feeds
+`forwardingCarrier`). Migration `20260729102922_add_phone_numbers`.
+
+**Verified — the guard is now demonstrated, not just installed.** A throwaway script against the live
+database, 8/8:
+
+| Case | Result |
+|---|---|
+| `findMany({})` unscoped | `TenantScopeError` ✓ |
+| `findMany({ where: { businessId } })` | succeeds ✓ |
+| `findUnique({ where: { e164 } })` | `TenantScopeError` ✓ |
+| `businessId` nested inside `OR` | `TenantScopeError` ✓ |
+| `create` with no `businessId` | `TenantScopeError` ✓ |
+| `unscoped.findFirst({ where: { e164 } })` — the webhook lookup | succeeds ✓ |
+| `Business.findMany({})` — not a tenant model | succeeds ✓ |
+| scoping to the **wrong** tenant | allowed, returns 0 rows — confirming the guard is a net, not a wall |
+
+**Watch out for — two toolchain traps found the hard way in this step.**
+
+1. **`prisma migrate dev` does not regenerate the client** for this generator and custom output path.
+   The new model was simply absent — `db.phoneNumber` undefined — which reads as a TypeScript problem
+   rather than a stale-codegen one. The schema header now says to run both commands.
+2. **`importFileExtension` had to be pinned to `""`.** Left unset, the generator emitted ESM-style
+   `"./internal/class.js"` specifiers, which tsc resolves but **Jest does not** — the entire tenant-guard
+   suite failed to load with `Cannot find module './internal/class.js'`. Worse, the output was
+   *non-deterministic*: the first generation emitted extensionless imports and a later one did not, so
+   the suite broke without any source change. Pinning it makes codegen independent of which command
+   triggered it.
+
+Third, for later: releasing a number and reassigning it to another business will collide with
+`e164 @unique`, since a `RELEASED` row keeps its value. Not a problem yet — worth a deliberate decision
+before the first offboarding, not an improvised one.
 
 #### `apps/api/src/common/phone.ts` · `phone.spec.ts`
 
