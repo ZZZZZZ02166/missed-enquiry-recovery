@@ -50,6 +50,7 @@ decision rather than restating the argument.
 | 13  | 2026-07-27 | Scaffolding batch                      | Root config, both apps, Prisma + first migration, health, phone helper — see below |
 | 14  | 2026-07-27 | `apps/api/src/prisma/tenant-guard.ts`  | D8 — throws when a query on a tenant model isn't scoped by businessId              |
 | 15  | 2026-07-27 | `apps/api/src/prisma/tenant-guard.spec.ts` | 71 tests pinning the guard's behaviour, including the OR trap                  |
+| 16  | 2026-07-29 | `apps/api/src/prisma/prisma.service.ts` | Applies the guard; three surfaces — `db`, `unscoped`, raw                          |
 
 ---
 
@@ -660,6 +661,57 @@ invalid, listing every problem at once.
 
 **Watch out for.** The D8 tenancy assertion extension is **not applied yet**, and the file says so in a
 block comment rather than a TODO — a TODO would be invisible by the time it matters.
+
+**Superseded by step 16** — the guard is now applied and the class was restructured. See below.
+
+#### `apps/api/src/prisma/prisma.service.ts` (rewritten)
+
+**Step 16** · 2026-07-29
+
+**What it does.** Owns the Prisma client, applies the tenancy guard, and exposes three deliberately
+distinct surfaces: `db` (guarded), `unscoped` (the escape hatch), and `$queryRaw` / `$executeRaw` (raw
+SQL).
+
+**Why it's written this way.**
+
+- **It no longer extends `PrismaClient`, and that is the whole point.** `$extends` returns a *new*
+  client rather than mutating the instance, so with inheritance `this` would remain the **unguarded**
+  base — the default surface would be the unsafe one, which is exactly backwards. Composition makes the
+  guarded client the default and forces `unscoped` to be asked for by name. The structural change was
+  forced by a one-line library behaviour, and getting it wrong would have silently disabled D8 while
+  looking correct.
+- **Three surfaces, chosen so the call site is self-documenting.** `prisma.db.lead.findMany(...)` and
+  `prisma.unscoped.phoneNumber.findFirst(...)` differ visibly in the diff. The rejected alternative was
+  injecting the extended client directly under one token, giving the nicer `prisma.lead.findMany(...)`
+  — but then which client you got would depend on a token declared in another file, and a reviewer
+  reading a query could not tell whether it was guarded. Slightly worse ergonomics bought local
+  readability at the exact place mistakes are made.
+- **`base` is private; `unscoped` is a getter.** There is one way to reach the unguarded client and it
+  is spelled `unscoped`, so `grep -rn 'unscoped' src/` is a complete audit of every bypass.
+- **Raw SQL sits on the root, not under `db` — deliberately.** The extension only sees model
+  operations, so `$queryRaw` is outside the guard *by nature, not by omission*. Placing it beside the
+  guarded surface would imply a protection that does not apply. It also happens to be why
+  `health.controller.ts` compiled unchanged through this rewrite: its `SELECT 1` never went through the
+  guarded path in the first place.
+- **`$transaction` is exposed from `db`, not `base`.** Easy to get wrong: a transaction taken from the
+  base client would run every statement inside it unguarded, which is the most dangerous possible place
+  to lose the check. Bound to the extended client so statements inside a transaction are checked too.
+- **The connect log says "tenant guard active".** Boot output is where you look when something is
+  wrong; if the guard is ever accidentally removed, the absence of that phrase is a visible signal.
+
+**Connects to.** `tenant-guard.ts` (applied here). `prisma.module.ts` exports this globally.
+`config/env.ts` supplies `DATABASE_URL`. `health/health.controller.ts` uses the raw surface.
+
+**Verified.** Rebuilt and booted against the live container: `Database connected (tenant guard active)`
+in the log, `/health/ready` → `{"status":"ok","database":"ok"}`.
+
+**Watch out for.** The guard is wired but **has not yet been exercised against a real tenant model** —
+`TENANT_MODELS` names nine models and the schema currently contains none of them, so `db.phoneNumber`
+does not exist yet. The first genuine end-to-end proof arrives with `phone_numbers` in step 17. Until
+then, "guard active" means "installed", not "demonstrated".
+
+Second: class field initialisation order matters here. `db` is initialised from `this.base`, so `base`
+must be declared first. Reordering the fields would break it at construction time, not at compile time.
 
 #### `apps/api/src/common/phone.ts` · `phone.spec.ts`
 
