@@ -64,6 +64,7 @@ decision rather than restating the argument.
 | 26  | 2026-07-31 | `apps/api/src/app.module.ts`                            | Imports TelephonyModule — routes go live; signed curl → TwiML, end to end          |
 | 27  | 2026-08-01 | `apps/api/prisma/schema.prisma`                         | `customers` + `calls` — a call is not a lead (D5). 14/14 verified                  |
 | 28  | 2026-08-01 | `apps/api/src/calls/calls.service.ts`                   | Records the call and decides whether to recover. 18/18 verified                    |
+| 29  | 2026-08-01 | `apps/api/prisma/schema.prisma`                         | `suppressions` — opt-out, blocklist, landline cache in one table. 9/9 verified     |
 
 ---
 
@@ -1382,6 +1383,70 @@ kill switch, when the table lands.
 Second: the per-business cap counts a rolling 24 hours, not a calendar day in the business's timezone.
 For a spend guardrail that is arguably better — it cannot be reset by midnight — but it does not match
 what an owner would mean by "200 a day", so the wording in any future settings UI needs care.
+
+#### `apps/api/prisma/schema.prisma` — `suppressions` added
+
+**Step 29** · 2026-08-01
+
+**What it does.** Adds `Suppression` and `SuppressionReason`. One table answering one question — "may we
+send to this number?" — for four different reasons: an opt-out, a non-textable line, an owner blocklist
+entry, and staff.
+
+**Why it's written this way.**
+
+- **One table, not three.** Opt-outs, the blocklist and cached landline results are separate concerns
+  that all get consulted at the same instant, on the same hot path. Three tables would mean three
+  lookups before every send and three chances to forget one — and the one you forget is the one that
+  breaches the Spam Act.
+- **`@@unique([businessId, phoneE164])` — suppression is per sender, not global.** This mirrors how the
+  Spam Act treats consent: a number that opted out of one business's messages has said nothing about
+  another's. Getting this wrong is a bug in _both_ directions — global suppression silently loses a
+  different business's leads, while no suppression breaches. Both directions are tested.
+- **The unique constraint has a consequence worth stating: one reason per number per business.** A
+  number blocked as `SPAM` that later replies STOP cannot hold both. `OPTED_OUT` must win, because it is
+  the only one with legal weight — that precedence belongs in the service's upsert, and is noted in the
+  schema so it is not discovered later.
+- **`sourceMessageSid` is a plain string, deliberately not a foreign key.** It is evidence that an
+  opt-out was honoured and when. `messages` does not exist yet, and more importantly this must **outlive**
+  the 90-day retention sweep that will eventually delete the message itself. A foreign key would either
+  block that deletion or cascade away the evidence.
+- **Opt-out rows are never bulk-deleted.** Honouring an opt-out means keeping the record of it, which
+  makes this table a deliberate exception to data minimisation (`docs/compliance.md` §7). Stated in the
+  model doc so nobody "cleans up old suppressions" and silently re-enables messaging to people who said
+  stop.
+- **The doc comment records the Twilio 21610 divergence.** Twilio keeps its own opt-out list per sending
+  number and rejects sends even when our database thinks a number is fine. The worker must back-fill a
+  row on 21610 — noted here because that is where someone will look when a send mysteriously fails.
+
+**Connects to.** `calls.service.ts` — this table is what `NoRecoveryReason.SUPPRESSED` needs, and closes
+the gap flagged in step 28. `.claude/skills/twilio/SKILL.md` §5 (opt-out, 21610).
+`docs/compliance.md` §1 and §7. Migration `20260801072010_add_suppressions`.
+
+**Verified against the live database, 9/9.** Guarded by the tenant extension. An opt-out stores with its
+evidence SID. **The same number is suppressed at business A and not at B**, and can be suppressed at B
+independently under a different reason. A duplicate `(business, phone)` is rejected. All four reasons
+round-trip. Business deletion cascades.
+
+**Index usage was measured, not assumed** — 500 rows, `EXPLAIN` on both real query shapes:
+
+| Query                                 | Plan                                                                                    |
+| ------------------------------------- | --------------------------------------------------------------------------------------- |
+| Hot path: `(business_id, phone_e164)` | `Index Only Scan using suppressions_business_id_phone_e164_key` — no heap access at all |
+| Dashboard: `(business_id, reason)`    | `Index Scan using suppressions_business_id_phone_e164_reason_idx`                       |
+
+Both indexes earn their place, and the hot path is an _index-only_ scan — the send guard never touches
+the table itself. Worth checking rather than assuming: the composite index has `phone_e164` in the
+middle, so it was not obvious it would serve a `(business_id, reason)` filter, and it does.
+
+**Watch out for.** The table exists; **nothing reads it yet**. `calls.service.ts` still never returns
+`SUPPRESSED`, so an opt-out is recorded and then ignored. The gap flagged in step 28 is now _closable_,
+not closed — the check must be added to `decideRecovery` immediately after the kill switch. Until then
+the compliance exposure is unchanged.
+
+Second: `NOT_TEXTABLE` is duplicated between here and `Customer.lineType`. That is intentional — the
+customer row caches what Lookup said, while a suppression row is the decision not to send — but two
+places holding the same fact can disagree. The service that writes both must keep them consistent, and
+`suppressions` is the one the send path trusts.
 
 #### `apps/api/src/common/phone.ts` · `phone.spec.ts`
 

@@ -1,6 +1,7 @@
 // Schema grows table by table (CLAUDE.md build protocol), not all twelve at once.
-// Landed so far: businesses, users, phone_numbers, webhook_events, customers, calls.
-// Remaining: services, conversations, messages, leads, attachments, suppressions.
+// Landed so far: businesses, users, phone_numbers, webhook_events, customers, calls,
+//                suppressions.
+// Remaining: services, conversations, messages, leads, attachments.
 //
 // Conventions (.claude/skills/backend/SKILL.md §4):
 //   camelCase fields, snake_case tables and columns via @map/@@map
@@ -67,6 +68,7 @@ model Business {
   phoneNumbers PhoneNumber[]
   customers    Customer[]
   calls        Call[]
+  suppressions Suppression[]
 
   @@map("businesses")
 }
@@ -308,6 +310,71 @@ model Call {
   @@index([businessId, noRecoveryReason])
   @@index([customerId])
   @@map("calls")
+}
+
+/// Why a number must not be texted.
+///
+/// One table covers three concerns that all answer the same question at the same
+/// moment — "may we send to this number?" — and splitting them would mean three
+/// lookups on the hot path and three chances to forget one.
+enum SuppressionReason {
+  /// STOP, UNSUBSCRIBE, CANCEL, END, QUIT. Legally binding under the Spam Act.
+  OPTED_OUT
+  /// Twilio Lookup says landline or toll-free; a send fails and still bills us.
+  NOT_TEXTABLE
+  /// Owner blocked them from the dashboard — a marketer, a nuisance caller.
+  SPAM
+  /// Staff, supplier, or an existing customer mid-job. Seeded at onboarding.
+  STAFF
+
+  @@map("suppression_reason")
+}
+
+/// Numbers we must not send to.
+///
+/// OPTED_OUT rows are the reason this table is checked before every send and never
+/// bulk-deleted: honouring an opt-out means keeping the record of it, which makes
+/// this a deliberate exception to data minimisation (docs/compliance.md §7).
+///
+/// Twilio maintains its own opt-out list per sending number and rejects sends with
+/// error 21610 even when our database thinks a number is fine. That is why the
+/// worker must back-fill a row on 21610: the two lists diverge, and Twilio's is
+/// authoritative for what actually gets delivered.
+model Suppression {
+  id         String @id @default(cuid())
+  businessId String @map("business_id")
+
+  /// E.164, normalised at the edge. The unique constraint below is only meaningful
+  /// because every writer normalises first (CLAUDE.md rule 6).
+  phoneE164 String @map("phone_e164")
+
+  reason SuppressionReason
+
+  /// Free text for the dashboard — "blocked by owner, repeated marketing calls".
+  note String?
+
+  /// The inbound message carrying the STOP, when there was one. Evidence that the
+  /// opt-out was honoured, and when. Not a foreign key: `messages` does not exist
+  /// yet, and this must survive the 90-day retention sweep that will eventually
+  /// remove the message itself.
+  sourceMessageSid String? @map("source_message_sid")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  /// One row per number per business. A number opted out of one business's messages
+  /// has said nothing about another's — suppression is per sender, as the Spam Act
+  /// treats it.
+  ///
+  /// Consequence: a number suppressed for one reason cannot also be recorded under
+  /// another. Reason is a single answer to "why", and OPTED_OUT is the one that
+  /// must win — see the upsert precedence rule in the suppressions service.
+  @@unique([businessId, phoneE164])
+  /// The hot path: "may we send to this number?"
+  @@index([businessId, phoneE164, reason])
+  @@map("suppressions")
 }
 
 enum WebhookProvider {
