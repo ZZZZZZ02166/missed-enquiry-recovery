@@ -1,7 +1,6 @@
 // Schema grows table by table (CLAUDE.md build protocol), not all twelve at once.
-// Landed so far: businesses, users, phone_numbers, webhook_events.
-// Remaining: services, customers, calls, conversations, messages,
-//            leads, attachments, suppressions.
+// Landed so far: businesses, users, phone_numbers, webhook_events, customers, calls.
+// Remaining: services, conversations, messages, leads, attachments, suppressions.
 //
 // Conventions (.claude/skills/backend/SKILL.md §4):
 //   camelCase fields, snake_case tables and columns via @map/@@map
@@ -66,6 +65,8 @@ model Business {
 
   users        User[]
   phoneNumbers PhoneNumber[]
+  customers    Customer[]
+  calls        Call[]
 
   @@map("businesses")
 }
@@ -159,6 +160,154 @@ model PhoneNumber {
   @@index([businessId])
   @@index([businessId, purpose])
   @@map("phone_numbers")
+}
+
+/// Twilio Lookup line type, cached so we never pay for the same number twice
+/// (~US$0.008 per lookup). UNKNOWN means not yet looked up — distinct from a lookup
+/// that ran and returned something unusable.
+enum LineType {
+  UNKNOWN
+  MOBILE
+  LANDLINE
+  VOIP
+  TOLL_FREE
+  OTHER
+
+  @@map("line_type")
+}
+
+/// A person who has called a business. Created on first contact, then reused —
+/// this is what makes "they've rung us before" possible.
+model Customer {
+  id         String @id @default(cuid())
+  businessId String @map("business_id")
+
+  /// E.164, normalised at the edge (CLAUDE.md rule 6). The unique constraint below
+  /// only means anything because every writer normalises first.
+  phoneE164 String @map("phone_e164")
+
+  /// Learned from the SMS conversation, not from the call. Null until they say.
+  name  String?
+  email String?
+
+  /// Cached Twilio Lookup result. Texting a landline fails and we are billed anyway,
+  /// so this is checked before the first send and never looked up twice.
+  lineType   LineType  @default(UNKNOWN)
+  lineTypeAt DateTime? @map("line_type_at")
+
+  /// Staff, suppliers, existing customers mid-job. They get a different message —
+  /// "What service do you need?" is jarring when you are ringing about today's job.
+  isKnownContact Boolean @default(false) @map("is_known_contact")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  calls    Call[]
+
+  /// The same phone number is a different customer for a different business.
+  @@unique([businessId, phoneE164])
+  @@index([businessId, createdAt])
+  @@map("customers")
+}
+
+/// How the call ended, from Twilio's `CallStatus`.
+///
+/// NO_ANSWER / BUSY / FAILED are what a *forwarded* call looks like when the owner
+/// did not pick up — they are the product's trigger, not errors.
+enum CallOutcome {
+  IN_PROGRESS
+  COMPLETED
+  NO_ANSWER
+  BUSY
+  FAILED
+  CANCELED
+
+  @@map("call_outcome")
+}
+
+/// Why no recovery SMS was sent. Null means one was (or is about to be).
+///
+/// Every one of these is a real, frequent case that costs money or trust if handled
+/// wrong, and the reason has to survive so "why did this caller never hear from us?"
+/// is answerable months later.
+enum NoRecoveryReason {
+  /// Caller ID withheld — nobody to text.
+  ANONYMOUS_CALLER
+  /// Twilio Lookup says landline or toll-free; an SMS would fail and still bill us.
+  NOT_TEXTABLE
+  /// STOP, or a blocklist entry.
+  SUPPRESSED
+  /// Already texted this number for this business within the throttle window.
+  RECENTLY_CONTACTED
+  /// Staff, supplier, or an existing customer mid-job.
+  KNOWN_CONTACT
+  /// Per-business daily cap or the global kill switch.
+  CAP_REACHED
+  /// The owner answered. Nothing to recover.
+  ANSWERED
+
+  @@map("no_recovery_reason")
+}
+
+/// A single inbound call.
+///
+/// A call is NOT a lead (D5). Leads are created lazily on the customer's first
+/// reply; calls that never get a response stay here. That is what keeps the owner's
+/// inbox honest and makes "% of missed callers who became qualified leads"
+/// computable.
+///
+/// No recording, ever — metadata only (CLAUDE.md rule 3).
+model Call {
+  id         String @id @default(cuid())
+  businessId String @map("business_id")
+
+  /// Null for a withheld caller ID: the call still happened and is still recorded,
+  /// there is simply no one to attribute it to.
+  customerId String? @map("customer_id")
+
+  /// Twilio's CallSid. Unique — one row per call, however many webhooks it emits.
+  providerCallSid String @unique @map("provider_call_sid")
+
+  /// The caller, E.164. Null when withheld.
+  fromE164 String? @map("from_e164")
+  /// Our Twilio number they reached.
+  toE164   String  @map("to_e164")
+
+  /// The business's own number, when the carrier supplies a diversion header.
+  /// Inconsistently populated on AU PSTN, so never depended on — stored because it
+  /// is evidence for the D13 question of what carriers actually pass through.
+  forwardedFromE164 String? @map("forwarded_from_e164")
+
+  outcome CallOutcome @default(IN_PROGRESS)
+
+  startedAt DateTime  @default(now()) @map("started_at")
+  endedAt   DateTime? @map("ended_at")
+
+  /// Whole seconds, from Twilio. Our leg only — the greeting, not the ring time.
+  durationSeconds Int? @map("duration_seconds")
+
+  /// Set when the recovery SMS is enqueued, not when it is delivered. The message's
+  /// own delivery status lives on `messages`.
+  recoverySmsQueuedAt DateTime? @map("recovery_sms_queued_at")
+
+  /// Null when a recovery SMS was sent. Otherwise the reason it was not — the
+  /// denominator of the pilot's headline metric depends on being able to separate
+  /// "we chose not to text" from "we failed to text".
+  noRecoveryReason NoRecoveryReason? @map("no_recovery_reason")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  business Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  customer Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+
+  /// The dashboard's default view: this business's calls, newest first.
+  @@index([businessId, startedAt])
+  /// "Which missed calls never got a recovery text, and why?"
+  @@index([businessId, noRecoveryReason])
+  @@index([customerId])
+  @@map("calls")
 }
 
 enum WebhookProvider {

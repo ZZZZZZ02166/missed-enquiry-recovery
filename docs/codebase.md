@@ -60,6 +60,9 @@ decision rather than restating the argument.
 | 23  | 2026-07-29 | `apps/api/src/telephony/webhook-events.service.spec.ts` | First integration suite — real Postgres, incl. a concurrency race                  |
 | —   | 2026-07-29 | `apps/api/package.json`                                 | `NODE_OPTIONS=--experimental-vm-modules` — Prisma 7 needs it under Jest            |
 | 24  | 2026-07-31 | `apps/api/src/telephony/voice.controller.ts`            | Answers the forwarded call; resolves tenant from `To`. 15/15 verified              |
+| 25  | 2026-07-31 | `apps/api/src/telephony/telephony.module.ts`            | Wires the controller, guard and service; routes map, guard rejects unsigned        |
+| 26  | 2026-07-31 | `apps/api/src/app.module.ts`                            | Imports TelephonyModule — routes go live; signed curl → TwiML, end to end          |
+| 27  | 2026-08-01 | `apps/api/prisma/schema.prisma`                         | `customers` + `calls` — a call is not a lead (D5). 14/14 verified                  |
 
 ---
 
@@ -907,8 +910,11 @@ own.
   development — is a permanent hole one misconfiguration away from production. Tests instead _sign_
   their payloads with a dummy token, which is both safer and a better test, since it exercises the real
   code path.
-- **403 with an empty body.** Nothing about why it failed goes back over the wire. The reason belongs in
-  our logs, not in a response to someone probing the endpoint.
+- **403 carrying no reason.** The exception is constructed with an empty message, so nothing about _why_
+  validation failed goes back over the wire — that belongs in our logs, not in a response to someone
+  probing the endpoint. (Precision, added at step 25: Nest's exception filter still serialises this to
+  `{"statusCode":403,"message":""}` rather than a zero-length body. The security property — no reason
+  disclosed — holds; the earlier wording "empty body" described the exception object, not the wire.)
 - **The failure log includes the reconstructed URL.** When this fires in a new environment the cause is
   almost always that this exact string does not match what Twilio called. Without it in the log the
   failure is opaque; with it, the diagnosis is immediate.
@@ -1155,6 +1161,159 @@ receives nothing. That is the honest state of the product until the calls module
 Third: the answer/announce flow assumes `From` is the **original caller** rather than the forwarding
 party. That is still D13 — unmeasured. If AU carriers present the business's own number, this controller
 records calls correctly and the recovery premise collapses anyway.
+
+#### `apps/api/src/telephony/telephony.module.ts`
+
+**Step 25** · 2026-07-31
+
+**What it does.** Registers `VoiceController`, `WebhookEventsService` and `TwilioSignatureGuard`, and
+exports the service for downstream modules.
+
+**Why it's written this way.**
+
+- **The signature guard is a module provider, not a global guard.** `APP_GUARD` would put it in front of
+  `/health`, the future dashboard API, and everything else — where a Twilio signature is meaningless and
+  would reject all traffic. Scoping it to this module means the blast radius of "everything requires a
+  Twilio signature" is exactly the routes where that is true.
+- **`PrismaService` is not imported.** `PrismaModule` is `@Global()`, so it is already available. Worth
+  stating in the file, because the absence otherwise reads as an oversight in a module whose controller
+  clearly uses Prisma.
+- **Only `WebhookEventsService` is exported.** The calls and conversations modules will need it to mark
+  events processed once the queue exists. Controllers are entry points and the guard is only meaningful
+  beside them, so exporting either would invite use that does not make sense.
+
+**Connects to.** `voice.controller.ts`, `webhook-events.service.ts`, `twilio-signature.guard.ts`,
+`prisma.module.ts` (global).
+
+**Verified 6/7, with the seventh a real finding.** The module was mounted in a throwaway root containing
+_only_ `PrismaModule` and `TelephonyModule` — proving it stands alone and does not lean on anything
+`AppModule` happens to provide. Confirmed: the DI graph resolves, `WebhookEventsService` is visible to a
+consumer module that imports this one, both routes map
+(`POST /webhooks/twilio/voice/incoming`, `POST /webhooks/twilio/voice/status`), and an **unsigned HTTP
+request is rejected with 403** — the guard is genuinely applied over the wire, not just decorated.
+
+**The failing assertion was correct and my documentation was wrong.** Step 20 claimed the guard returns
+"403 with an empty body". Over real HTTP, Nest's exception filter serialises the empty-message
+`HttpException` to `{"statusCode":403,"message":""}`. The security property still holds — no reason is
+disclosed — but "empty body" described the exception object rather than the response. Step 20's entry is
+now corrected. Left as-is in code: the body reveals nothing an attacker cannot already infer, and
+changing it to chase the earlier wording would be scope creep. This is a good argument for testing over
+HTTP rather than against the exception alone.
+
+**Watch out for.** The routes still do not exist on the running application — `AppModule` does not import
+this module, so `pnpm dev:api` will 404 on both paths. That one-line edit is step 26, kept separate
+because it is the moment public webhook endpoints switch on, which deserves its own review rather than
+riding along here. **Resolved in step 26.**
+
+#### `apps/api/src/app.module.ts` — TelephonyModule imported
+
+**Step 26** · 2026-07-31
+
+**What it does.** Adds `TelephonyModule` to the root module's imports. One line of code; the moment the
+public webhook endpoints exist on the running application.
+
+**Why it's written this way.**
+
+- **Kept as its own step, deliberately.** Mechanically it is trivial, but it is the transition from
+  "code that compiles" to "two unauthenticated, publicly reachable endpoints on a running server". That
+  is worth a review boundary of its own rather than riding along inside step 25.
+- **The comment states what the import means, not what it does.** `imports: [TelephonyModule]` is
+  self-evident; that it exposes routes whose only protection is `TwilioSignatureGuard` is not. Someone
+  removing the guard later should meet that sentence first.
+- **The worker loads this same graph and that is intentional.** `worker.ts` uses
+  `createApplicationContext`, so controllers are instantiated but never routed and no port opens (D7).
+  The telephony providers are needed there for job processing. Worth stating, because "the worker
+  imports the module with the HTTP controllers" otherwise looks like a mistake.
+
+**Connects to.** `telephony.module.ts`, `main.ts` (HTTP), `worker.ts` (context only).
+
+**Verified end to end against the running server** — built, booted `node dist/main.js`, seeded a business
+and an `ACTIVE` phone number, and posted requests signed exactly as Twilio signs them:
+
+| Request                     | Result                                                                              |
+| --------------------------- | ----------------------------------------------------------------------------------- |
+| Routes at boot              | `Mapped {/webhooks/twilio/voice/incoming, POST}` and `.../status, POST` ✓           |
+| Unsigned POST               | `403` ✓                                                                             |
+| Signed POST                 | `200`, `content-type: text/xml`, TwiML naming **E2E Cleaning Co** ✓                 |
+| Signed retry (same payload) | `200`, identical TwiML, **no second row** ✓                                         |
+| Signed status callback      | `204` ✓                                                                             |
+| Database after 3 deliveries | 2 rows — `voice.incoming` **PROCESSED, tenant resolved**; `voice.status` RECEIVED ✓ |
+
+This is the first time the whole chain has run as it will in production: HTTP → signature validation →
+idempotent persistence → tenant resolution from `To` → TwiML. All test data was removed afterwards.
+
+**Watch out for — a local `.env` change was required.** `TWILIO_AUTH_TOKEN` was empty, and the guard
+correctly refuses **all** webhook traffic when it is unset, so nothing could be exercised. It is now
+`local_test_token_for_e2e` in the local `.env` (gitignored, never committed). Replace it with the real
+auth token from the Twilio console when the account is provisioned — until then, signatures only
+validate against payloads signed with this placeholder.
+
+Second: the endpoints are now live whenever the API runs. On a laptop that is harmless, but the moment
+this is deployed they are internet-reachable. Before that happens, `PUBLIC_API_URL` must match the
+deployed URL exactly or every signature fails (step 20), and the Twilio console webhook URLs must point
+at the same host (`docs/twilio-setup.md` §5).
+
+#### `apps/api/prisma/schema.prisma` — `customers` and `calls` added
+
+**Step 27** · 2026-08-01
+
+**What it does.** Adds `Customer` and `Call`, plus three enums (`LineType`, `CallOutcome`,
+`NoRecoveryReason`). Two tables in one step because a `Call` without a `Customer` has nowhere to point,
+and a `Customer` with no calls is an empty concept — splitting them would have produced a migration that
+could not be exercised.
+
+**Why it's written this way.**
+
+- **A call is not a lead (D5), and the schema enforces it.** `Call` has no lead relation and no lead
+  fields. Leads arrive later, created lazily on the customer's _first reply_. This is what keeps the
+  owner's inbox free of spam callers and non-responders, and it is what makes "% of missed callers who
+  became qualified leads" a computable number rather than an estimate.
+- **`NoRecoveryReason` is the most valuable column here.** Every value is a real, frequent case that
+  costs money or trust if mishandled: withheld caller ID, a landline that would fail and bill us anyway,
+  an opt-out, a repeat caller inside the throttle window, staff ringing in, a spend cap, or the owner
+  simply answering. Storing _why_ no text was sent means "why did this caller never hear from us?" is
+  answerable months later — and it separates "we chose not to text" from "we failed to text", which is
+  the difference between a working product and a broken one in the pilot metrics.
+- **`customerId` is nullable, and `onDelete: SetNull`.** A withheld caller ID produces a real call with
+  nobody to attribute it to. And if a customer is later deleted — an APP 12/13 erasure request
+  (`docs/compliance.md` §4) — the call still happened; erasing the person must not erase the business's
+  own record of its call volume.
+- **`@@unique([businessId, phoneE164])`, not a global unique on the phone.** The same person calling two
+  cleaning companies is two customers. A global unique would silently merge two businesses' customer
+  records, which is a tenancy breach dressed as deduplication.
+- **`LineType.UNKNOWN` is distinct from a null.** It means _not yet looked up_, which is different from
+  "looked up and unusable". Lookup costs ~US$0.008 a call and the result is cached here so the same
+  number is never paid for twice.
+- **`providerCallSid @unique`.** One row per call however many webhooks it emits — the `Call` table's
+  own idempotency, independent of `webhook_events`.
+- **`forwardedFromE164` is stored despite being unreliable.** It is inconsistently populated on AU PSTN
+  and must never be depended on, but it is direct evidence for the D13 question of what carriers
+  actually pass through on a forwarded leg. Every real call becomes a data point.
+- **`durationSeconds` is our leg only** — the greeting, not how long the caller waited before the
+  carrier forwarded. Worth stating, because it is the obvious thing to misread when the number looks
+  implausibly small.
+
+**Connects to.** `phone_numbers` (resolves which business a call belongs to). `tenant-guard.ts` — both
+models were already in `TENANT_MODELS`, so they arrived guarded. D5, D8. Migration
+`20260801061653_add_customers_and_calls`.
+
+**Verified against the live database, 14/14.** Both models are guarded (`findMany({})` throws). The same
+number is a distinct customer per business; a duplicate within one business is rejected. `lineType`
+defaults to `UNKNOWN` with a null timestamp. A duplicate `CallSid` is rejected. A withheld-caller-ID call
+records with `customerId: null` and `noRecoveryReason: ANONYMOUS_CALLER`. Deleting a customer leaves the
+call intact with a null `customerId`. The "which calls never got a text, and why" query works. Deleting a
+business cascades to both tables.
+
+**Watch out for — the guard rejected the verification script, correctly.** `customer.delete({ where: { id } })`
+threw `TenantScopeError`. That is the D8 design working: a bare-id delete cannot express a tenant
+constraint, so a stolen or guessed id would delete another business's row. The scoped form is
+`deleteMany({ where: { businessId, id } })`. Expect this friction whenever a service does a
+delete-by-id — it is the guard doing its job, not an obstacle to route around with `unscoped`.
+
+Second: `Call.outcome` defaults to `IN_PROGRESS`, but the voice webhook currently records nothing into
+this table at all — it only writes `webhook_events`. Nothing populates `calls` yet. The service that
+turns a recorded webhook into a `Call` is the next step, and until it exists these tables stay empty on
+a running system.
 
 #### `apps/api/src/common/phone.ts` · `phone.spec.ts`
 
