@@ -63,6 +63,7 @@ decision rather than restating the argument.
 | 25  | 2026-07-31 | `apps/api/src/telephony/telephony.module.ts`            | Wires the controller, guard and service; routes map, guard rejects unsigned        |
 | 26  | 2026-07-31 | `apps/api/src/app.module.ts`                            | Imports TelephonyModule — routes go live; signed curl → TwiML, end to end          |
 | 27  | 2026-08-01 | `apps/api/prisma/schema.prisma`                         | `customers` + `calls` — a call is not a lead (D5). 14/14 verified                  |
+| 28  | 2026-08-01 | `apps/api/src/calls/calls.service.ts`                   | Records the call and decides whether to recover. 18/18 verified                    |
 
 ---
 
@@ -1313,7 +1314,74 @@ delete-by-id — it is the guard doing its job, not an obstacle to route around 
 Second: `Call.outcome` defaults to `IN_PROGRESS`, but the voice webhook currently records nothing into
 this table at all — it only writes `webhook_events`. Nothing populates `calls` yet. The service that
 turns a recorded webhook into a `Call` is the next step, and until it exists these tables stay empty on
-a running system.
+a running system. **The service landed in step 28; the controller still does not call it.**
+
+---
+
+### API — calls
+
+#### `apps/api/src/calls/calls.service.ts`
+
+**Step 28** · 2026-08-01
+
+**What it does.** Turns a recorded voice webhook into a `Call` (creating or reusing a `Customer`), and
+decides whether that caller should get a recovery SMS — returning either `shouldRecover: true` or a
+`NoRecoveryReason`. Also applies status callbacks to an existing call.
+
+**Why it's written this way.**
+
+- **The decision is the product, so it is a pure ordered sequence of guards with a reason attached to
+  each.** Texting the wrong person is expensive in three different currencies: a landline send fails and
+  still bills us, an opt-out breaches the Spam Act, and a qualification question to your own plumber
+  mid-job is a trust cost. Making each skip an enum value rather than an early `return false` is what
+  keeps "why did this caller never hear from us?" answerable months later.
+- **The check order is deliberate, not cosmetic.** `ANONYMOUS_CALLER` needs no query at all, so a
+  withheld number never causes a database round trip. `CAP_REACHED` (the kill switch) comes before
+  anything caller-specific, because a global stop should not depend on per-caller lookups. The two
+  counting queries are last, cheapest-first.
+- **Replay returns the original decision rather than re-deciding — the subtlest thing here.** A retried
+  webhook that re-ran the decision would see the _first_ attempt's `recoverySmsQueuedAt` in the throttle
+  window and skip, silently converting a transient retry into a permanent `RECENTLY_CONTACTED`. The
+  early return on an existing `providerCallSid` is what prevents a duplicate delivery from suppressing
+  the very message it is retrying.
+- **`recoverySmsQueuedAt` is set at decision time, not on delivery.** It marks _the decision_, and the
+  message's own status lives on `messages`. That means a crash between deciding and enqueuing cannot
+  produce a second text on retry — the throttle window already knows.
+- **The throttle counts calls we queued a text for, not calls received.** Three rings in five minutes is
+  one conversation, and that is exactly what someone does when they need a cleaner today.
+- **`upsert`, not find-then-create.** Two calls from the same number can arrive concurrently and the
+  unique index would reject the loser. `update: {}` touches nothing — a call is not new information
+  about a customer, and blindly writing would risk overwriting a learned name with nothing.
+- **`UNKNOWN` line type is allowed through.** Lookup runs in the worker before the send, so this is not
+  the last line of defence; blocking here would mean never texting anyone we have not already paid to
+  look up.
+- **Terminal outcomes are never walked backwards.** Status callbacks arrive out of order, so a late
+  `ringing` after `completed` is ignored rather than regressing the call.
+- **An unrecognised `CallStatus` warns and falls back** instead of throwing. A new Twilio status must not
+  break call recording, but it should be noticed.
+
+**Connects to.** `prisma/schema.prisma` (`Call`, `Customer`, `NoRecoveryReason`). `config/env.ts`
+(`SENDING_ENABLED`, `MAX_SMS_PER_BUSINESS_PER_DAY` — the circuit breakers from the queues skill §9).
+Will be called by `voice.controller.ts` and read by the recovery job.
+
+**Verified against the live database, 18/18.** A normal missed call recovers with
+`recoverySmsQueuedAt` set. A repeat caller inside 24h → `RECENTLY_CONTACTED`, reusing the same customer.
+Withheld → `ANONYMOUS_CALLER` with a null `customerId`. Landline → `NOT_TEXTABLE`. Staff →
+`KNOWN_CONTACT`. **Replaying a `CallSid` returns the same row and preserves the original decision rather
+than re-throttling.** The same caller at a _different_ business is not throttled — tenant isolation holds
+in the decision path, not just in queries. `completed` applies duration and `endedAt`; a late `ringing`
+does not overwrite it. An unknown status falls back without throwing; `applyStatus` on an unknown call
+returns null.
+
+**Watch out for.** `SUPPRESSED` is defined in `NoRecoveryReason` but **is never returned** — the
+`suppressions` table does not exist yet. Opt-outs are therefore not enforced in this decision path. That
+is the single most important gap in this file: sending to someone who replied STOP is a Spam Act breach,
+and nothing here currently prevents it. The check belongs in `decideRecovery`, immediately after the
+kill switch, when the table lands.
+
+Second: the per-business cap counts a rolling 24 hours, not a calendar day in the business's timezone.
+For a spend guardrail that is arguably better — it cannot be reset by midnight — but it does not match
+what an owner would mean by "200 a day", so the wording in any future settings UI needs care.
 
 #### `apps/api/src/common/phone.ts` · `phone.spec.ts`
 
