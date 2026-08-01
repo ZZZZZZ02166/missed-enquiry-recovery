@@ -59,6 +59,7 @@ decision rather than restating the argument.
 | 22  | 2026-07-29 | `apps/api/src/telephony/webhook-events.service.ts`      | Idempotent recording; 5 deliveries for one CallSid → 3 rows                        |
 | 23  | 2026-07-29 | `apps/api/src/telephony/webhook-events.service.spec.ts` | First integration suite — real Postgres, incl. a concurrency race                  |
 | —   | 2026-07-29 | `apps/api/package.json`                                 | `NODE_OPTIONS=--experimental-vm-modules` — Prisma 7 needs it under Jest            |
+| 24  | 2026-07-31 | `apps/api/src/telephony/voice.controller.ts`            | Answers the forwarded call; resolves tenant from `To`. 15/15 verified              |
 
 ---
 
@@ -1094,6 +1095,66 @@ Second: `pnpm test` now **requires Postgres to be running**. Unit and integratio
 command and one `.spec.ts` suffix. That matches the backend skill's guidance and keeps the setup simple,
 but it means CI must start docker-compose. If the split ever becomes painful, the fix is a separate
 `.int-spec.ts` suffix and a second Jest project — not mocking the database.
+
+#### `apps/api/src/telephony/voice.controller.ts`
+
+**Step 24** · 2026-07-31
+
+**What it does.** Two endpoints. `POST /webhooks/twilio/voice/incoming` answers a forwarded call: record
+idempotently, resolve the tenant from `To`, return answer-announce-hangup TwiML (D2).
+`POST /webhooks/twilio/voice/status` records call status callbacks.
+
+**Why it's written this way.**
+
+- **It always returns valid TwiML, including when recording fails.** The `catch` answers the call
+  anyway. A 500 here makes the caller hear a **Twilio error tone during precisely the window this
+  product exists to fix** — and Twilio would retry, so the failure is both audible and repeated. Losing
+  a row is bad; a bad caller experience is worse. That trade is the whole reason the handler is
+  structured around a try/catch rather than letting errors propagate to the exception filter.
+- **A duplicate delivery still gets a full greeting.** The natural reading of "idempotent" is _do
+  nothing the second time_, which would be wrong here: a retry is a **live call leg** with a real person
+  on it. Idempotency applies to the side effects, not to the response.
+- **The tenant lookup is the first real `prisma.unscoped` call in the codebase**, exactly as `D8` and
+  the `PhoneNumber` schema comment predicted. This lookup _is_ how the tenant is discovered, so there is
+  no `businessId` to scope by. One line, one place.
+- **`ACTIVE` and `SUSPENDED` both answer.** `SUSPENDED` is the offboarding grace state — a cancelled
+  business's carrier is still forwarding, and refusing the call would send **their** customers to a dead
+  line (`docs/compliance.md` §8). Filtering on `status: 'ACTIVE'` alone would have been the obvious
+  query and the wrong one.
+- **An unrecognised `To` is `IGNORED`, not `FAILED`.** Nothing is broken — it is a released number still
+  being dialled, or a console misconfiguration. Conflating the two would make the failure count useless
+  as an alert signal.
+- **A withheld caller ID logs and proceeds.** `toE164` returns null, which is a normal daily occurrence
+  rather than an error: we answer the call, we just have nobody to text.
+- **The greeting names the business and announces the text**, and falls back to generic wording when the
+  business is unknown rather than guessing. Naming it is the caller's only signal that an SMS about to
+  arrive from an unknown number is legitimate.
+- **Status callbacks return 204 and swallow errors.** No caller-facing consequence, but still must not
+  500, or Twilio retries a request we cannot serve.
+
+**Connects to.** `twilio-signature.guard.ts` (guards both routes — nothing unsigned reaches here).
+`webhook-events.service.ts` (recording and lifecycle). `common/phone.ts` (`toE164` at the edge).
+`prisma.service.ts` (`unscoped`). D1, D2, D8.
+
+**Verified against the live database, 15/15.** Greeting names the business, hangs up, contains no
+`<Record>`, uses `en-AU`, and is a valid TwiML document. Tenant resolved from `To` onto the event
+(`PROCESSED`). A Twilio retry answers identically and produces **no second row**. An unrecognised `To`
+still answers and is marked `IGNORED`. A withheld caller ID still answers. A `SUSPENDED` number still
+answers. One incoming plus two distinct status callbacks produce three rows.
+
+**Watch out for — this controller is not yet reachable.** No module registers it, so the routes do not
+exist on the running app; it was verified by direct instantiation. `telephony.module.ts` is the next
+step, and until it lands `curl` against these paths will 404. This is the build protocol working as
+intended, not an oversight.
+
+Second — **a deliberate, marked gap: no SMS is sent.** The comment in `incoming()` says where the
+recovery job gets enqueued and why it cannot happen inline (Twilio's ~15s timeout, and the
+no-side-effects-in-a-webhook rule). Today the endpoint answers the call and records it, and the caller
+receives nothing. That is the honest state of the product until the calls module and queue exist.
+
+Third: the answer/announce flow assumes `From` is the **original caller** rather than the forwarding
+party. That is still D13 — unmeasured. If AU carriers present the business's own number, this controller
+records calls correctly and the recovery premise collapses anyway.
 
 #### `apps/api/src/common/phone.ts` · `phone.spec.ts`
 
