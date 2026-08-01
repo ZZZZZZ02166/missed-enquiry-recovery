@@ -65,6 +65,7 @@ decision rather than restating the argument.
 | 27  | 2026-08-01 | `apps/api/prisma/schema.prisma`                         | `customers` + `calls` — a call is not a lead (D5). 14/14 verified                  |
 | 28  | 2026-08-01 | `apps/api/src/calls/calls.service.ts`                   | Records the call and decides whether to recover. 18/18 verified                    |
 | 29  | 2026-08-01 | `apps/api/prisma/schema.prisma`                         | `suppressions` — opt-out, blocklist, landline cache in one table. 9/9 verified     |
+| 30  | 2026-08-01 | `apps/api/src/calls/suppressions.service.ts`            | "May we send?" + OPTED_OUT-wins precedence + STOP keywords. 15/15 verified         |
 
 ---
 
@@ -1447,6 +1448,58 @@ Second: `NOT_TEXTABLE` is duplicated between here and `Customer.lineType`. That 
 customer row caches what Lookup said, while a suppression row is the decision not to send — but two
 places holding the same fact can disagree. The service that writes both must keep them consistent, and
 `suppressions` is the one the send path trusts.
+
+#### `apps/api/src/calls/suppressions.service.ts`
+
+**Step 30** · 2026-08-01
+
+**What it does.** Owns "may we send to this number?". `isSuppressed` is the hot-path read; `suppress`
+applies reason precedence; `optOut` / `optIn` handle the Spam Act path; `classifyKeyword` decides whether
+an inbound message is a STOP; `block` and `markNotTextable` are the operational entry points.
+
+**Why it's written this way.**
+
+- **`classifyKeyword` matches the whole message, not a substring — the trap in this file.** A caller
+  writing _"please stop by tomorrow"_ or _"can you stop the carpet clean?"_ must not be opted out. A
+  naive `body.includes('stop')` silently loses a customer mid-conversation and, worse, looks like
+  correct compliance behaviour while doing it. Exact match after trimming and stripping trailing
+  punctuation, which is also how Twilio behaves. Both phrasings are in the test set.
+- **`isSuppressed` returns the _reason_, not a boolean.** The caller has to record _why_ it skipped
+  (`NoRecoveryReason`), and a boolean would force either a second query or an unexplained no-op in the
+  logs.
+- **Deliberately not cached.** An opt-out must take effect on the very next send. A stale cache entry
+  here is a compliance breach, not a performance regression — and step 29 measured this as an
+  index-only scan, so there is nothing to optimise.
+- **Precedence exists because the table holds one row per (business, phone).** A number blocked as
+  `SPAM` that later replies STOP has to resolve to something. `OPTED_OUT` outranks everything: it is the
+  only reason with legal weight and the only one that may never be silently discarded. Lower-priority
+  writes still record their note and evidence, so the fact that they _also_ opted out is not lost.
+- **`optIn` only deletes `OPTED_OUT` rows.** A `START` says nothing about a landline or an owner's
+  blocklist entry. Clearing everything would let a blocked marketer text their way back in — tested
+  explicitly.
+- **`optOut` logs at `warn`.** An opt-out is not an error, but a rising rate is the clearest early signal
+  that the messaging is landing badly, and it should be visible without going looking for it.
+
+**Connects to.** `prisma/schema.prisma` (`Suppression`, step 29). `calls.service.ts` — `isSuppressed` is
+what `NoRecoveryReason.SUPPRESSED` needs. `.claude/skills/twilio/SKILL.md` §5 (STOP keywords, error
+21610). `docs/compliance.md` §1.
+
+**Verified against the live database, 15/15.** 14 keyword cases including both false-positive phrasings.
+`SPAM` and `NOT_TEXTABLE` do **not** downgrade an existing `OPTED_OUT`, and the opt-out's evidence SID
+survives those writes. A STOP **does** upgrade an existing `SPAM`. `optIn` clears an opt-out but leaves a
+blocklist entry intact. A repeated STOP creates no second row. Opt-out is per business — the same number
+is suppressed at A and sendable at B. `listForBusiness` filters and orders correctly.
+
+**Watch out for — the wiring is still not done.** This service exists and works, but
+`calls.service.ts` does not call it. `decideRecovery` still never returns `SUPPRESSED`, so an opt-out is
+recorded and then ignored on the next call from that number. That is one line plus a constructor
+dependency, and it is step 31. **Until it lands, the compliance gap opened at step 28 remains open** —
+the mechanism is built, not connected.
+
+Second: `START` is treated as a resubscribe, and `YES` is included in that set. `YES` is plausible as a
+genuine conversational reply ("yes, 2 bedrooms") — it is harmless today because it only _removes_ a
+suppression that must already exist, but if the keyword set is ever reused for anything else, `YES`
+should be reconsidered.
 
 #### `apps/api/src/common/phone.ts` · `phone.spec.ts`
 
