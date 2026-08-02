@@ -77,6 +77,8 @@ decision rather than restating the argument.
 | 38  | 2026-08-02 | `apps/api/src/jobs/queues.ts`                           | Queue topology, payloads, Redis durability check. 13/13 verified                    |
 | —   | 2026-08-02 | `.claude/skills/queues-redis/SKILL.md`                  | Corrected `jobId` guidance — BullMQ rejects `:` in a custom id                      |
 | 39  | 2026-08-02 | `apps/api/src/jobs/jobs.module.ts`                      | Queues as injectable providers; durability check now runs at boot. 8/8              |
+| 40  | 2026-08-02 | `apps/api/src/common/gsm7.ts`                           | GSM-7 charset + segment counting — rule 5 becomes enforceable. 30/30                |
+| 41  | 2026-08-02 | `apps/api/src/notifications/templates.ts`               | The recovery SMS copy; rules 2, 5, 10 asserted at import. 18/18                     |
 
 ---
 
@@ -1988,6 +1990,63 @@ Second: each Nest application context creates its **own** connection and its own
 contexts in one process — as in a test that boots twice — means two connections, and closing one does
 not close the other. Fine in practice, but it makes leaked connections easy to create in tests.
 
+#### `apps/api/src/common/gsm7.ts`
+
+**Step 40** · 2026-08-02
+
+**What it does.** Determines whether a message is GSM-7, counts billable segments, and throws with a
+useful message when a template would silently cost more than it should. Makes `CLAUDE.md` rule 5
+enforceable rather than aspirational — it has had **no enforcement at all** until now.
+
+**Why it's written this way.**
+
+- **The charset is an explicit `Set`, not a regex range.** GSM 03.38 is not contiguous in Unicode, so a
+  range would quietly admit characters that are not in it — which is precisely the failure being
+  prevented. Verbose, and correct.
+- **Extended characters count as two septets.** `^ { } \ [ ~ ] | €` are reachable only via an escape
+  sequence, so a message full of them hits the limit at half its apparent length. Verified: 80 euro
+  signs is one segment, 81 is two.
+- **`findNonGsm7` returns the characters, not a boolean.** The useful error is _which_ character.
+  "contains ’ (U+2019)" tells someone what to fix; "not GSM-7" sends them hunting through a string that
+  looks correct — because the difference between `'` and `’` is invisible at normal reading size.
+- **`assertSendable` throws rather than returning a result.** A message that silently triples in cost is
+  worse than one that fails in CI, and there is no sensible "carry on" branch. `maxSegments` defaults to
+  1: the recovery SMS should fit in one, and needing two should be a deliberate decision.
+- **`normaliseToGsm7` is deliberately narrow** — it fixes curly quotes, dashes, ellipses and
+  non-breaking spaces, and nothing else. A general "strip anything unrepresentable" would turn
+  `Café Cleaning` into `Caf Cleaning` in every message a business ever sends, and nobody would notice
+  until a customer did. Emoji are likewise left to fail loudly rather than vanish. Both behaviours are
+  tested as _requirements_, not accidents.
+- **`é`, `ñ` and `ü` are in GSM-7** and pass unchanged, which matters for real AU business names.
+
+**Connects to.** `CLAUDE.md` rule 5. `.claude/skills/twilio/SKILL.md` §6 (SMS copy rules). Every
+outbound message template, and the send path.
+
+**Verified 30/30, including a live demonstration of the cost bug.** The same sentence:
+
+| Version                          | Encoding | Segments |
+| -------------------------------- | -------- | -------- |
+| `can't` / `we're` (straight `'`) | GSM-7    | **1**    |
+| `can’t` / `we’re` (curly `’`)    | UCS-2    | **3**    |
+
+One invisible character, 3× the bill on every send. Also confirmed: segment boundaries at 160/161 and
+306/307; an empty body still bills one segment; an emoji forces UCS-2 and its surrogate pair counts as
+two UTF-16 units; the error message names the offending code point; and `normaliseToGsm7` fixes curly
+quotes without touching `é`.
+
+**Watch out for.** This is a _pure_ module — nothing calls it yet. Rule 5 is now **enforceable**, not
+enforced. It becomes real when message templates land and their tests call `assertSendable`; the
+skill's requirement is that every outbound template is charset- and segment-asserted in CI.
+
+Second: segment counting assumes Twilio's standard concatenation (UDH header, 153/67 per part). Twilio
+may split differently for some carriers, so treat the count as the billing model, not a wire-format
+guarantee.
+
+Third — a small irony worth keeping. The first version of `normaliseToGsm7` contained a **literal
+non-breaking space** in its own regex, and ESLint's `no-irregular-whitespace` rejected it. It is now
+` `. An invisible character in the file whose job is catching invisible characters is exactly the
+failure mode this module exists for.
+
 #### `apps/api/src/common/phone.ts` · `phone.spec.ts`
 
 **Step 13** · 2026-07-27
@@ -2155,3 +2214,67 @@ not sufficient.
 
 Also: `expect.assertions(5)` in the diagnosability test is doing real work — it proves the `catch` block
 ran at all. Without it, a version of `assertTenantScoped` that never threw would pass that test silently.
+
+---
+
+### API — notifications
+
+#### `apps/api/src/notifications/templates.ts`
+
+**Step 41** · 2026-08-02
+
+**What it does.** The four caller-facing SMS templates, and a **module-load assertion** that every one
+of them is GSM-7 and one segment at the worst legitimate business name.
+
+The actual copy:
+
+```
+Melbourne Sparkle Cleaning: sorry we missed your call. What do you need help
+with, and which suburb are you in? Reply STOP to opt out.          [134 chars, 1 seg]
+```
+
+**Why it's written this way.**
+
+- **The assertion runs at import, not in a test.** A template that costs three times as much, or that
+  drops the opt-out notice, must not be _deployable_ — so the guard runs in CI, in dev, and at boot in
+  production. A test can be skipped or forgotten; an import cannot. The failure this guards is silent
+  and recurring, which is the shape that earns a boot-time check rather than a warning.
+- **Templates are functions, not format strings.** The business name has to be interpolated before the
+  segment count means anything: a 158-character template plus a 30-character name is two segments, and
+  asserting the template alone would miss it. Everything is checked as the complete message.
+- **Assertions use a worst-case name** (`MAX_BUSINESS_NAME` = 32), not a convenient short example that
+  hides the boundary. The first message leaves 20 characters of headroom at that size.
+- **Over-long names are truncated, not allowed through.** Truncation is visible and cheap; silently
+  doubling the cost of every message a business sends is neither. A 200-character name still yields one
+  segment.
+- **The business name is the first thing in the message**, satisfying Spam Act sender identification and
+  doing double duty as the caller's only signal that a text from an unknown number is legitimate — the
+  voice greeting told them to expect it seconds earlier.
+- **The first message asks one open question, not a list.** Six sequential questions lose most people by
+  the third, and every abandoned conversation still costs money. Verified: exactly one `?`.
+- **There is deliberately no `{price}` placeholder.** Rule 2 says every currency figure comes from
+  `PriceCalculator` at send time. Making the template incapable of holding one removes the temptation.
+- **A separate known-contact variant exists.** "What do you need help with?" to someone ringing about a
+  job already booked reads as automated and erodes trust; that message says a human will call back and
+  gets out of the way.
+- **The handoff message promises nothing** — no time, no price, no availability. We know none of them,
+  and promising any on the business's behalf is a representation we cannot stand behind.
+
+**Connects to.** `common/gsm7.ts` (the assertion). `CLAUDE.md` rules 2, 5, 10. `docs/compliance.md` §1.
+Will be used by the recovery job processor.
+
+**Verified 18/18.** All four templates are one GSM-7 segment at worst case. Sender identification is at
+character 0. The opt-out notice is present on both first-contact messages and correctly absent from the
+handoff. No template contains marketing language (`off|discount|deal|offer|save|free|special|promo|book
+now`) or any currency pattern. A curly apostrophe in a _business name_ is normalised so it cannot triple
+the cost, while `é` survives. And the guard was shown to have teeth: a deliberately curly-quoted
+template is rejected.
+
+**Watch out for.** `MAX_BUSINESS_NAME` is 32 characters, which truncates real names — "Melbourne End of
+Lease Cleaning Specialists" becomes "Melbourne End of Lease Cleaning." That is the right trade against a
+second segment on every message, but it is a _product_ decision, and an owner should see their truncated
+name during onboarding rather than discovering it in a customer's inbox.
+
+Second: these templates are fixed strings. The plan allows owners to configure their own questions, and
+the moment a template becomes owner-editable this import-time guard no longer covers it — owner-supplied
+copy has to be asserted on save _and_ at send, because a boot-time check cannot see data.
