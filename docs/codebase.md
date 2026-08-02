@@ -76,6 +76,7 @@ decision rather than restating the argument.
 | 37  | 2026-08-02 | `apps/api/src/telephony/voice.controller.ts`            | **Loop closed** — a signed webhook now creates a Call + decision. 7/7 end to end    |
 | 38  | 2026-08-02 | `apps/api/src/jobs/queues.ts`                           | Queue topology, payloads, Redis durability check. 13/13 verified                    |
 | —   | 2026-08-02 | `.claude/skills/queues-redis/SKILL.md`                  | Corrected `jobId` guidance — BullMQ rejects `:` in a custom id                      |
+| 39  | 2026-08-02 | `apps/api/src/jobs/jobs.module.ts`                      | Queues as injectable providers; durability check now runs at boot. 8/8              |
 
 ---
 
@@ -1935,6 +1936,57 @@ job ids are constrained.
 
 Second: `assertRedisDurability` is written but **nothing calls it yet**. It belongs in the worker's
 bootstrap, where a warning is visible at startup. Until then the check exists and never runs.
+**Wired in step 39 — it now runs on every boot of both entrypoints.**
+
+#### `apps/api/src/jobs/jobs.module.ts`
+
+**Step 39** · 2026-08-02
+
+**What it does.** Registers all five queues as injectable providers over one shared Redis connection,
+runs the durability check at boot, and closes the connection on shutdown.
+
+**Why it's written this way.**
+
+- **`@Global()`, and this is the second and last one.** Producers live in almost every feature module —
+  telephony enqueues recovery, conversations enqueue replies, leads enqueue owner notifications.
+  Importing `JobsModule` in each would be noise that hides nothing. `PrismaModule` is the only other
+  global; both are genuinely used everywhere, which is the bar.
+- **Producers only. Processors belong to `worker.ts`.** The API and the worker load the same module
+  graph (D7), so if this module registered `Worker` instances the API would start consuming its own
+  jobs — sending SMS from inside the web process, which is exactly what the queue exists to prevent.
+  The split is structural rather than a convention someone has to remember.
+- **One connection for all producer queues, five separate ones for workers.** Producers only issue
+  commands, so sharing is correct and avoids five sockets per process. A _worker_ connection blocks on
+  `BRPOPLPUSH` and cannot also serve commands — sharing there deadlocks under load.
+- **Queue providers are generated from the `QUEUE` constant**, so adding a queue is a one-line change in
+  `queues.ts` and the provider appears automatically. A hand-written provider per queue is where the
+  sixth one gets forgotten.
+- **The durability check logs at `error`, not `warn`, when it fails** — but does not throw. The failure
+  it guards is _invisible_: delayed jobs vanish on restart with no error anywhere. A loud line at
+  startup is the entire point. Refusing to boot would take down an API that is still answering calls
+  correctly, which trades a silent queue problem for a loud outage.
+- **A failed `CONFIG GET` is caught separately and warns.** Managed Redis often forbids the command.
+  That is not a fault in itself, but it means the settings are _unverified_ — saying so is more useful
+  than silence, and materially different from "verified bad".
+
+**Connects to.** `queues.ts` (topology, options, connection factory). `worker.ts` (will register
+processors against these queue names). Every future producer injects `queueToken(QUEUE.X)`.
+
+**Verified 8/8 through compiled output.** All five queues resolve as real `Queue` instances with names
+matching the topology; they share exactly one connection; `DEFAULT_JOB_OPTIONS` reaches a job enqueued
+through DI; the queues are reachable from a module that imports **nothing**, proving `@Global()` works;
+and the connection is both closed and genuinely unusable after shutdown. The boot log now carries
+`Redis durability OK (appendonly=yes, maxmemory-policy=noeviction)`.
+
+**Watch out for — an assertion race worth knowing.** `ioredis` updates its `status` property a tick
+_after_ `quit()` resolves. Asserting `conn.status === 'end'` immediately after `await app.close()` reads
+`'ready'` and looks like the shutdown hook never ran. It did — a manual `quit()` afterwards fails with
+"Connection is closed". Any test of connection teardown needs a tick, or should assert on behaviour
+(`ping()` rejects) rather than on the status string.
+
+Second: each Nest application context creates its **own** connection and its own queue instances. Two
+contexts in one process — as in a test that boots twice — means two connections, and closing one does
+not close the other. Fine in practice, but it makes leaked connections easy to create in tests.
 
 #### `apps/api/src/common/phone.ts` · `phone.spec.ts`
 
