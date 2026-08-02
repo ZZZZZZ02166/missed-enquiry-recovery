@@ -74,6 +74,8 @@ decision rather than restating the argument.
 | 36  | 2026-08-02 | `apps/api/src/telephony/telephony.module.ts`            | Imports CallsModule — `CallsService` now reachable from the webhook. 7/7            |
 | —   | 2026-08-02 | `apps/api/src/telephony/telephony.module.ts`            | Merged the duplicate doc block left by step 36 (cosmetic)                           |
 | 37  | 2026-08-02 | `apps/api/src/telephony/voice.controller.ts`            | **Loop closed** — a signed webhook now creates a Call + decision. 7/7 end to end    |
+| 38  | 2026-08-02 | `apps/api/src/jobs/queues.ts`                           | Queue topology, payloads, Redis durability check. 13/13 verified                    |
+| —   | 2026-08-02 | `.claude/skills/queues-redis/SKILL.md`                  | Corrected `jobId` guidance — BullMQ rejects `:` in a custom id                      |
 
 ---
 
@@ -1876,6 +1878,63 @@ Second: `/status` resolves the business by looking the `To` number up again, a s
 callback. Fine at pilot volume and it keeps the handler stateless, but if status callbacks ever become
 hot, the `Call` row already holds `businessId` and could be found by `providerCallSid` — that lookup is
 `unscoped`, however, so it needs deliberate handling rather than a quiet swap.
+
+---
+
+### API — jobs
+
+#### `apps/api/src/jobs/queues.ts`
+
+**Step 38** · 2026-08-02
+
+**What it does.** Queue names, typed job payloads, default job options, the Redis connection factory,
+and `assertRedisDurability` — a boot-time check of the two Redis settings whose failure is silent.
+
+**Why it's written this way.**
+
+- **Names and payload types are colocated so a producer and consumer cannot disagree.** A typo in a
+  queue name enqueues into a queue nobody reads, and _nothing errors_ — the job simply waits forever.
+  One `QUEUE` constant and a `JobDataByQueue` map make that a compile error instead.
+- **Five queues, one per side effect, not one shared queue.** Retry policy, rate limits and failure
+  isolation are then tunable independently: SMS sends need a limiter to protect Twilio, LLM extraction
+  needs low concurrency because it is slow and costly, and neither should stall the other. A single
+  queue makes all three settings global.
+- **Payloads carry IDs, never entities.** A serialised `Call` in Redis is a copy that goes stale the
+  moment the row changes — and a delayed job may sit for hours. Re-reading in the processor also means
+  it observes any state change made since the job was enqueued, which is what makes the
+  `recoverySmsQueuedAt` check meaningful at send time.
+- **`removeOnComplete` is treated as mandatory.** Without it Redis grows without bound until it hits
+  maxmemory, where `noeviction` turns a slow leak into a hard stop. There is no separate dead-letter
+  queue: `removeOnFail: { age: 604800 }` _is_ the dead letter, keeping a week of failures inspectable.
+- **`assertRedisDurability` returns problems rather than throwing.** A misconfigured Redis is serious,
+  but refusing to boot would take down a system that is otherwise serving calls correctly. The right
+  response is a loud warning at startup, not a crash.
+
+**Connects to.** `.claude/skills/queues-redis/SKILL.md` §1–4. `docker-compose.yml` (the settings it
+asserts). `config/env.ts` (`REDIS_URL`). Will be consumed by the jobs module and `worker.ts`.
+
+**Verified against real Redis, 13/13.** Defaults apply on enqueue (5 attempts, exponential backoff,
+`removeOnComplete`); a typed payload round-trips; a delayed job lands in the delayed set; a worker with
+its **own** connection drains the queue. Most usefully, `assertRedisDurability` was tested in both
+directions — it passes against the compose config, **detects `allkeys-lru`**, and **detects both
+problems at once** when `appendonly` is also turned off. A check that only ever passes proves nothing;
+this one was made to fail on purpose and then restored.
+
+**Watch out for — a documented pattern that does not work.** BullMQ 5 rejects a custom `jobId`
+containing a colon:
+
+```
+Error: Custom Id cannot contain :
+```
+
+`:` is BullMQ's Redis key separator. The `queues-redis` skill recommended `recovery:${callSid}` and
+`nudge:${conversationId}` — both would have thrown at the first enqueue. **Corrected to hyphens in the
+same step**, since leaving it would have caused exactly this crash in whoever wrote the first producer.
+Note the asymmetry: `webhook_events.dedupeKey` is a Postgres column and keeps its colons; only BullMQ
+job ids are constrained.
+
+Second: `assertRedisDurability` is written but **nothing calls it yet**. It belongs in the worker's
+bootstrap, where a warning is visible at startup. Until then the check exists and never runs.
 
 #### `apps/api/src/common/phone.ts` · `phone.spec.ts`
 

@@ -100,7 +100,11 @@ if (conversation.recoverySentAt) return; // already done, exit clean
 Every processor must be safe to run twice. Assume it will be: workers get killed mid-job, jobs stall and
 get retried, deploys restart processes.
 
-Still set a meaningful `jobId` (`recovery:${callSid}`) — it collapses the common duplicate-webhook case
+**A custom `jobId` must not contain `:`.** BullMQ uses the colon as its Redis key separator and rejects
+it outright — `Error: Custom Id cannot contain :`. Use a hyphen: `recovery-${callSid}`. This differs
+from `webhook_events.dedupeKey`, which is a Postgres column and keeps its colons.
+
+Still set a meaningful `jobId` (`recovery-${callSid}`) — it collapses the common duplicate-webhook case
 cheaply, before the processor even starts.
 
 ---
@@ -147,7 +151,7 @@ wasted send into five, and hides the real cause behind a stack of timeouts.
 await followupQueue.add(
   'nudge',
   { conversationId },
-  { delay: ms, jobId: `nudge:${conversationId}` },
+  { delay: ms, jobId: `nudge-${conversationId}` },
 );
 ```
 
