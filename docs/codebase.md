@@ -72,6 +72,8 @@ decision rather than restating the argument.
 | 34  | 2026-08-01 | `apps/api/src/calls/calls.module.ts`                    | Wires calls + suppressions. Found: **tsx breaks Nest DI**, `dev:worker` affected    |
 | 35  | 2026-08-02 | `apps/api/package.json`                                 | `dev:worker` moved off tsx to `nest start --entryFile worker` — DI now works        |
 | 36  | 2026-08-02 | `apps/api/src/telephony/telephony.module.ts`            | Imports CallsModule — `CallsService` now reachable from the webhook. 7/7            |
+| —   | 2026-08-02 | `apps/api/src/telephony/telephony.module.ts`            | Merged the duplicate doc block left by step 36 (cosmetic)                           |
+| 37  | 2026-08-02 | `apps/api/src/telephony/voice.controller.ts`            | **Loop closed** — a signed webhook now creates a Call + decision. 7/7 end to end    |
 
 ---
 
@@ -1821,7 +1823,59 @@ leaves the compiler and the app running.
 **Watch out for.** The controller still does not call it. `CallsService` is now _available_ to
 `VoiceController` — nothing more. On a running system a forwarded call is still authenticated, recorded
 in `webhook_events`, and answered, with no `Call` row and no recovery decision. Step 37 is the line of
-code that closes it.
+code that closes it. **Done in step 37.**
+
+#### `apps/api/src/telephony/voice.controller.ts` — wired to `CallsService`
+
+**Step 37** · 2026-08-02
+
+**What it does.** `/incoming` now calls `recordInboundCall`, creating a `Call` and a `Customer` and
+recording the recovery decision. `/status` now calls `applyStatus`, so a call's outcome and duration are
+recorded rather than only its arrival. **This closes the loop that has been open since step 28.**
+
+**Why it's written this way.**
+
+- **The withheld-caller-ID branch was removed, not kept.** The controller no longer inspects `from`
+  before deciding — it passes the null through and lets `CallsService` return `ANONYMOUS_CALLER`.
+  Branching in both places would put two different answers to "why didn't we text?" in two files, and
+  the enum exists precisely so there is one.
+- **`toE164: number.e164`, not the inbound `To`.** Both normalise to the same value — the row was found
+  by it — but the stored one is canonical by construction and needs no fallback for unparseable input.
+  This was forced by `noUncheckedIndexedAccess` flagging `body.To` as `string | undefined`, and the
+  compiler's objection led to the better expression.
+- **`/status` applies the outcome even for a duplicate delivery.** `applyStatus` is idempotent and
+  refuses to overwrite a terminal outcome, so a replay cannot walk a completed call backwards. Skipping
+  the update on a duplicate would instead mean a retried callback never lands at all.
+- **`CallDuration` is parsed defensively.** A missing or non-numeric value yields `undefined` rather
+  than `NaN` — which would otherwise be written into an `Int` column.
+- **The enqueue is still a marked gap**, now on the `shouldRecover` branch with a log line. The call is
+  already stamped `recoverySmsQueuedAt`, so the decision survives a crash between here and the enqueue —
+  the throttle window will not re-decide on a retry.
+
+**Connects to.** `calls.service.ts` (the decision), `webhook-events.service.ts` (idempotency),
+`telephony.module.ts` (supplies the dependency), `common/phone.ts` (`toE164` at the edge).
+
+**Verified end to end against a running server, 7/7.** Signed webhooks posted with `curl`, exactly as
+Twilio sends them:
+
+| Scenario                          | `Call` row written                                                          |
+| --------------------------------- | --------------------------------------------------------------------------- |
+| Normal missed call                | `outcome=COMPLETED`, `recoverySmsQueuedAt` set, no reason, customer created |
+| Opted-out caller                  | `noRecoveryReason=SUPPRESSED`, **not** queued                               |
+| Withheld caller ID                | `noRecoveryReason=ANONYMOUS_CALLER`, `customerId=null`                      |
+| Status callback (`completed`, 9s) | `outcome=COMPLETED`, `durationSeconds=9`, `endedAt` set                     |
+
+All three calls answered with valid TwiML and HTTP 200; the status callback returned 204. This is the
+first time the full chain has run in one pass: **signature → idempotent record → tenant resolution →
+call + customer → suppression check → recovery decision → TwiML.**
+
+**Watch out for.** No SMS is sent, and that is now the _only_ thing missing from the recovery path. A
+real caller today hears the greeting and receives nothing. The queue and the Twilio send are what remain.
+
+Second: `/status` resolves the business by looking the `To` number up again, a second query per
+callback. Fine at pilot volume and it keeps the handler stateless, but if status callbacks ever become
+hot, the `Call` row already holds `businessId` and could be found by `providerCallSid` — that lookup is
+`unscoped`, however, so it needs deliberate handling rather than a quiet swap.
 
 #### `apps/api/src/common/phone.ts` · `phone.spec.ts`
 

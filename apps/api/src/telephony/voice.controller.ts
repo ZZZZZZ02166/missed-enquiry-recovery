@@ -1,5 +1,6 @@
 import { Body, Controller, Header, HttpCode, Logger, Post, UseGuards } from '@nestjs/common';
 import { twiml } from 'twilio';
+import { CallsService } from '../calls/calls.service';
 import { toE164 } from '../common/phone';
 import { PrismaService } from '../prisma/prisma.service';
 import { TwilioSignatureGuard } from './twilio-signature.guard';
@@ -26,6 +27,7 @@ export class VoiceController {
   constructor(
     private readonly prisma: PrismaService,
     private readonly webhookEvents: WebhookEventsService,
+    private readonly calls: CallsService,
   ) {}
 
   /**
@@ -74,17 +76,32 @@ export class VoiceController {
 
       await this.webhookEvents.markProcessed(outcome.event.id, number.businessId);
 
-      // `From` is null for a withheld caller ID. That is a normal daily occurrence,
-      // not an error: we answer the call, we just have nobody to text.
-      if (!from) {
-        this.logger.log(`Call to ${to} with withheld caller ID — answering, no recovery possible`);
-      }
+      // Record the call and decide whether to recover. `from` is null for a withheld
+      // caller ID — a normal daily occurrence, not an error — and CallsService
+      // handles that itself, returning ANONYMOUS_CALLER. Passing it through rather
+      // than branching here keeps every "why we did not text" answer in one place.
+      const decision = await this.calls.recordInboundCall({
+        businessId: number.businessId,
+        providerCallSid: callSid,
+        fromE164: from,
+        // The stored number, not the inbound `To`. Both normalise to the same value —
+        // we just looked the row up by it — but this one is canonical by construction
+        // and needs no fallback for an unparseable input.
+        toE164: number.e164,
+        // Inconsistently populated on AU PSTN and never depended on, but every real
+        // call is evidence for the D13 question of what carriers actually pass on.
+        forwardedFromE164: toE164(body.ForwardedFrom),
+        callStatus: body.CallStatus,
+      });
 
-      // GAP (deliberate, not forgotten): the recovery SMS is enqueued here once the
-      // calls module and queue exist. It must never be sent inside this request —
-      // Twilio's ~15s timeout and the no-side-effects-in-a-webhook rule both forbid
-      // it. Until then this endpoint answers correctly and records the call, and
-      // nothing is texted.
+      if (decision.shouldRecover) {
+        // GAP (deliberate, not forgotten): the recovery SMS is enqueued here once the
+        // queue exists. It must never be sent inside this request — Twilio's ~15s
+        // timeout and the no-side-effects-in-a-webhook rule both forbid it. The call
+        // is already marked `recoverySmsQueuedAt`, so the decision survives a crash
+        // between here and the enqueue.
+        this.logger.log(`Call ${callSid}: recovery pending (queue not yet built)`);
+      }
 
       return this.greeting(number.business.name);
     } catch (error) {
@@ -116,6 +133,20 @@ export class VoiceController {
         eventType: 'voice.status',
         payload: body,
       });
+
+      // Apply the outcome even for a duplicate delivery: the write is idempotent and
+      // guards terminal states, so a replay cannot walk a completed call backwards.
+      const to = toE164(body.To);
+      const number = to ? await this.findNumber(to) : null;
+      if (number) {
+        const duration = Number.parseInt(body.CallDuration ?? '', 10);
+        await this.calls.applyStatus(
+          number.businessId,
+          callSid,
+          callStatus,
+          Number.isFinite(duration) ? duration : undefined,
+        );
+      }
     } catch (error) {
       // A status callback carries no caller-facing consequence, so swallowing it is
       // safe — but it must still not 500, or Twilio retries a request we cannot serve.

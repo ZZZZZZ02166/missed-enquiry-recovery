@@ -19,16 +19,13 @@ import { WebhookEventsService } from './webhook-events.service';
  * `WebhookEventsService` is exported because the calls and conversations modules will
  * need to mark events processed once the queue exists. Nothing else here is exported:
  * the controllers are entry points, and the guard is only meaningful alongside them.
- */
-/**
- * Imports `CallsModule` for `CallsService`, which turns an authenticated webhook
- * into a `Call` and decides whether to recover.
  *
- * The dependency points this way — telephony depends on calls, not the reverse —
- * because `CallsService` knows nothing about Twilio. It takes already-normalised
- * values and returns a decision, which keeps the recovery logic testable without a
- * webhook and makes it reusable if calls ever arrive from somewhere other than
- * Twilio.
+ * `CallsModule` is imported for `CallsService`, which turns an authenticated webhook
+ * into a `Call` and decides whether to recover. The dependency points this way —
+ * telephony depends on calls, not the reverse — because `CallsService` knows nothing
+ * about Twilio. It takes already-normalised values and returns a decision, which keeps
+ * the recovery logic testable without a webhook and reusable if calls ever arrive from
+ * somewhere other than Twilio.
  */
 @Module({
   imports: [CallsModule],
