@@ -1,4 +1,5 @@
 import { Module } from '@nestjs/common';
+import { CallsModule } from '../calls/calls.module';
 import { TwilioSignatureGuard } from './twilio-signature.guard';
 import { VoiceController } from './voice.controller';
 import { WebhookEventsService } from './webhook-events.service';
@@ -19,7 +20,18 @@ import { WebhookEventsService } from './webhook-events.service';
  * need to mark events processed once the queue exists. Nothing else here is exported:
  * the controllers are entry points, and the guard is only meaningful alongside them.
  */
+/**
+ * Imports `CallsModule` for `CallsService`, which turns an authenticated webhook
+ * into a `Call` and decides whether to recover.
+ *
+ * The dependency points this way — telephony depends on calls, not the reverse —
+ * because `CallsService` knows nothing about Twilio. It takes already-normalised
+ * values and returns a decision, which keeps the recovery logic testable without a
+ * webhook and makes it reusable if calls ever arrive from somewhere other than
+ * Twilio.
+ */
 @Module({
+  imports: [CallsModule],
   controllers: [VoiceController],
   providers: [WebhookEventsService, TwilioSignatureGuard],
   exports: [WebhookEventsService],

@@ -71,6 +71,7 @@ decision rather than restating the argument.
 | 33  | 2026-08-01 | `apps/api/src/calls/suppressions.service.ts`            | Rewritten for the two-column model — step 31 bug fixed. Green. 18/18                |
 | 34  | 2026-08-01 | `apps/api/src/calls/calls.module.ts`                    | Wires calls + suppressions. Found: **tsx breaks Nest DI**, `dev:worker` affected    |
 | 35  | 2026-08-02 | `apps/api/package.json`                                 | `dev:worker` moved off tsx to `nest start --entryFile worker` — DI now works        |
+| 36  | 2026-08-02 | `apps/api/src/telephony/telephony.module.ts`            | Imports CallsModule — `CallsService` now reachable from the webhook. 7/7            |
 
 ---
 
@@ -1784,6 +1785,43 @@ silently injects `undefined` is not a faster dev loop.
 Second: the Nest CLI spawns a child process that survives a signal sent to the parent. When stopping a
 watch-mode worker from a script, `pkill -f 'nest.js start'` is needed; killing the shell that launched it
 leaves the compiler and the app running.
+
+#### `apps/api/src/telephony/telephony.module.ts` — imports `CallsModule`
+
+**Step 36** · 2026-08-02
+
+**What it does.** Adds `imports: [CallsModule]`, making `CallsService` injectable into
+`VoiceController`.
+
+**Why it's written this way.**
+
+- **The dependency points telephony → calls, not the reverse, and that direction is the design.**
+  `CallsService` knows nothing about Twilio: it takes already-normalised values and returns a decision.
+  That is what let steps 28–33 verify the entire recovery decision — throttling, suppression, precedence
+  — without constructing a single webhook. If the arrow were reversed, every test of the decision would
+  need a signed Twilio payload.
+- **Only the import changes.** `TelephonyModule` still exports just `WebhookEventsService`; it does not
+  re-export `CallsService`, because a module should not become a pass-through for its own dependencies.
+  Anything needing `CallsService` imports `CallsModule` directly.
+
+**Connects to.** `calls.module.ts` (step 34), `voice.controller.ts` (which can now inject it, step 37).
+
+**Verified 7/7 through compiled output** — following the step 34 lesson that tsx cannot exercise Nest DI:
+
+- `CallsService` resolves **from `TelephonyModule`'s own scope**, not merely from the root container.
+  This is the assertion that actually tests the import; `app.get(CallsService)` would have passed even
+  without it, because the root container sees every provider in the graph.
+- `SuppressionsService` is reachable transitively, since `CallsModule` exports it.
+- `WebhookEventsService` and `VoiceController` still resolve — the import broke nothing.
+- **The same `CallsService` instance is shared**, not duplicated per importing module. Worth asserting
+  explicitly: two instances would mean two independent 24-hour throttle counters, and a caller could be
+  texted twice for one call.
+- `CallsService` has a real `SuppressionsService` injected, so the wiring is live end to end.
+
+**Watch out for.** The controller still does not call it. `CallsService` is now _available_ to
+`VoiceController` — nothing more. On a running system a forwarded call is still authenticated, recorded
+in `webhook_events`, and answered, with no `Call` row and no recovery decision. Step 37 is the line of
+code that closes it.
 
 #### `apps/api/src/common/phone.ts` · `phone.spec.ts`
 
