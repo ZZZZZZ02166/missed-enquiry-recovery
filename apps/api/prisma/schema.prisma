@@ -312,14 +312,18 @@ model Call {
   @@map("calls")
 }
 
-/// Why a number must not be texted.
+/// Why a number must not be texted — the *operational* reason.
 ///
 /// One table covers three concerns that all answer the same question at the same
 /// moment — "may we send to this number?" — and splitting them would mean three
 /// lookups on the hot path and three chances to forget one.
+///
+/// OPTED_OUT is deliberately NOT a member. A customer replying STOP is a legal fact
+/// that can coexist with an operational one, and collapsing the two into a single
+/// column destroyed information: a blocked marketer who texted STOP then START had
+/// their block deleted along with the opt-out (found at step 31). The opt-out now
+/// lives in `optedOutAt`, orthogonal to this enum.
 enum SuppressionReason {
-  /// STOP, UNSUBSCRIBE, CANCEL, END, QUIT. Legally binding under the Spam Act.
-  OPTED_OUT
   /// Twilio Lookup says landline or toll-free; a send fails and still bills us.
   NOT_TEXTABLE
   /// Owner blocked them from the dashboard — a marketer, a nuisance caller.
@@ -348,7 +352,18 @@ model Suppression {
   /// because every writer normalises first (CLAUDE.md rule 6).
   phoneE164 String @map("phone_e164")
 
-  reason SuppressionReason
+  /// The operational reason, or null when the row exists purely because of an
+  /// opt-out. At least one of `reason` and `optedOutAt` is always set — a row with
+  /// neither would suppress a number for no recorded cause.
+  reason SuppressionReason?
+
+  /// When the customer replied STOP. The legal fact, kept independent of `reason`
+  /// so that clearing one cannot silently clear the other.
+  ///
+  /// Set → the number is suppressed regardless of `reason`, and `isSuppressed`
+  /// reports OPTED_OUT. START clears this timestamp and nothing else, so an owner's
+  /// block underneath survives.
+  optedOutAt DateTime? @map("opted_out_at")
 
   /// Free text for the dashboard — "blocked by owner, repeated marketing calls".
   note String?
@@ -368,12 +383,13 @@ model Suppression {
   /// has said nothing about another's — suppression is per sender, as the Spam Act
   /// treats it.
   ///
-  /// Consequence: a number suppressed for one reason cannot also be recorded under
-  /// another. Reason is a single answer to "why", and OPTED_OUT is the one that
-  /// must win — see the upsert precedence rule in the suppressions service.
+  /// A row can now hold both an operational reason and an opt-out at the same time,
+  /// so the single-row model no longer costs information.
   @@unique([businessId, phoneE164])
-  /// The hot path: "may we send to this number?"
-  @@index([businessId, phoneE164, reason])
+  /// Dashboard: "show me everything blocked as SPAM for this business".
+  @@index([businessId, reason])
+  /// Compliance: "show me every opt-out, newest first".
+  @@index([businessId, optedOutAt])
   @@map("suppressions")
 }
 

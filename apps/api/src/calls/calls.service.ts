@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { env } from '../config/env';
 import type { Call, Customer, NoRecoveryReason } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { SuppressionsService } from './suppressions.service';
 
 /**
  * Turns a recorded voice webhook into a `Call`, and decides whether the caller
@@ -59,7 +60,10 @@ export interface CallDecision {
 export class CallsService {
   private readonly logger = new Logger(CallsService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly suppressions: SuppressionsService,
+  ) {}
 
   /**
    * Record an inbound call and decide what to do about it.
@@ -162,6 +166,18 @@ export class CallsService {
 
     // Global kill switch / spend cap, before anything caller-specific.
     if (!env.SENDING_ENABLED) return 'CAP_REACHED';
+
+    // Opt-outs, the owner's blocklist, and cached non-textable numbers — one indexed
+    // lookup covering all three. First of the caller-specific checks because it is
+    // the only one with legal weight: texting someone who replied STOP is a Spam Act
+    // breach, and no other reason to skip outranks that.
+    //
+    // NOT_TEXTABLE from a suppression row is mapped to the same reason as the
+    // lineType check below; the difference is only which write got there first.
+    const suppressed = await this.suppressions.isSuppressed(input.businessId, input.fromE164);
+    if (suppressed) {
+      return suppressed === 'NOT_TEXTABLE' ? 'NOT_TEXTABLE' : 'SUPPRESSED';
+    }
 
     // Staff, suppliers, existing customers mid-job. They are on the do-not-SMS list
     // precisely because a qualification question would be nonsense to them.

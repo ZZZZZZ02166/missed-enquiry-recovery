@@ -32,40 +32,45 @@ decision rather than restating the argument.
 
 ## Build log
 
-| #   | Date       | File                                                    | In one line                                                                        |
-| --- | ---------- | ------------------------------------------------------- | ---------------------------------------------------------------------------------- |
-| 1   | 2026-07-27 | `CLAUDE.md`                                             | Project brief, build protocol, and the 12 engineering invariants                   |
-| 2   | 2026-07-27 | `docs/codebase.md`                                      | This file — the running per-file explanation                                       |
-| 3   | 2026-07-27 | `.claude/skills/twilio/SKILL.md`                        | Telephony reference: webhooks, Lookup, opt-out, SMS segments, testing              |
-| —   | 2026-07-27 | `CLAUDE.md`                                             | Amended rule 7 — signatures validate over URL + sorted params, not raw body        |
-| 4   | 2026-07-27 | `.claude/skills/queues-redis/SKILL.md`                  | BullMQ and Redis: persistence, idempotency, retries, delayed work                  |
-| 5   | 2026-07-27 | `.claude/skills/backend/SKILL.md`                       | NestJS + Prisma: tenancy assertion, modules, auth, migrations, money               |
-| 6   | 2026-07-27 | `.claude/skills/frontend/SKILL.md`                      | Next.js dashboard: cookie domain, magic link, mobile-first, en-AU formatting       |
-| 7   | 2026-07-27 | `docs/decisions.md`                                     | ADR-lite: 12 locked decisions with rejected alternatives, 5 pending                |
-| 8   | 2026-07-27 | `docs/carrier-forwarding-test.md`                       | The go/no-go gate — protocol and empty results matrix                              |
-| 9   | 2026-07-27 | `docs/twilio-setup.md`                                  | Account runbook: bundle, geo permissions, numbers, webhooks, usage triggers        |
-| 10  | 2026-07-27 | `docs/compliance.md`                                    | Spam Act position, sender split, privacy posture, price representations, retention |
-| 11  | 2026-07-27 | `.claude/settings.json`                                 | Permission allowlist, and denies for the destructive Prisma commands               |
-| 12  | 2026-07-27 | `pnpm-workspace.yaml`                                   | Monorepo shape, and the pnpm build-script allowlist Prisma needs                   |
-| 13  | 2026-07-27 | Scaffolding batch                                       | Root config, both apps, Prisma + first migration, health, phone helper — see below |
-| 14  | 2026-07-27 | `apps/api/src/prisma/tenant-guard.ts`                   | D8 — throws when a query on a tenant model isn't scoped by businessId              |
-| 15  | 2026-07-27 | `apps/api/src/prisma/tenant-guard.spec.ts`              | 71 tests pinning the guard's behaviour, including the OR trap                      |
-| 16  | 2026-07-29 | `apps/api/src/prisma/prisma.service.ts`                 | Applies the guard; three surfaces — `db`, `unscoped`, raw                          |
-| 17  | 2026-07-29 | `apps/api/prisma/schema.prisma`                         | `phone_numbers` — first tenant model; guard proven 8/8 against a live database     |
-| 18  | 2026-07-29 | `apps/api/prisma/schema.prisma`                         | `webhook_events` — idempotency backbone, keyed on a handler-built `dedupeKey`      |
-| 19  | 2026-07-29 | `.claude/skills/twilio/SKILL.md`                        | Corrected §3 — `CallSid` alone is not a valid uniqueness key                       |
-| 20  | 2026-07-29 | `apps/api/src/telephony/twilio-signature.guard.ts`      | Rejects forged webhooks; URL pinned to PUBLIC_API_URL. 11/11 verified              |
-| 21  | 2026-07-29 | `apps/api/src/telephony/twilio-signature.guard.spec.ts` | 24 tests: forgery, replay, diagnostics, unconfigured token                         |
-| 22  | 2026-07-29 | `apps/api/src/telephony/webhook-events.service.ts`      | Idempotent recording; 5 deliveries for one CallSid → 3 rows                        |
-| 23  | 2026-07-29 | `apps/api/src/telephony/webhook-events.service.spec.ts` | First integration suite — real Postgres, incl. a concurrency race                  |
-| —   | 2026-07-29 | `apps/api/package.json`                                 | `NODE_OPTIONS=--experimental-vm-modules` — Prisma 7 needs it under Jest            |
-| 24  | 2026-07-31 | `apps/api/src/telephony/voice.controller.ts`            | Answers the forwarded call; resolves tenant from `To`. 15/15 verified              |
-| 25  | 2026-07-31 | `apps/api/src/telephony/telephony.module.ts`            | Wires the controller, guard and service; routes map, guard rejects unsigned        |
-| 26  | 2026-07-31 | `apps/api/src/app.module.ts`                            | Imports TelephonyModule — routes go live; signed curl → TwiML, end to end          |
-| 27  | 2026-08-01 | `apps/api/prisma/schema.prisma`                         | `customers` + `calls` — a call is not a lead (D5). 14/14 verified                  |
-| 28  | 2026-08-01 | `apps/api/src/calls/calls.service.ts`                   | Records the call and decides whether to recover. 18/18 verified                    |
-| 29  | 2026-08-01 | `apps/api/prisma/schema.prisma`                         | `suppressions` — opt-out, blocklist, landline cache in one table. 9/9 verified     |
-| 30  | 2026-08-01 | `apps/api/src/calls/suppressions.service.ts`            | "May we send?" + OPTED_OUT-wins precedence + STOP keywords. 15/15 verified         |
+| #   | Date       | File                                                    | In one line                                                                         |
+| --- | ---------- | ------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| 1   | 2026-07-27 | `CLAUDE.md`                                             | Project brief, build protocol, and the 12 engineering invariants                    |
+| 2   | 2026-07-27 | `docs/codebase.md`                                      | This file — the running per-file explanation                                        |
+| 3   | 2026-07-27 | `.claude/skills/twilio/SKILL.md`                        | Telephony reference: webhooks, Lookup, opt-out, SMS segments, testing               |
+| —   | 2026-07-27 | `CLAUDE.md`                                             | Amended rule 7 — signatures validate over URL + sorted params, not raw body         |
+| 4   | 2026-07-27 | `.claude/skills/queues-redis/SKILL.md`                  | BullMQ and Redis: persistence, idempotency, retries, delayed work                   |
+| 5   | 2026-07-27 | `.claude/skills/backend/SKILL.md`                       | NestJS + Prisma: tenancy assertion, modules, auth, migrations, money                |
+| 6   | 2026-07-27 | `.claude/skills/frontend/SKILL.md`                      | Next.js dashboard: cookie domain, magic link, mobile-first, en-AU formatting        |
+| 7   | 2026-07-27 | `docs/decisions.md`                                     | ADR-lite: 12 locked decisions with rejected alternatives, 5 pending                 |
+| 8   | 2026-07-27 | `docs/carrier-forwarding-test.md`                       | The go/no-go gate — protocol and empty results matrix                               |
+| 9   | 2026-07-27 | `docs/twilio-setup.md`                                  | Account runbook: bundle, geo permissions, numbers, webhooks, usage triggers         |
+| 10  | 2026-07-27 | `docs/compliance.md`                                    | Spam Act position, sender split, privacy posture, price representations, retention  |
+| 11  | 2026-07-27 | `.claude/settings.json`                                 | Permission allowlist, and denies for the destructive Prisma commands                |
+| 12  | 2026-07-27 | `pnpm-workspace.yaml`                                   | Monorepo shape, and the pnpm build-script allowlist Prisma needs                    |
+| 13  | 2026-07-27 | Scaffolding batch                                       | Root config, both apps, Prisma + first migration, health, phone helper — see below  |
+| 14  | 2026-07-27 | `apps/api/src/prisma/tenant-guard.ts`                   | D8 — throws when a query on a tenant model isn't scoped by businessId               |
+| 15  | 2026-07-27 | `apps/api/src/prisma/tenant-guard.spec.ts`              | 71 tests pinning the guard's behaviour, including the OR trap                       |
+| 16  | 2026-07-29 | `apps/api/src/prisma/prisma.service.ts`                 | Applies the guard; three surfaces — `db`, `unscoped`, raw                           |
+| 17  | 2026-07-29 | `apps/api/prisma/schema.prisma`                         | `phone_numbers` — first tenant model; guard proven 8/8 against a live database      |
+| 18  | 2026-07-29 | `apps/api/prisma/schema.prisma`                         | `webhook_events` — idempotency backbone, keyed on a handler-built `dedupeKey`       |
+| 19  | 2026-07-29 | `.claude/skills/twilio/SKILL.md`                        | Corrected §3 — `CallSid` alone is not a valid uniqueness key                        |
+| 20  | 2026-07-29 | `apps/api/src/telephony/twilio-signature.guard.ts`      | Rejects forged webhooks; URL pinned to PUBLIC_API_URL. 11/11 verified               |
+| 21  | 2026-07-29 | `apps/api/src/telephony/twilio-signature.guard.spec.ts` | 24 tests: forgery, replay, diagnostics, unconfigured token                          |
+| 22  | 2026-07-29 | `apps/api/src/telephony/webhook-events.service.ts`      | Idempotent recording; 5 deliveries for one CallSid → 3 rows                         |
+| 23  | 2026-07-29 | `apps/api/src/telephony/webhook-events.service.spec.ts` | First integration suite — real Postgres, incl. a concurrency race                   |
+| —   | 2026-07-29 | `apps/api/package.json`                                 | `NODE_OPTIONS=--experimental-vm-modules` — Prisma 7 needs it under Jest             |
+| 24  | 2026-07-31 | `apps/api/src/telephony/voice.controller.ts`            | Answers the forwarded call; resolves tenant from `To`. 15/15 verified               |
+| 25  | 2026-07-31 | `apps/api/src/telephony/telephony.module.ts`            | Wires the controller, guard and service; routes map, guard rejects unsigned         |
+| 26  | 2026-07-31 | `apps/api/src/app.module.ts`                            | Imports TelephonyModule — routes go live; signed curl → TwiML, end to end           |
+| 27  | 2026-08-01 | `apps/api/prisma/schema.prisma`                         | `customers` + `calls` — a call is not a lead (D5). 14/14 verified                   |
+| 28  | 2026-08-01 | `apps/api/src/calls/calls.service.ts`                   | Records the call and decides whether to recover. 18/18 verified                     |
+| 29  | 2026-08-01 | `apps/api/prisma/schema.prisma`                         | `suppressions` — opt-out, blocklist, landline cache in one table. 9/9 verified      |
+| 30  | 2026-08-01 | `apps/api/src/calls/suppressions.service.ts`            | "May we send?" + OPTED_OUT-wins precedence + STOP keywords. 15/15 verified          |
+| 31  | 2026-08-01 | `apps/api/src/calls/calls.service.ts`                   | Wires the suppression check — Spam Act gap CLOSED. Found a bug in step 30           |
+| 32  | 2026-08-01 | `apps/api/prisma/schema.prisma`                         | `optedOutAt` splits the legal fact from the operational one. **Build red until 33** |
+| 33  | 2026-08-01 | `apps/api/src/calls/suppressions.service.ts`            | Rewritten for the two-column model — step 31 bug fixed. Green. 18/18                |
+| 34  | 2026-08-01 | `apps/api/src/calls/calls.module.ts`                    | Wires calls + suppressions. Found: **tsx breaks Nest DI**, `dev:worker` affected    |
+| 35  | 2026-08-02 | `apps/api/package.json`                                 | `dev:worker` moved off tsx to `nest start --entryFile worker` — DI now works        |
 
 ---
 
@@ -1500,6 +1505,285 @@ Second: `START` is treated as a resubscribe, and `YES` is included in that set. 
 genuine conversational reply ("yes, 2 bedrooms") — it is harmless today because it only _removes_ a
 suppression that must already exist, but if the keyword set is ever reused for anything else, `YES`
 should be reconsidered.
+
+**Correction (step 31).** The verified claim above — "`optIn` clears an opt-out but leaves a blocklist
+entry intact" — is **true only when the number was never upgraded**. The step 30 test covered a number
+that was _only_ blocked. It does not hold for `block → STOP → START`, because the precedence upgrade
+overwrites `reason` **in place**: the row becomes `OPTED_OUT`, `optIn` deletes rows whose reason is
+`OPTED_OUT`, and the original `SPAM` block is destroyed with it. See step 31 for the full finding and the
+fix. The docstring on `optIn` currently overstates what the method guarantees.
+
+#### `apps/api/src/calls/calls.service.ts` — suppression check wired
+
+**Step 31** · 2026-08-01
+
+**What it does.** Injects `SuppressionsService` and adds one check to `decideRecovery`. **This closes the
+Spam Act gap opened at step 28** — an opt-out now actually prevents the next recovery SMS.
+
+**Why it's written this way.**
+
+- **The check sits immediately after the kill switch and before every other caller-specific test.** It is
+  the only skip reason with legal weight; nothing else should be able to shortcut past it. The kill
+  switch stays first because a global stop must not depend on a per-caller query.
+- **One lookup covers three concerns** — opt-out, owner blocklist, cached non-textable — which is the
+  payoff for the single-table design chosen at step 29.
+- **A `NOT_TEXTABLE` suppression maps back to `NOT_TEXTABLE`, not `SUPPRESSED`.** The two are
+  operationally identical (do not send) but mean different things in the pilot metrics: "this line
+  cannot receive SMS" is a technical fact, while `SUPPRESSED` is a person or an owner saying no. Merging
+  them would corrupt the denominator of the recovery-rate figure the pilot rests on.
+
+**Connects to.** `suppressions.service.ts` (step 30), `calls.service.ts` (step 28),
+`docs/compliance.md` §1.
+
+**Verified against the live database, 8/10 — and both failures were informative.**
+
+Confirmed working: a caller who opts out and rings again gets `SUPPRESSED` with no recovery queued and
+the reason persisted on the call row; the same number is still recoverable at a _different_ business; an
+owner blocklist entry yields `SUPPRESSED`; a cached landline yields `NOT_TEXTABLE`.
+
+**Failure 1 was the test, not the code.** After `optIn`, the caller was reported as
+`RECENTLY_CONTACTED` rather than recoverable. That is correct — the same caller had a _recovered_ call
+minutes earlier, so the 24-hour throttle applied. Diagnosed directly: the suppression row was gone
+(`isSuppressed → null`), so the opt-in worked exactly as intended.
+
+**Failure 2 is a real bug, in step 30's code, found only because this step exercised the two services
+together.**
+
+```
+block(SPAM)  →  isSuppressed = SPAM
+optOut()     →  isSuppressed = OPTED_OUT     (precedence upgrade, overwrites `reason` in place)
+optIn()      →  isSuppressed = null          (row deleted entirely — the SPAM block is gone)
+```
+
+`optIn` deletes rows whose reason is `OPTED_OUT`. Because the upgrade **overwrote** the reason rather
+than layering on top of it, the original blocklist entry no longer exists to survive the delete. A
+blocked marketer can therefore text `STOP` then `START` and become contactable again — precisely the
+behaviour `optIn`'s docstring says it prevents.
+
+Severity, honestly: this fails in the _safe_ direction for compliance — opt-outs are still honoured, so
+there is no Spam Act exposure. The cost is money and owner trust, and it needs an unusual sequence. But
+it contradicts documented behaviour, so it is a bug rather than a quirk.
+
+**The fix is a schema change and is step 32:** separate the legal fact from the operational one with an
+`optedOutAt DateTime?` column. `reason` then stays operational (`SPAM` / `STAFF` / `NOT_TEXTABLE`),
+`optedOutAt` records the opt-out independently, `isSuppressed` returns `OPTED_OUT` whenever `optedOutAt`
+is set, and `optIn` clears the timestamp instead of deleting the row — so an underlying block survives.
+That also removes the single-reason limitation noted in step 29.
+
+**Watch out for.** Nothing calls `recordInboundCall` yet — `voice.controller.ts` still only writes
+`webhook_events`. The decision logic is complete and correct, but on a running system no `Call` rows are
+created and therefore no suppression check ever executes. The controller wiring is still outstanding.
+
+#### `apps/api/prisma/schema.prisma` — `optedOutAt` added, `OPTED_OUT` removed from the enum
+
+**Step 32** · 2026-08-01
+
+**What it does.** Fixes the step 31 bug at its root. `SuppressionReason` loses `OPTED_OUT` and keeps only
+the three operational values; `reason` becomes nullable; a new `optedOutAt DateTime?` records the legal
+fact independently.
+
+**Why it's written this way.**
+
+- **The bug was a modelling error, not a logic error, so the fix belongs in the schema.** An opt-out and
+  an owner's block are _different kinds of fact_ that happen to have the same effect. Forcing them into
+  one enum column meant recording the second destroyed the first, and no amount of care in the service
+  could recover information the column could not hold.
+- **`reason` is nullable, with the invariant stated in the comment:** at least one of `reason` and
+  `optedOutAt` is always set. A row with neither would suppress a number for no recorded cause, which is
+  worse than not suppressing it.
+- **Two new indexes replace one.** `(businessId, reason)` serves the dashboard's "show me everything
+  blocked as SPAM"; `(businessId, optedOutAt)` serves "show me every opt-out, newest first" — a
+  compliance query that had no index at all before, because opt-outs were previously indistinguishable
+  from other reasons. The old three-column index is dropped: with `reason` no longer carrying the
+  opt-out, it no longer answers either question.
+- **The hot-path unique index is untouched**, so the index-only scan measured at step 29 still holds.
+
+**Connects to.** Fixes the defect recorded in step 31. `suppressions.service.ts` must now change to
+match (step 33). Migration `20260801080000_split_optout_from_reason`.
+
+**Migration applied and verified.** The database now has `opted_out_at`, a nullable `reason`, the
+three-value enum, and both new indexes. Confirmed with `\d suppressions`.
+
+**Watch out for — two real toolchain findings.**
+
+1. **`prisma migrate dev` cannot run non-interactively when a change is destructive.** Removing an enum
+   value triggers a `(y/N)` confirmation, and with no TTY the command aborts with
+   _"Prisma Migrate has detected that the environment is non-interactive"_. `--create-only` aborts the
+   same way, and piping `y` through `script` did not forward stdin. **The working route is
+   `prisma migrate diff --from-config-datasource --to-schema ./prisma/schema.prisma --script`** to
+   generate the SQL into a hand-named migration directory, then `prisma migrate deploy` to apply it —
+   `deploy` is non-interactive by design. Note the Prisma 7 flag names: `--to-schema`, not
+   `--to-schema-datamodel`, and there is no `--shadow-database-url` on `migrate diff`.
+2. **`prisma generate` succeeded while the migration had failed**, leaving the generated client
+   describing a schema the database did not have. Nothing warned. If a migration aborts, re-check
+   `migrate status` before trusting the client — a generate that "worked" is not evidence the database
+   moved.
+
+**Watch out for — the build is RED at the end of this step.** `pnpm typecheck` reports exactly 4 errors,
+all in `suppressions.service.ts`, all caused by `'OPTED_OUT'` no longer being a `SuppressionReason`:
+the `REASON_PRECEDENCE` key, an index into it that can now be null, the literal in `optOut`, and the
+`deleteMany` filter in `optIn`. `calls.service.ts` still compiles — its `'SUPPRESSED'` is a
+`NoRecoveryReason` and is unaffected.
+
+This is the one-file protocol's intended trade: schema and service are a single logical change whose
+intermediate state does not compile. It is recorded here rather than hidden, and **step 33 restores
+green**. Do not deploy from this commit. **Resolved in step 33 — 0 errors.**
+
+#### `apps/api/src/calls/suppressions.service.ts` (rewritten)
+
+**Step 33** · 2026-08-01
+
+**What it does.** Rewrites the service against the two-column model from step 32. Restores the build to
+green and fixes the step 31 defect.
+
+**Why it's written this way.**
+
+- **`REASON_PRECEDENCE` is gone entirely.** That table existed only to arbitrate between two facts
+  competing for one column. With `optedOutAt` and `reason` orthogonal, writing one cannot destroy the
+  other, so there is nothing left to arbitrate — the fix _removed_ code rather than adding a special
+  case on top of a flawed model. Worth noticing: a bug fix that deletes the mechanism that caused it is
+  usually the right shape.
+- **`isSuppressed` reports `OPTED_OUT` ahead of any operational reason**, via a new `SuppressionStatus`
+  type — `SuppressionReason | 'OPTED_OUT'`. Precedence survives where it belongs, in _reporting_: the
+  opt-out is the answer that matters legally and the one an owner needs to see. It no longer touches
+  storage.
+- **`optOut` preserves the original `optedOutAt` on a repeat STOP.** The date that matters for a
+  compliance record is when they _first_ said stop, not when they last repeated it. `existing.optedOutAt
+?? new Date()` is a one-line detail with real consequences in a dispute.
+- **`optOut` writes `reason: null` for a fresh row.** The row exists purely because of the opt-out and
+  claims no operational block — which is exactly the state that used to be unrepresentable.
+- **`optIn` deletes the row only when `reason` is null.** Otherwise it clears the timestamp and leaves
+  the block. An empty row would suppress nothing while looking like it suppressed something.
+- **`optIn` keeps `sourceMessageSid`.** It is evidence that an opt-out happened; a later opt-in does not
+  make that untrue, and the audit trail should outlive the state change.
+- **`listOptOuts` is new** — the compliance view, backed by the `(businessId, optedOutAt)` index added in
+  step 32. It could not exist before, because opt-outs were indistinguishable from other reasons.
+
+**Connects to.** `prisma/schema.prisma` (step 32). `calls.service.ts` — unchanged, and still compiles:
+it consumes the returned status without caring how it is stored.
+
+**Verified against the live database, 18/18 — including the exact step 31 scenario.**
+
+```
+block(SPAM)  →  SPAM         row: reason=SPAM,  optedOutAt=null
+optOut()     →  OPTED_OUT    row: reason=SPAM,  optedOutAt=<t>   ← block survives underneath
+optIn()      →  SPAM         row: reason=SPAM,  optedOutAt=null  ← FIXED
+```
+
+Also confirmed: the reverse order (opt-out first, then block) holds both facts simultaneously and still
+reports `OPTED_OUT`; a repeat STOP keeps the original timestamp; an opt-out-only row is deleted on
+opt-in because nothing is left to record; opt-out evidence survives opt-in; per-business isolation holds;
+whole-message keyword matching is unchanged; and end to end through `CallsService`, an opted-out caller
+yields `SUPPRESSED` while a landline still yields the distinct `NOT_TEXTABLE`.
+
+**Watch out for.** `isSuppressed` now returns `SuppressionStatus`, a wider type than
+`SuppressionReason`. Anything that switches exhaustively on the result must handle `'OPTED_OUT'`, which
+is not a database value. `calls.service.ts` already does, via its `=== 'NOT_TEXTABLE'` check falling
+through to `SUPPRESSED`.
+
+Second: the schema invariant "at least one of `reason` and `optedOutAt` is set" is enforced by this
+service, not by the database. A `CHECK` constraint would make it structural. Worth adding if anything
+else ever writes to this table.
+
+#### `apps/api/src/calls/calls.module.ts`
+
+**Step 34** · 2026-08-01
+
+**What it does.** Registers `CallsService` and `SuppressionsService` and exports both.
+
+**Why it's written this way.**
+
+- **No controllers.** Calls arrive through Twilio webhooks, which belong to `TelephonyModule`. This
+  module owns what happens _after_ a webhook is authenticated and recorded. A dashboard call list will
+  add a controller later; there is nothing to expose yet.
+- **`SuppressionsService` lives here rather than in its own module.** It exists to answer one question —
+  "may we send to this caller?" — which is a step in the recovery decision. A separate module whose only
+  consumer is this one would be ceremony.
+- **Both are exported.** `TelephonyModule` needs `CallsService`; the messaging path will need
+  `SuppressionsService` directly, to record a STOP reply and to check before every send.
+
+**Connects to.** `calls.service.ts`, `suppressions.service.ts`, `prisma.module.ts` (global). Will be
+imported by `TelephonyModule` and later by the messaging module.
+
+**Verified 7/7 — but only after the verification method itself had to be fixed.** Mounted with _only_
+`PrismaModule`, proving it stands alone: both services resolve, `PrismaService` is reachable through the
+global module without being imported, `CallsService` receives a **real** `SuppressionsService` instance
+(not a stub), an opted-out caller yields `SUPPRESSED` through container-wired instances, and both
+services are visible to a downstream consumer module.
+
+**Watch out for — a finding that invalidates a verification technique used since step 27.**
+
+**`tsx` cannot run NestJS dependency injection.** tsx compiles with esbuild, and **esbuild does not
+support `emitDecoratorMetadata`**. Without `design:paramtypes`, Nest cannot see a constructor's
+parameter types, so it injects **nothing** — and, critically, does not error. Providers are constructed
+with `undefined` dependencies and fail later at first use:
+
+```
+TypeError: Cannot read properties of undefined (reading 'db')
+    at SuppressionsService.optOut (suppressions.service.ts:119)
+```
+
+The identical probe compiled with `nest build` (tsc) passes 7/7. Earlier verification scripts were
+unaffected because they constructed services by hand — `new CallsService(prisma, suppressions)` — which
+bypasses DI entirely. **Any future check of DI wiring must run against `dist/`, not through tsx.**
+
+**Second, and more serious: this affects `pnpm dev:worker`.** The script is
+`tsx watch src/worker.ts`, so the worker's entire object graph is built without decorator metadata.
+It _appears_ to start correctly — the boot log shows every module initialising and "Worker started" —
+because nothing dereferences an injected dependency at boot. The failure surfaces only when a job
+processor actually runs, as an `undefined` property error far from its cause.
+
+Nothing is broken today: `worker.ts` currently only creates a context and logs. But the first BullMQ
+processor with an injected service would hit this, and the symptom would look like a bug in the
+processor rather than in the dev script.
+
+**Verified fix:** `nest start --entryFile worker` boots the same graph through tsc with metadata intact
+(confirmed working). The `dev:worker` script should change to that, plus `--watch`. That is a
+`package.json` edit and is the next step.
+
+`pnpm dev:api` is unaffected — it already uses `nest start --watch`. **Fixed in step 35.**
+
+#### `apps/api/package.json` — `dev:worker` moved off tsx
+
+**Step 35** · 2026-08-02
+
+**What it does.** Changes one script:
+
+```diff
+- "dev:worker": "tsx watch src/worker.ts",
++ "dev:worker": "nest start --watch --entryFile worker",
+```
+
+**Why it's written this way.**
+
+- **It removes a trap rather than fixing a visible failure.** Nothing was broken — the old script
+  started cleanly and printed a healthy boot log. It would have failed on the _first BullMQ processor
+  that used an injected service_, as an `undefined` property error inside the processor, days after the
+  cause was introduced and nowhere near it. Fixing it before writing that processor is the difference
+  between a non-event and a wasted afternoon.
+- **`nest start --entryFile worker` compiles with tsc**, so `emitDecoratorMetadata` is applied and
+  `design:paramtypes` exists for Nest to read. It also matches `dev` exactly, which means the two
+  entrypoints now share one toolchain — consistent with D7's "same modules, same image, different start
+  command".
+- **`tsx` stays in devDependencies deliberately.** It is genuinely useful for one-off scripts that
+  construct objects directly, which is how most verification in this build has been done. The limitation
+  is documented at step 34 rather than removing a useful tool.
+
+**Connects to.** `src/worker.ts` (the entrypoint), `nest-cli.json` (supplies the compiler options),
+step 34 (which found the problem).
+
+**Verified.** `pnpm dev:worker` now compiles in watch mode — _"Found 0 errors. Watching for file
+changes."_ — then boots the full graph: `PrismaModule`, `AppModule`, `TelephonyModule` all initialise
+and `Database connected (tenant guard active)` appears. The same graph under tsx built its providers
+with `undefined` dependencies.
+
+**Watch out for.** `nest start --watch` recompiles the whole project on change, so it is slower to
+restart than tsx was. That is the cost of correct DI and is not negotiable — a faster dev loop that
+silently injects `undefined` is not a faster dev loop.
+
+Second: the Nest CLI spawns a child process that survives a signal sent to the parent. When stopping a
+watch-mode worker from a script, `pkill -f 'nest.js start'` is needed; killing the shell that launched it
+leaves the compiler and the app running.
 
 #### `apps/api/src/common/phone.ts` · `phone.spec.ts`
 

@@ -8,24 +8,20 @@ import { PrismaService } from '../prisma/prisma.service';
  * Every outbound send passes through `isSuppressed` first. That check is the last
  * thing standing between a STOP reply and a Spam Act breach, so it is deliberately
  * boring: one indexed lookup, no caching, no cleverness.
+ *
+ * A row carries two independent facts:
+ *
+ *   optedOutAt  the customer said STOP — legal, and only they can undo it
+ *   reason      an operational block — NOT_TEXTABLE, SPAM, STAFF
+ *
+ * They were one column until step 32. Merging them meant an opt-out overwrote a
+ * block, and the subsequent START deleted the row entirely — a blocked marketer
+ * could text their way back in. Keeping them orthogonal removes the whole class of
+ * bug: clearing one cannot touch the other.
  */
 
-/**
- * Which reason wins when a number is already suppressed for a different one.
- *
- * The table holds one row per (business, phone), so a number blocked as SPAM that
- * later replies STOP has to resolve to something. OPTED_OUT always wins: it is the
- * only reason with legal weight, and the only one we may never quietly discard.
- * The rest are operational and can be overwritten freely.
- *
- * Higher number wins.
- */
-const REASON_PRECEDENCE: Record<SuppressionReason, number> = {
-  OPTED_OUT: 100,
-  STAFF: 20,
-  SPAM: 10,
-  NOT_TEXTABLE: 5,
-};
+/** What `isSuppressed` reports. `OPTED_OUT` is a status, not a stored reason. */
+export type SuppressionStatus = SuppressionReason | 'OPTED_OUT';
 
 /**
  * The keywords Twilio treats as opt-out, matched case-insensitively.
@@ -49,83 +45,67 @@ export class SuppressionsService {
   /**
    * The hot path. Called before every outbound send.
    *
-   * Returns the reason, or null when sending is permitted. Deliberately returns the
+   * Returns the reason, or null when sending is permitted. Deliberately returns a
    * reason rather than a boolean so the caller can record *why* it skipped
    * (`NoRecoveryReason`) instead of logging an unexplained no-op.
    *
-   * Not cached. An opt-out must take effect on the very next send, and a stale cache
-   * entry here is a compliance breach rather than a performance regression. The
-   * unique index makes this an index-only scan (measured at step 29).
+   * `OPTED_OUT` outranks any operational reason in what it *reports* — it is the
+   * answer that matters legally, and the one an owner needs to see. The block
+   * underneath is still on the row, so removing the opt-out does not unblock.
+   *
+   * Not cached. An opt-out must take effect on the very next send, and a stale entry
+   * here is a compliance breach rather than a performance regression. The unique
+   * index makes this an index-only scan (measured at step 29).
    */
-  async isSuppressed(businessId: string, phoneE164: string): Promise<SuppressionReason | null> {
+  async isSuppressed(businessId: string, phoneE164: string): Promise<SuppressionStatus | null> {
     const row = await this.prisma.db.suppression.findFirst({
       where: { businessId, phoneE164 },
-      select: { reason: true },
+      select: { reason: true, optedOutAt: true },
     });
-    return row?.reason ?? null;
+    if (!row) return null;
+    if (row.optedOutAt) return 'OPTED_OUT';
+    return row.reason;
   }
 
   /**
-   * Suppress a number, respecting precedence.
+   * Apply an operational block, leaving any opt-out untouched.
    *
-   * Never downgrades: a number already OPTED_OUT stays OPTED_OUT even if it is later
-   * blocked as SPAM or found to be a landline. Silently losing an opt-out because a
-   * lower-priority write happened afterwards is exactly the failure this guards.
+   * No precedence logic is needed any more. The two facts live in different columns,
+   * so writing one cannot destroy the other — which is exactly the bug that made
+   * precedence necessary in the first place.
    */
   async suppress(params: {
     businessId: string;
     phoneE164: string;
     reason: SuppressionReason;
     note?: string;
-    sourceMessageSid?: string;
   }): Promise<Suppression> {
-    const { businessId, phoneE164, reason } = params;
+    const { businessId, phoneE164, reason, note } = params;
 
     const existing = await this.prisma.db.suppression.findFirst({
       where: { businessId, phoneE164 },
     });
 
     if (existing) {
-      if (REASON_PRECEDENCE[existing.reason] >= REASON_PRECEDENCE[reason]) {
-        // Keep the stronger reason, but still record the note and evidence if this
-        // call carries them — the fact that they also opted out is worth keeping.
-        if (params.note || params.sourceMessageSid) {
-          return this.prisma.db.suppression.update({
-            where: { id: existing.id, businessId },
-            data: {
-              note: params.note ?? existing.note,
-              sourceMessageSid: params.sourceMessageSid ?? existing.sourceMessageSid,
-            },
-          });
-        }
-        return existing;
-      }
-
       return this.prisma.db.suppression.update({
         where: { id: existing.id, businessId },
-        data: {
-          reason,
-          note: params.note ?? existing.note,
-          sourceMessageSid: params.sourceMessageSid ?? existing.sourceMessageSid,
-        },
+        data: { reason, note: note ?? existing.note },
       });
     }
 
     return this.prisma.db.suppression.create({
-      data: {
-        businessId,
-        phoneE164,
-        reason,
-        note: params.note,
-        sourceMessageSid: params.sourceMessageSid,
-      },
+      data: { businessId, phoneE164, reason, note },
     });
   }
 
   /**
    * Record an opt-out. The Spam Act path.
    *
-   * Logged at `warn` on purpose: an opt-out is not an error, but a rising rate is the
+   * Sets `optedOutAt` and nothing else, so an existing block survives. Re-recording
+   * an opt-out keeps the *original* timestamp: the date that matters is when they
+   * first said stop, not when they last repeated it.
+   *
+   * Logged at `warn` on purpose. An opt-out is not an error, but a rising rate is the
    * clearest early signal that the messaging is landing badly, and it should be
    * visible without going looking.
    */
@@ -135,30 +115,63 @@ export class SuppressionsService {
     sourceMessageSid?: string,
   ): Promise<Suppression> {
     this.logger.warn(`Opt-out recorded for ${phoneE164} (business ${businessId})`);
-    return this.suppress({
-      businessId,
-      phoneE164,
-      reason: 'OPTED_OUT',
-      sourceMessageSid,
-      note: 'Customer replied with a STOP keyword',
+
+    const existing = await this.prisma.db.suppression.findFirst({
+      where: { businessId, phoneE164 },
+    });
+
+    if (existing) {
+      return this.prisma.db.suppression.update({
+        where: { id: existing.id, businessId },
+        data: {
+          optedOutAt: existing.optedOutAt ?? new Date(),
+          sourceMessageSid: sourceMessageSid ?? existing.sourceMessageSid,
+        },
+      });
+    }
+
+    return this.prisma.db.suppression.create({
+      data: {
+        businessId,
+        phoneE164,
+        // No operational reason: the row exists purely because they opted out.
+        reason: null,
+        optedOutAt: new Date(),
+        sourceMessageSid,
+        note: 'Customer replied with a STOP keyword',
+      },
     });
   }
 
   /**
    * Undo an opt-out after START / UNSTOP.
    *
-   * Only removes `OPTED_OUT` rows. A resubscribe says nothing about a landline or an
-   * owner's blocklist entry, and deleting those would let a blocked marketer text
-   * their way back in.
+   * Clears `optedOutAt` only. An operational block stays, so a marketer the owner
+   * blocked cannot text STOP then START to become contactable again — the failure
+   * found at step 31.
+   *
+   * The row is deleted only when nothing is left to record. Keeping an empty row
+   * would suppress nothing while looking like it suppressed something.
    */
   async optIn(businessId: string, phoneE164: string): Promise<boolean> {
-    const { count } = await this.prisma.db.suppression.deleteMany({
-      where: { businessId, phoneE164, reason: 'OPTED_OUT' },
+    const existing = await this.prisma.db.suppression.findFirst({
+      where: { businessId, phoneE164 },
     });
-    if (count > 0) {
-      this.logger.log(`Opt-in: suppression cleared for ${phoneE164} (business ${businessId})`);
+    if (!existing?.optedOutAt) return false;
+
+    if (existing.reason === null) {
+      await this.prisma.db.suppression.deleteMany({ where: { businessId, id: existing.id } });
+    } else {
+      await this.prisma.db.suppression.update({
+        where: { id: existing.id, businessId },
+        // sourceMessageSid is kept: it is evidence of the opt-out that happened,
+        // and a later opt-in does not make that untrue.
+        data: { optedOutAt: null },
+      });
     }
-    return count > 0;
+
+    this.logger.log(`Opt-in: opt-out cleared for ${phoneE164} (business ${businessId})`);
+    return true;
   }
 
   /**
@@ -187,8 +200,8 @@ export class SuppressionsService {
    * Cache a Twilio Lookup result that says this number cannot receive SMS.
    *
    * Written alongside `Customer.lineType`. Both hold the same fact, but this is the
-   * one the send path trusts — the customer row is the cache of what Lookup said,
-   * this is the decision not to send.
+   * one the send path trusts — the customer row caches what Lookup said, this is the
+   * decision not to send.
    */
   async markNotTextable(
     businessId: string,
@@ -208,6 +221,14 @@ export class SuppressionsService {
     return this.prisma.db.suppression.findMany({
       where: { businessId, ...(reason ? { reason } : {}) },
       orderBy: { createdAt: 'desc' },
+    });
+  }
+
+  /** Every opt-out for a business, newest first — the compliance view. */
+  async listOptOuts(businessId: string): Promise<Suppression[]> {
+    return this.prisma.db.suppression.findMany({
+      where: { businessId, optedOutAt: { not: null } },
+      orderBy: { optedOutAt: 'desc' },
     });
   }
 }
