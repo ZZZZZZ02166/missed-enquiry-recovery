@@ -109,6 +109,7 @@ decision rather than restating the argument.
 | 65  | 2026-08-03 | `apps/api/src/jobs/jobs.module.ts`                      | Registers the inbound processor; boot proves its wiring. 22/22 boot, 160 tests     |
 | 66  | 2026-08-03 | `apps/api/src/worker.ts`                               | Inbound worker + **fixed a shutdown crash on every deploy**. 17/17 end to end       |
 | 67  | 2026-08-03 | `apps/api/src/telephony/messages.controller.ts`         | **THE LOOP IS CLOSED** — signed reply → question, no manual step. 25/25             |
+| 68  | 2026-08-03 | `apps/api/prisma/schema.prisma`                        | `leads` — typed answer columns, quote fields, 6 statuses + 4 flags. 31/31           |
 
 ---
 
@@ -3707,3 +3708,61 @@ no further.
 
 Third: `MAX_SMS_PER_BUSINESS_PER_DAY` remains unenforced, so the loop that now runs unattended has no
 spend ceiling other than `SENDING_ENABLED`.
+
+#### `apps/api/prisma/schema.prisma` — step 68 revision (`leads`)
+
+**Step 68** · 2026-08-03 · _tenth of twelve tables; `services` and `attachments` remain_
+
+**What it does.** Adds the `Lead` model plus four enums (`LeadStatus`, `PropertyType`, `LeadUrgency`,
+`QuoteType`), and the back-relations on `Business`, `Customer` and `Conversation`.
+
+**Why it is written this way.**
+
+- **A call is not a lead.** Leads are created lazily, on the customer's *first reply* — calls that never
+  get a response stay as calls. That keeps the owner's inbox honest, keeps spam out of it, and makes
+  "% of missed callers who become qualified leads" a number that means something.
+- **One lead per conversation**, enforced by a unique `conversationId`. The conversation is the
+  transcript and the cursor; the lead is the structured result the owner acts on. Keeping them separate
+  means the owner's view does not change shape every time the question flow does. Verified: a second
+  lead on the same conversation is rejected by the database, not by a code path someone could forget.
+- **Six statuses, and four flags that are deliberately not statuses.** `needsHuman`, `isSpam`,
+  `isDuplicate` and `optedOut` can each be true at any point in the pipeline; modelling them as statuses
+  guarantees a state bug the first time a qualified lead turns out to be spam. `CONTACTED` is absent for
+  a different reason — contact here is automatic and instant, so it would be true of every lead from the
+  moment it exists.
+- **Typed columns for what the pricing matrix will read; JSON for the long tail.** Beds, baths, carpeted
+  rooms and suburb have to be priced in SQL/TS, and "leads by suburb" should be a `GROUP BY` rather than
+  JSON surgery — verified with the actual `groupBy` the dashboard will run. `answers` keeps everything
+  the question flow collected, so the columns are a promoted subset rather than a replacement.
+- **`serviceId` is a plain nullable column, not a relation.** The `services` table does not exist yet.
+  Adding the column now means matching becomes an additive migration rather than a reshape — the
+  fast-follow requirement from `docs/decisions.md`.
+- **`quoteShownToCustomer` is separate from `quotedAmountCents`.** A price the system computed but the
+  owner suppressed is still worth recording, and conflating "we worked out a number" with "we told them
+  the number" would corrupt the one metric that decides whether the pricing feature works.
+- **`quoteSnapshot` freezes the service config at quote time.** When the owner raises prices next month,
+  what the customer was told must not change with them.
+- **`ownerNotifiedAt` exists now because it is the notify job's idempotency key.** Texting an owner the
+  same lead twice is the kind of thing that gets the product turned off.
+- **`wonValueCents` is one integer, deliberately.** It is the input to the only commercial metric that
+  matters, and owners will not maintain a CRM — which is exactly why the ask has to be one tap
+  ("reply 1W 450") rather than a form.
+
+**Verified 31/31** against the migrated database: the model reaches the client; the tenant guard covers
+it (unscoped `findMany` rejected, `findUnique` banned) — worth checking rather than assuming, since a
+new model that is missing from `TENANT_MODELS` would be an unguarded table with nothing to signal it;
+every default is the safe one (`NEW`, `NONE`, all flags false, `answers` `{}`, `missingFields` `[]`);
+the unique conversation constraint; the typed columns and enums round-trip; `groupBy` on suburb works;
+quote figures store as integer cents with the snapshot intact; cross-tenant reads return nothing; and
+deleting a conversation cascades to its lead.
+
+**Watch out for.** **Nothing writes a lead yet.** `InboundMessageProcessor.createLead` still only logs,
+so the table is empty and the owner still receives nothing.
+
+Second: `PropertyType` and `LeadUrgency` are uppercase in the database while extraction produces
+lowercase (`'apartment'`, `'high'`). Whatever creates leads owns that mapping, and getting it wrong
+fails at write time rather than silently — but it is a real conversion, not a cast.
+
+Third: `missingFields` is `String[]`, a Postgres array rather than a relation. Fine for a short list the
+owner reads, but it cannot be joined or indexed usefully — if "which field is most often missing?" ever
+becomes a question worth answering across businesses, it needs a different shape.

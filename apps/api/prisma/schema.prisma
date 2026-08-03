@@ -1,7 +1,7 @@
 // Schema grows table by table (CLAUDE.md build protocol), not all twelve at once.
 // Landed so far: businesses, users, phone_numbers, webhook_events, customers, calls,
-//                suppressions, messages, conversations.
-// Remaining: services, leads, attachments.
+//                suppressions, messages, conversations, leads.
+// Remaining: services, attachments.
 //
 // Conventions (.claude/skills/backend/SKILL.md §4):
 //   camelCase fields, snake_case tables and columns via @map/@@map
@@ -71,6 +71,7 @@ model Business {
   suppressions  Suppression[]
   messages      Message[]
   conversations Conversation[]
+  leads         Lead[]
 
   @@map("businesses")
 }
@@ -210,6 +211,7 @@ model Customer {
   calls         Call[]
   messages      Message[]
   conversations Conversation[]
+  leads         Lead[]
 
   /// The same phone number is a different customer for a different business.
   @@unique([businessId, phoneE164])
@@ -471,6 +473,8 @@ model Conversation {
   business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
   customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
   call     Call?    @relation(fields: [callId], references: [id], onDelete: SetNull)
+  /// Created lazily, on the customer's first reply. Null until then.
+  lead     Lead?
 
   /// One open conversation per customer per business. A second missed call from
   /// someone mid-conversation must continue the existing thread, not start a rival
@@ -597,6 +601,182 @@ model Message {
   /// "Which sends failed?" — the operational view.
   @@index([businessId, status])
   @@map("messages")
+}
+
+/// Where a lead is in the owner's pipeline.
+///
+/// Six statuses, and deliberately not eight. `NEEDS_HUMAN`, `SPAM`, `DUPLICATE` and
+/// `OPTED_OUT` are **flags**, not statuses: each can be true at any point in the
+/// pipeline, and modelling them as statuses guarantees state bugs the first time a
+/// qualified lead turns out to be spam. `CONTACTED` is also absent — contact is
+/// automatic and instant here, so it would be true of every lead the moment it exists
+/// (Part 3 of the plan).
+enum LeadStatus {
+  /// Created on the customer's first reply, before anything is known.
+  NEW
+  /// Questions are still outstanding.
+  QUALIFYING
+  /// Everything required is answered. This is the one the owner acts on.
+  QUALIFIED
+  /// A price was computed and shown. Only reachable once services exist.
+  QUOTED
+  WON
+  LOST
+
+  @@map("lead_status")
+}
+
+enum PropertyType {
+  HOUSE
+  APARTMENT
+  TOWNHOUSE
+  UNIT
+  OTHER
+
+  @@map("property_type")
+}
+
+enum LeadUrgency {
+  LOW
+  NORMAL
+  HIGH
+
+  @@map("lead_urgency")
+}
+
+/// How a quoted figure should be read — and worded to the customer.
+///
+/// Mirrors the four pricing types on `services`, because the wording obligation
+/// differs per type: a `FROM` price must say "starting from" and an `ESTIMATE` must
+/// say the business will confirm (docs/decisions.md, Part 6).
+enum QuoteType {
+  /// A firm price the business will honour.
+  FIXED
+  /// Computed but not binding — per-unit totals, for instance.
+  ESTIMATE
+  /// A floor, not a price. "Prices start from ..."
+  FROM
+  /// No figure was shown. The default, and the only value possible today.
+  NONE
+
+  @@map("quote_type")
+}
+
+/// A missed caller who replied, with whatever they told us.
+///
+/// **A call is not a lead** (docs/decisions.md). Leads are created lazily, on the
+/// customer's *first reply* — calls that never get a response stay as calls. That is
+/// what keeps the owner's inbox honest, keeps spam out of it, and makes "% of missed
+/// callers who become qualified leads" a number that means something.
+///
+/// One lead per conversation, enforced by a unique `conversationId`. The conversation
+/// is the transcript and the cursor; the lead is the structured result the owner acts
+/// on. Splitting them means the owner's view does not change shape every time the
+/// question flow does.
+model Lead {
+  id         String @id @default(cuid())
+  businessId String @map("business_id")
+  customerId String @map("customer_id")
+
+  /// The thread this was extracted from. Unique: a conversation yields one lead.
+  conversationId String @unique @map("conversation_id")
+
+  status LeadStatus @default(NEW)
+
+  /// Flags, not statuses. Each can be true alongside any status.
+  needsHuman  Boolean @default(false) @map("needs_human")
+  isSpam      Boolean @default(false) @map("is_spam")
+  isDuplicate Boolean @default(false) @map("is_duplicate")
+  optedOut    Boolean @default(false) @map("opted_out")
+
+  /// Why a human is needed, or why the lead was lost. Shown to the owner, never
+  /// to the customer.
+  needsHumanReason String? @map("needs_human_reason")
+  lostReason       String? @map("lost_reason")
+
+  // --- Answers -------------------------------------------------------------
+  //
+  // Typed columns, not JSON, for the fields the future pricing matrix reads. The
+  // matrix has to price in SQL/TS off beds, baths, carpet and suburb — and the
+  // dashboard's "leads by suburb" is a GROUP BY rather than JSON surgery. The long
+  // tail stays in `answers`.
+
+  /// What the customer called it, in their words. Always populated.
+  serviceType String? @map("service_type")
+
+  /// The matched catalogue entry. Null until the `services` table exists — at which
+  /// point this becomes a relation. Kept as a plain column now so the matching step
+  /// is an additive migration rather than a reshape.
+  serviceId String? @map("service_id")
+
+  suburb        String?
+  propertyType  PropertyType? @map("property_type")
+  bedrooms      Int?
+  bathrooms     Int?
+  carpetedRooms Int?          @map("carpeted_rooms")
+
+  /// The customer's own words ("next Tuesday"), deliberately unparsed. Converting it
+  /// needs the business timezone and a reference point (rule 12), and getting it
+  /// wrong silently books the wrong week.
+  preferredDate String? @map("preferred_date")
+
+  urgency          LeadUrgency?
+  propertyCondition String?     @map("property_condition")
+
+  /// Owner-configurable add-ons — oven, windows, balcony. Shape varies per business.
+  extras Json?
+
+  /// Everything the question flow collected, including fields with no column yet.
+  /// The columns above are a promoted subset, not a replacement.
+  answers Json @default("{}")
+
+  /// Required fields still unanswered when the conversation ended. The owner's
+  /// "what do I still need to ask?" list.
+  missingFields String[] @map("missing_fields")
+
+  // --- Quote ---------------------------------------------------------------
+  //
+  // Every figure here comes from PriceCalculator over the owner's stored config
+  // (CLAUDE.md rule 2). Nothing writes these yet — services do not exist.
+
+  /// Integer cents, AUD, GST-inclusive as shown to the caller (rule 11).
+  quotedAmountCents    Int?      @map("quoted_amount_cents")
+  quoteType            QuoteType @default(NONE) @map("quote_type")
+  /// Whether the customer was actually told. A computed price the owner suppressed
+  /// is still worth recording, and the two must not be conflated.
+  quoteShownToCustomer Boolean   @default(false) @map("quote_shown_to_customer")
+  quotedAt             DateTime? @map("quoted_at")
+
+  /// The service config exactly as it stood when the quote was made. When the owner
+  /// raises prices next month, what the customer was told must not change with them.
+  quoteSnapshot Json? @map("quote_snapshot")
+
+  // --- Outcome -------------------------------------------------------------
+
+  /// Set when the structured lead SMS reaches the owner. The notify job's idempotency
+  /// key: an owner must not be texted the same lead twice.
+  ownerNotifiedAt DateTime? @map("owner_notified_at")
+
+  /// What the job was worth. Owner-entered, and the input to the only commercial
+  /// metric that matters — which is exactly why the ask has to be one tap
+  /// ("reply 1W 450"), not a CRM form nobody fills in.
+  wonValueCents Int?      @map("won_value_cents")
+  closedAt      DateTime? @map("closed_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  business     Business     @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  customer     Customer     @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+
+  /// The owner's inbox: open leads, newest first.
+  @@index([businessId, status, createdAt])
+  /// The dashboard's default view and the weekly close-out sweep.
+  @@index([businessId, createdAt])
+  /// "Leads by suburb" without a table scan (plan §11).
+  @@index([businessId, suburb])
+  @@map("leads")
 }
 
 enum WebhookProvider {
