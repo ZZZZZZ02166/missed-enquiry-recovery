@@ -108,6 +108,7 @@ decision rather than restating the argument.
 | 64  | 2026-08-03 | `apps/api/src/jobs/processors/inbound-message.processor.ts` | Reply → decision → persist → send. 42/42 against a real database              |
 | 65  | 2026-08-03 | `apps/api/src/jobs/jobs.module.ts`                      | Registers the inbound processor; boot proves its wiring. 22/22 boot, 160 tests     |
 | 66  | 2026-08-03 | `apps/api/src/worker.ts`                               | Inbound worker + **fixed a shutdown crash on every deploy**. 17/17 end to end       |
+| 67  | 2026-08-03 | `apps/api/src/telephony/messages.controller.ts`         | **THE LOOP IS CLOSED** — signed reply → question, no manual step. 25/25             |
 
 ---
 
@@ -3649,3 +3650,60 @@ database rows rather than on the process merely starting.
 
 **Watch out for.** Still nothing enqueues. `MessagesController` records an inbound message and does not
 queue the job, so the queue this worker now consumes stays empty.
+
+#### `apps/api/src/telephony/messages.controller.ts` — step 67 revision
+
+**Step 67** · 2026-08-03 · **the conversation loop closes here**
+
+**What changed.** The deliberate GAP left at step 53 is filled: after persisting an inbound reply, the
+controller enqueues `inbound-message`. A customer's reply now produces a question with no manual step
+anywhere in the path.
+
+**Why it is written this way.**
+
+- **Enqueue, and nothing else.** This is rule 8 in one line — validate → persist → enqueue → return.
+  The work behind it is a model call taking seconds; Twilio abandons a webhook at around 15.
+- **`jobId` is derived from the MessageSid.** Unique per inbound message, so a duplicate delivery that
+  somehow gets past `webhook_events` still collapses to one job. Hyphens, not colons — BullMQ rejects a
+  colon in a custom id.
+- **A STOP reply is never enqueued at all.** Replying to someone who asked us to stop is exactly what
+  the opt-out forbids, and the cheapest way to guarantee it is for the job never to exist rather than
+  for a later guard to catch it. Verified end to end: the suppression is written, no job is created, no
+  reply is sent.
+- **A failed enqueue is logged and swallowed**, matching `VoiceController`. Throwing would 500 and
+  Twilio would retry — but the retry hits the `webhook_events` idempotency check, returns early as a
+  duplicate, and never reaches the enqueue. A throw would cost a retry storm and fix nothing. Logged at
+  `error` rather than `warn` because it is the one failure that is completely silent to the customer:
+  they replied, and nothing comes back.
+
+**Verified 25/25, the whole loop, nothing stubbed but the two paid providers.** The compiled API and
+the compiled worker run as separate processes; a genuinely **signed** Twilio webhook is posted at the
+real HTTP endpoint; the signature, Redis, BullMQ and Postgres are all real. Covered: an unsigned request
+403s and records nothing; a signed reply is accepted with empty TwiML, recorded, picked up by the
+worker, and answered with a one-segment `QUALIFICATION` message to the right number; the conversation
+opens in `COLLECTING` with a question outstanding; a duplicate delivery produces neither a second
+inbound row nor a second reply; and STOP is suppressed synchronously, never enqueued, never answered.
+
+**Two things the first run of that verification caught, both in the test rather than the code** — worth
+recording because both looked like product bugs for a minute:
+
+1. The fixture's `MessageSid` collided with `FakeSmsProvider`'s generated sid format (`SM` + a
+   zero-padded counter), tripping the unique constraint on `provider_message_sid`. Real Twilio sids are
+   random hex, so this is the same lesson as the invalid test phone numbers at step 51: the code was
+   right and the fixture was wrong.
+2. The assertion expected a `SuppressionReason` of `OPTED_OUT`. There is no such value — `optedOutAt` is
+   its own column precisely so that `block(SPAM) → optOut → optIn` cannot delete the block (steps
+   32–33). The test was asserting against a design that was deliberately replaced.
+
+**Watch out for.** The send-then-record ordering in `InboundMessageProcessor` has a narrow hole that
+surfaced during the collision above: `lastInboundAt` advances first, so if the outbound `message.create`
+fails *after* a successful send, the retry is skipped and the message goes unrecorded. Recording before
+sending would instead risk suppressing a real send, and no transaction can span a provider call — so
+this is a documented trade rather than a fixable bug. The failure loses a record, not a customer.
+
+Second: the owner still receives nothing. `createLead` only logs, and there is no `leads` table, no
+owner notification and no magic link — a completed conversation currently ends in the database and goes
+no further.
+
+Third: `MAX_SMS_PER_BUSINESS_PER_DAY` remains unenforced, so the loop that now runs unattended has no
+spend ceiling other than `SENDING_ENABLED`.

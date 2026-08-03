@@ -1,7 +1,9 @@
-import { Body, Controller, Header, HttpCode, Logger, Post, UseGuards } from '@nestjs/common';
+import { Body, Controller, Header, HttpCode, Inject, Logger, Post, UseGuards } from '@nestjs/common';
+import { Queue } from 'bullmq';
 import { twiml } from 'twilio';
 import { SuppressionsService } from '../calls/suppressions.service';
 import { toE164 } from '../common/phone';
+import { QUEUE, queueToken, type InboundMessageJobData } from '../jobs/queues';
 import { PrismaService } from '../prisma/prisma.service';
 import { TwilioSignatureGuard } from './twilio-signature.guard';
 import { WebhookEventsService, dedupeKeys } from './webhook-events.service';
@@ -18,10 +20,12 @@ import { WebhookEventsService, dedupeKeys } from './webhook-events.service';
  *      one obligation with legal weight (docs/compliance.md §1).
  *   2. **The message is recorded**, so the thread and the billing picture are
  *      complete.
+ *   3. **The reply is enqueued**, and nothing more. Extraction, the next question and
+ *      lead creation all happen on the worker.
  *
- * Everything else — extraction, the next question, lead creation — belongs to the
- * worker and lands with the conversation engine. This endpoint stays inside Twilio's
- * ~15s budget.
+ * That third step is the whole of rule 8 in one line: validate → persist → enqueue →
+ * return. The expensive work is a model call taking seconds, and Twilio abandons a
+ * webhook at around 15 — so this endpoint does the cheap, ordered part and hands over.
  */
 @Controller('webhooks/twilio/messages')
 @UseGuards(TwilioSignatureGuard)
@@ -32,6 +36,8 @@ export class MessagesController {
     private readonly prisma: PrismaService,
     private readonly webhookEvents: WebhookEventsService,
     private readonly suppressions: SuppressionsService,
+    @Inject(queueToken(QUEUE.INBOUND_MESSAGE))
+    private readonly inboundQueue: Queue<InboundMessageJobData>,
   ) {}
 
   /**
@@ -86,7 +92,7 @@ export class MessagesController {
 
       const customer = await this.upsertCustomer(businessId, from);
 
-      await this.prisma.db.message.create({
+      const message = await this.prisma.db.message.create({
         data: {
           businessId,
           customerId: customer.id,
@@ -104,13 +110,15 @@ export class MessagesController {
 
       await this.webhookEvents.markProcessed(outcome.event.id, businessId);
 
-      // GAP (deliberate): the conversation engine is enqueued here — extraction, the
-      // next question, lead creation. It must not run inline; an LLM call inside a
-      // webhook would blow Twilio's timeout. A STOP reply is never processed further,
-      // because replying to someone who asked us to stop is the exact thing the
-      // opt-out forbids.
+      // Extraction, the next question and lead creation all happen on the worker.
+      // Running any of it inline would put a multi-second model call inside a webhook
+      // Twilio abandons at ~15s (rule 8).
+      //
+      // A STOP reply is never enqueued: replying to someone who asked us to stop is
+      // the exact thing the opt-out forbids, and the cheapest way to guarantee that
+      // is for the job never to exist.
       if (keyword !== 'stop') {
-        this.logger.log(`Inbound reply from ${from} recorded (conversation engine not yet built)`);
+        await this.enqueueReply(message.id, businessId, messageSid);
       }
 
       return EMPTY_TWIML;
@@ -188,6 +196,44 @@ export class MessagesController {
     } catch (error) {
       this.logger.error(
         `Failed to handle status for ${messageSid}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  /**
+   * Hand the reply to the worker.
+   *
+   * `jobId` is derived from the MessageSid — unique per inbound message — so a
+   * duplicate webhook delivery that somehow gets past `webhook_events` still collapses
+   * to one job. Hyphens, not colons: BullMQ rejects a colon in a custom id.
+   *
+   * A failure to enqueue is logged and swallowed, matching `VoiceController`. Throwing
+   * would return a 500 and Twilio would retry — but the retry hits the idempotency
+   * check above, returns early as a duplicate, and never reaches this line. So a throw
+   * costs a retry storm and fixes nothing. The message row is already written, which
+   * is what makes the job re-drivable by hand.
+   *
+   * This is the one failure that is silent to the customer: they replied, and nothing
+   * comes back. Hence `error`, not `warn`.
+   */
+  private async enqueueReply(
+    messageId: string,
+    businessId: string,
+    messageSid: string,
+  ): Promise<void> {
+    try {
+      await this.inboundQueue.add(
+        'inbound',
+        { messageId, businessId },
+        { jobId: `inbound-${messageSid}` },
+      );
+      this.logger.log(`Inbound reply ${messageSid} queued for processing`);
+    } catch (error) {
+      this.logger.error(
+        `Failed to enqueue inbound reply ${messageSid}: ` +
+          `${error instanceof Error ? error.message : String(error)}. ` +
+          `Message ${messageId} is recorded and the job can be re-driven; ` +
+          `until then this customer gets no response.`,
       );
     }
   }
