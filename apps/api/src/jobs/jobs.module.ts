@@ -15,9 +15,10 @@ import { RecoveryProcessor } from './processors/recovery.processor';
 import {
   DEFAULT_JOB_OPTIONS,
   QUEUE,
+  REDIS_CONNECTION,
   assertRedisDurability,
   createRedisConnection,
-  type QueueName,
+  queueToken,
 } from './queues';
 
 /**
@@ -32,11 +33,18 @@ import {
  * the API never accidentally starts consuming its own jobs.
  */
 
-/** Injection token for a queue. `inject(queueToken(QUEUE.RECOVERY))`. */
-export const queueToken = (name: QueueName): string => `BULLMQ_QUEUE_${name}`;
-
-/** The Redis connection shared by all producer queues. */
-export const REDIS_CONNECTION = 'BULLMQ_REDIS_CONNECTION';
+// `queueToken` and `REDIS_CONNECTION` are defined in `queues.ts`, NOT here.
+//
+// Defining them beside the module meant every producer had to import this file,
+// which imports the feature modules — a circular import
+// (jobs.module → telephony.module → voice.controller → jobs.module) that left the
+// token `undefined` at decoration time and killed the API at boot with
+// `TypeError: queueToken is not a function`. tsc reported no error, because the
+// types resolve fine.
+//
+// Re-exported so existing imports keep working; new code should import from
+// `./queues` directly.
+export { REDIS_CONNECTION, queueToken } from './queues';
 
 /**
  * One connection for every producer queue.
@@ -60,13 +68,13 @@ const queueProviders: Provider[] = Object.values(QUEUE).map((name) => ({
 /**
  * Processors are *provided* here but no `Worker` is created — `worker.ts` does that.
  * Registering the class makes it injectable in both processes; only the worker
- * actually consumes jobs, which is what keeps the API from sending SMS from inside a
- * web request.
+ * actually consumes jobs, which is what keeps the API from sending SMS inside a web
+ * request.
  *
  * `CallsModule` and `TelephonyModule` are imported for the processors' dependencies.
- * Note the direction: nothing imports `JobsModule` back, because it is `@Global()` —
- * a producer reaches the queues without an import edge, which is what avoids a cycle
- * when telephony starts enqueuing.
+ * Nothing imports `JobsModule` back — producers reach the queues through the
+ * `@Global()` DI scope. Note that this avoids a *Nest* cycle only; the JavaScript
+ * import cycle is avoided separately, by keeping the tokens in `queues.ts`.
  */
 @Global()
 @Module({

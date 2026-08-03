@@ -34,6 +34,24 @@ export const QUEUE = {
 export type QueueName = (typeof QUEUE)[keyof typeof QUEUE];
 
 /**
+ * Injection tokens.
+ *
+ * Deliberately here rather than in `jobs.module.ts`. This file imports nothing from
+ * the feature modules, so a producer can import a token without pulling in the module
+ * graph. Defining them beside the module created a genuine circular import —
+ * `jobs.module` → `telephony.module` → `voice.controller` → `jobs.module` — and
+ * `queueToken` was `undefined` at decoration time, which surfaces as
+ * `TypeError: queueToken is not a function` at boot rather than as a compile error.
+ *
+ * `@Global()` removes the *Nest DI* import edge; it does nothing about the
+ * *JavaScript module* edge.
+ */
+export const queueToken = (name: QueueName): string => `BULLMQ_QUEUE_${name}`;
+
+/** The Redis connection shared by all producer queues. */
+export const REDIS_CONNECTION = 'BULLMQ_REDIS_CONNECTION';
+
+/**
  * Job payloads carry IDs, never entities.
  *
  * A serialised `Call` in Redis is a copy that goes stale the moment anything updates

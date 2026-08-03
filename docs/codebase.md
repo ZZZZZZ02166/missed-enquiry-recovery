@@ -90,6 +90,10 @@ decision rather than restating the argument.
 | 49  | 2026-08-03 | `apps/api/src/jobs/processors/recovery.processor.ts`    | **The send.** Re-checks at send time, idempotent, 21610 back-fill. 20/20            |
 | 50  | 2026-08-03 | `apps/api/src/worker.ts`                                | Registers the recovery Worker — queue→worker→send proven through real Redis         |
 | —   | 2026-08-03 | `jobs.module.ts` + `app.module.ts`                      | Forced siblings: registering `RecoveryProcessor` so the worker can boot             |
+| 51  | 2026-08-03 | `apps/api/src/telephony/voice.controller.ts`            | **RECOVERY LOOP CLOSED** — signed webhook → SMS, no manual step. 8/8                |
+| —   | 2026-08-03 | `apps/api/src/jobs/queues.ts`                           | Moved `queueToken`/`REDIS_CONNECTION` out of the module — fixed a circular import   |
+| —   | 2026-08-03 | `apps/api/src/jobs/jobs.module.ts`                      | Restored: step 50/51 edits had reverted; worker was crashing again                  |
+| 52  | 2026-08-03 | `apps/api/src/app.boot.spec.ts`                         | Boot smoke test — catches missing DI registration the sweep cannot see. 17 tests    |
 
 ---
 
@@ -2805,3 +2809,120 @@ in the next step even though `JobsModule` already imports it.
 Second: only the `recovery` queue has a worker. The other four (`inbound-message`, `notify-owner`,
 `followup`, `maintenance`) accept jobs that nothing will ever consume — they would sit in `waiting`
 forever, silently. Worth knowing before anything enqueues to them.
+
+#### `apps/api/src/telephony/voice.controller.ts` — enqueue wired
+
+**Step 51** · 2026-08-03
+
+**What it does.** Replaces the `// GAP` marker with a real `recoveryQueue.add(...)`. **This closes the
+recovery loop.** A signed Twilio webhook now produces an SMS with no manual step.
+
+**Why it is written this way.**
+
+- **Enqueue only, never send.** Twilio times out around 15 seconds; an SMS inside this request would
+  make the caller's greeting depend on the messaging API being fast. The contract from
+  `.claude/skills/twilio/SKILL.md` §3 is now complete: validate → persist → enqueue → return.
+- **`jobId: recovery-${callSid}`** — hyphen, not colon (BullMQ rejects colons in custom ids, found at
+  step 38). A duplicate delivery reaching this point collapses to one job.
+- **A failed enqueue is logged and swallowed, not thrown.** The call is already recorded and the caller
+  is mid-greeting. Throwing returns a 500, Twilio retries, and the caller hears an error tone. A lost job
+  is recoverable from `recoverySmsQueuedAt`; a bad caller experience is not.
+
+**Verified end to end — two processes, one webhook, nothing else touched.**
+
+```
+POST /webhooks/twilio/voice/incoming   (signed)      -> 200, TwiML
+[API]    Recovery queued for call E2E4396
+[WORKER] [recovery] job recovery-E2E4396 attempt 1 call=cmscxedcn...
+[WORKER] Recovery SMS queued for call cmscxedcn... (1 segment)
+```
+
+Resulting state (8/8): one call, one customer, one message.
+
+```
+"Melbourne Sparkle Cleaning: sorry we missed your call. What do you need help
+ with, and which suburb are you in? Reply STOP to opt out."
++61488884396 -> +61418884396    RECOVERY - QUEUED - 1 segment
+```
+
+Call marked recovered with no skip reason, message linked to both call and customer, and Lookup ran and
+cached `MOBILE` on the customer.
+
+**Watch out for — a circular import that only appears at runtime.** Step 50's entry claimed `@Global()`
+avoided a cycle "when telephony starts enqueuing". **That was wrong.** `@Global()` removes the _Nest DI_
+import edge; it does nothing about the _JavaScript module_ edge. Importing `queueToken` from
+`jobs.module.ts` created:
+
+```
+jobs.module -> telephony.module -> voice.controller -> jobs.module
+```
+
+and the API died at boot with `TypeError: queueToken is not a function` — the token was `undefined` when
+the `@Inject()` decorator evaluated. **tsc reported zero errors**; the cycle is invisible to the type
+checker because the _types_ resolve fine.
+
+Fixed by moving `queueToken` and `REDIS_CONNECTION` into `queues.ts`, which imports nothing from the
+feature modules. Producers now import the token without pulling in the module graph. `jobs.module.ts`
+re-exports both for compatibility. **Rule of thumb: injection tokens belong with the topology they name,
+never with the module that provides them.**
+
+Second, a test-data finding worth keeping: the first end-to-end attempt failed with
+`Inbound call to unrecognised number`, and the fabricated number `+61360016192` was the cause —
+libphonenumber rejects it as an unallocated range, so `toE164` correctly returned null. The code was
+right and the fixture was wrong. Test numbers must be in real ranges (`+613 8888 XXXX`,
+`+614 8888 XXXX`); the seed now asserts `toE164(n) === n` before inserting.
+
+#### `apps/api/src/app.boot.spec.ts`
+
+**Step 52** · 2026-08-03
+
+**What it does.** Boots the real `AppModule` and resolves everything both entrypoints depend on. 17
+tests, bringing the suite to 155.
+
+**Why it exists.** Twice — at step 50 and again when `jobs.module.ts` reverted — a provider was missing
+from a module and **every other check passed**: typecheck clean, lint clean, 138 unit tests green, both
+builds successful, while `pnpm dev:worker` died at startup with
+
+```
+UnknownElementException: Nest could not find RecoveryProcessor element
+```
+
+Nothing in the normal sweep constructs the DI container. A missing registration, or a circular import
+that leaves a token `undefined` at decoration time, is invisible to all of it — runtime-only failures
+with compile-time-looking symptoms. This closes that gap for about 200ms of test time.
+
+**Why it is written this way.**
+
+- **It asserts on _resolution_, not behaviour.** Behaviour is covered elsewhere; the question here is only
+  "does the application assemble?" Mixing the two would make it slow and give it a second reason to fail.
+- **`abortOnError: false` is essential.** By default Nest calls `process.exit()` when a dependency cannot
+  be resolved, which kills Jest before any `catch` runs — the suite still fails, but with a stack trace
+  instead of an explanation. With it, the diagnostic actually prints.
+- **It checks that `RecoveryProcessor` received its dependencies**, not merely that it resolves. A
+  provider can construct with `undefined` constructor arguments — exactly what happens when decorator
+  metadata is missing (the tsx problem from step 34). Instance-exists is not the same as wired.
+- **It asserts the SMS provider injected into the processor is the _same instance_** as the one resolved
+  from the token. Two instances would mean a test asserting on the fake's `sent` array silently misses
+  what the processor actually sent.
+- **It checks `queueToken` is callable and produces distinct tokens.** That is the circular-import canary
+  from step 51: a cycle does not fail to compile, it leaves the binding `undefined`, and
+  `@Inject(queueToken(...))` then receives nothing.
+
+**Verified by deliberately reintroducing both historical bugs:**
+
+| Sabotage                                         | typecheck    | boot spec                                   |
+| ------------------------------------------------ | ------------ | ------------------------------------------- |
+| Remove `RecoveryProcessor` from providers        | **0 errors** | **3 tests fail**                            |
+| Remove `imports: [CallsModule, TelephonyModule]` | **0 errors** | **suite fails with the written diagnostic** |
+
+Both were restored and the suite returned to 155 passing. A test that has never been seen to fail proves
+nothing; these two were made to fail on purpose.
+
+**Watch out for.** This is an integration test — it needs Postgres and Redis. The `beforeAll` failure
+message says so, because "cannot construct AppModule" and "docker-compose is not running" look identical
+otherwise.
+
+Second: it boots `AppModule`, which is what `main.ts` and `worker.ts` both load — but it does **not**
+execute either entrypoint. `main.ts`-specific setup (`rawBody`, `trust proxy`, the global validation
+pipe) and `worker.ts`-specific setup (`Worker` construction, shutdown handlers) are still unverified by
+the suite.

@@ -1,7 +1,18 @@
-import { Body, Controller, Header, HttpCode, Logger, Post, UseGuards } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Header,
+  HttpCode,
+  Inject,
+  Logger,
+  Post,
+  UseGuards,
+} from '@nestjs/common';
+import { Queue } from 'bullmq';
 import { twiml } from 'twilio';
 import { CallsService } from '../calls/calls.service';
 import { toE164 } from '../common/phone';
+import { QUEUE, queueToken, type RecoveryJobData } from '../jobs/queues';
 import { PrismaService } from '../prisma/prisma.service';
 import { TwilioSignatureGuard } from './twilio-signature.guard';
 import { WebhookEventsService, dedupeKeys } from './webhook-events.service';
@@ -28,6 +39,9 @@ export class VoiceController {
     private readonly prisma: PrismaService,
     private readonly webhookEvents: WebhookEventsService,
     private readonly calls: CallsService,
+    // Reachable without importing JobsModule — it is @Global(), which is what keeps
+    // this from being a cycle (JobsModule already imports TelephonyModule).
+    @Inject(queueToken(QUEUE.RECOVERY)) private readonly recoveryQueue: Queue<RecoveryJobData>,
   ) {}
 
   /**
@@ -95,12 +109,7 @@ export class VoiceController {
       });
 
       if (decision.shouldRecover) {
-        // GAP (deliberate, not forgotten): the recovery SMS is enqueued here once the
-        // queue exists. It must never be sent inside this request — Twilio's ~15s
-        // timeout and the no-side-effects-in-a-webhook rule both forbid it. The call
-        // is already marked `recoverySmsQueuedAt`, so the decision survives a crash
-        // between here and the enqueue.
-        this.logger.log(`Call ${callSid}: recovery pending (queue not yet built)`);
+        await this.enqueueRecovery(decision.call.id, number.businessId, callSid);
       }
 
       return this.greeting(number.business.name);
@@ -152,6 +161,43 @@ export class VoiceController {
       // safe — but it must still not 500, or Twilio retries a request we cannot serve.
       this.logger.error(
         `Failed to record call status ${callSid}/${callStatus}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    }
+  }
+
+  /**
+   * Hand the send to the worker.
+   *
+   * Enqueue only — never send here. Twilio times out around 15 seconds, and an SMS
+   * inside this request would make the caller's greeting depend on the messaging API
+   * being fast (`.claude/skills/twilio/SKILL.md` §3).
+   *
+   * `jobId` is derived from the CallSid, so a duplicate webhook delivery that somehow
+   * reaches this point collapses to one job. Hyphens, not colons — BullMQ rejects a
+   * colon in a custom id.
+   *
+   * A failure to enqueue is logged and swallowed. The call is already recorded and
+   * the caller is mid-greeting; throwing would return a 500, Twilio would retry, and
+   * the caller would hear an error tone. A lost job is recoverable from
+   * `recoverySmsQueuedAt`; a bad caller experience is not.
+   */
+  private async enqueueRecovery(
+    callId: string,
+    businessId: string,
+    callSid: string,
+  ): Promise<void> {
+    try {
+      await this.recoveryQueue.add(
+        'recovery',
+        { callId, businessId },
+        { jobId: `recovery-${callSid}` },
+      );
+      this.logger.log(`Recovery queued for call ${callSid}`);
+    } catch (error) {
+      this.logger.error(
+        `Failed to enqueue recovery for call ${callSid}: ` +
+          `${error instanceof Error ? error.message : String(error)}. ` +
+          `The call is recorded with recoverySmsQueuedAt set and can be re-driven.`,
       );
     }
   }
