@@ -52,13 +52,15 @@ export class InboundMessageProcessor {
       return;
     }
     if (message.direction !== 'INBOUND') {
-      // A bug in whatever enqueued this. Loud, and not retried — it will never
-      // become inbound.
+      // A bug in whatever enqueued this. Loud, and terminal — it will never become
+      // inbound, so re-driving it every minute would be pure noise.
       this.logger.error(`Message ${messageId} is ${message.direction}, not INBOUND — dropping`);
+      await this.finish(messageId, businessId, 'FAILED', 'not an inbound message');
       return;
     }
     if (!message.customerId) {
       this.logger.warn(`Inbound message ${messageId} has no customer — dropping`);
+      await this.finish(messageId, businessId, 'FAILED', 'no customer attributed');
       return;
     }
 
@@ -67,6 +69,7 @@ export class InboundMessageProcessor {
     // Terminal and never reopened, whatever they send afterwards.
     if (conversation.state === 'OPTED_OUT') {
       this.logger.log(`Conversation ${conversation.id} is opted out — not replying`);
+      await this.finish(messageId, businessId, 'SKIPPED', 'conversation opted out');
       return;
     }
 
@@ -81,18 +84,29 @@ export class InboundMessageProcessor {
     // both, which is what a person would do.
     if (conversation.lastInboundAt && conversation.lastInboundAt >= message.createdAt) {
       this.logger.debug(`Message ${messageId} already processed — skipping`);
+      // PROCESSED, not SKIPPED: the work genuinely happened, either on a previous
+      // attempt of this job or in a later reply that superseded it. This is also the
+      // path that repairs a crash between the conversation write and the status
+      // write — without it the row would sit QUEUED forever.
+      await this.finish(messageId, businessId, 'PROCESSED', 'superseded by a later reply');
       return;
     }
 
     // Re-checked here rather than trusted from the webhook: the job may have waited
     // while the customer sent STOP, and the state that matters is the state now.
     if (!env.SENDING_ENABLED) {
-      this.logger.warn(`Sending disabled — not replying to message ${messageId}`);
+      this.logger.warn(`Sending disabled — leaving message ${messageId} PENDING for later`);
+      // Back to PENDING, not SKIPPED. The kill switch is temporary by design, and
+      // these customers are owed a reply once it is flipped back — the reconciler
+      // re-drives them automatically. Bounded batches keep the retry cheap while the
+      // switch is off.
+      await this.finish(messageId, businessId, 'PENDING', 'sending disabled at process time');
       return;
     }
     const suppressed = await this.suppressions.isSuppressed(businessId, message.fromE164);
     if (suppressed) {
       this.logger.log(`Not replying to ${message.fromE164}: ${suppressed}`);
+      await this.finish(messageId, businessId, 'SKIPPED', `suppressed: ${suppressed}`);
       return;
     }
 
@@ -154,11 +168,45 @@ export class InboundMessageProcessor {
 
     await this.reply(message, businessId, decision.reply.kind, decision.reply.body);
 
+    // Last, and only on the success path. A transient model or SMS failure throws
+    // before reaching here, leaving the row QUEUED for BullMQ's retry — which is
+    // correct, because the work is genuinely still outstanding.
+    await this.finish(messageId, businessId, 'PROCESSED', null);
+
     this.logger.log(
       `Conversation ${conversation.id} → ${decision.state} ` +
         `(${decision.usage.inputTokens}+${decision.usage.outputTokens} tokens, ${decision.latencyMs}ms` +
         `${decision.stillMissing.length ? `, missing ${decision.stillMissing.join('/')}` : ''})`,
     );
+  }
+
+  /**
+   * Record the terminal processing state of an inbound message.
+   *
+   * Every exit path from `process()` goes through here, so no row is left in QUEUED
+   * with nothing to explain it. `PENDING` is a legitimate argument: it hands the
+   * message back to the reconciler for a genuinely temporary condition.
+   *
+   * Deliberately not wrapped in a transaction with the conversation write. If this
+   * update is the thing that fails, the retry hits the `lastInboundAt` check above and
+   * lands on PROCESSED — self-healing, and cheaper than a transaction spanning an
+   * external send.
+   */
+  private async finish(
+    messageId: string,
+    businessId: string,
+    status: 'PENDING' | 'PROCESSED' | 'SKIPPED' | 'FAILED',
+    note: string | null,
+  ): Promise<void> {
+    await this.prisma.db.message.update({
+      where: { id: messageId, businessId },
+      data: {
+        processingStatus: status,
+        // Only a terminal state gets a timestamp; PENDING is going back in the queue.
+        processedAt: status === 'PENDING' ? null : new Date(),
+        processingNote: note,
+      },
+    });
   }
 
   /**

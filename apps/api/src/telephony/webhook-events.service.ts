@@ -129,14 +129,19 @@ export class WebhookEventsService {
   /**
    * Processing failed. Increments `attempts` so a row that keeps failing is visible
    * as such rather than looking like a single stuck event.
+   *
+   * Takes `businessId` for the same reason the other two do: a failed event is the
+   * one an operator most needs to attribute to a tenant, and leaving it null made
+   * failures invisible to any per-business query.
    */
-  async markFailed(id: string, reason: string): Promise<void> {
+  async markFailed(id: string, reason: string, businessId?: string | null): Promise<void> {
     await this.prisma.db.webhookEvent.update({
       where: { id },
       data: {
         status: 'FAILED',
         error: truncate(reason),
         attempts: { increment: 1 },
+        ...(businessId ? { businessId } : {}),
       },
     });
   }

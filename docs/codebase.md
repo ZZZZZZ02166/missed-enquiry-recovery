@@ -110,6 +110,9 @@ decision rather than restating the argument.
 | 66  | 2026-08-03 | `apps/api/src/worker.ts`                               | Inbound worker + **fixed a shutdown crash on every deploy**. 17/17 end to end       |
 | 67  | 2026-08-03 | `apps/api/src/telephony/messages.controller.ts`         | **THE LOOP IS CLOSED** — signed reply → question, no manual step. 25/25             |
 | 68  | 2026-08-03 | `apps/api/prisma/schema.prisma`                        | `leads` — typed answer columns, quote fields, 6 statuses + 4 flags. 31/31           |
+| 69  | 2026-08-03 | _9 files — see "Durable inbound outbox"_               | **Redis-outage data-loss fix**: outbox + reconciler + degraded boot. 37/37          |
+| 70  | 2026-08-03 | _reconciler, controller, health_                       | Backlog alert + **two bugs in step 69's own reconciler**. 11/11                     |
+| 71  | 2026-08-03 | `voice.controller.ts`, reconciler, `schema.prisma`     | **Same hang in the voice webhook** — caller heard silence. 14/14                    |
 
 ---
 
@@ -3766,3 +3769,192 @@ fails at write time rather than silently — but it is a real conversion, not a 
 Third: `missingFields` is `String[]`, a Postgres array rather than a relation. Fine for a short list the
 owner reads, but it cannot be joined or indexed usefully — if "which field is most often missing?" ever
 becomes a question worth answering across businesses, it needs a different shape.
+
+### Durable inbound outbox — the Redis-outage fix
+
+**Step 69** · 2026-08-03 · _a cross-cutting change, not one file: `queues.ts`, `jobs.module.ts`,
+`health.controller.ts`, `messages.controller.ts`, `inbound-message.processor.ts`,
+`inbound-reconciler.processor.ts` (new), `worker.ts`, `webhook-events.service.ts`, `schema.prisma`_
+
+**The bug.** A customer replies, Postgres stores the message, Redis is unavailable, the enqueue fails —
+and the reply is lost permanently and silently. Twilio has already had its 200 so it never retries, and
+its retry would be deduplicated anyway. Every signal reported success.
+
+**Three things measurement changed about the diagnosis.** None were visible by reading the code:
+
+1. **`queue.add()` does not reject when Redis is unreachable — it never settles.** Measured: still
+   pending after 8s, against 1ms to reject with `enableOfflineQueue: false`. So the `catch` that was
+   supposedly "swallowing the error" mostly never ran; the request hung until Twilio gave up.
+2. **`enableOfflineQueue: false` alone does not fix it.** `Queue.add()` first awaits BullMQ's own
+   `waitUntilReady()`, which resolves on `ready` and rejects on `end` — a client retrying against a dead
+   Redis reaches neither. The hang moves inside BullMQ. An explicit timeout is load-bearing, not
+   belt-and-braces.
+3. **Redis down at boot took the whole API down.** `JobsModule.onModuleInit` awaited a buffered
+   `CONFIG GET` forever, so Nest never called `listen()`. Measured: `/health` unreachable, last log line
+   PrismaService. A queue outage became a total outage — including for STOP, the one path with legal
+   weight.
+
+**The fix, and why each part.**
+
+- **`messages` is the outbox.** No new table: the row is already written in the same request that must
+  enqueue, so a reply cannot be enqueued without being durable. `processingStatus` is the marker and the
+  reconciler is the relay. A separate outbox table would duplicate `messages` and add a second thing to
+  keep in sync.
+- **`processingStatus` is deliberately separate from `status`.** They answer different questions — "did
+  the SMS arrive?" versus "did we act on it?" — and conflating them would hide exactly this failure.
+  Null on outbound, so outbound rows are not work.
+- **Ordering corrected.** `markProcessed` now runs *after* a confirmed enqueue. Previously it ran before,
+  so the audit table asserted success for work that was never queued — and defeated the obvious recovery
+  query ("find webhook_events that are not PROCESSED") at the same time.
+- **Producer and worker Redis configs now differ, deliberately.** The API fails fast
+  (`enableOfflineQueue: false`, 3s connect/command timeouts) because an HTTP request is waiting; workers
+  keep the offline queue on and retry forever, because riding out a blip without a restart is their job.
+  Using either config in the other place would be a bug, so both are named and commented as such.
+- **`addJobBounded` is the one place that bounds an enqueue** (2s), used by the controller and the
+  reconciler alike so neither can reintroduce the hang.
+- **STOP is `SKIPPED`, not `PENDING`.** It is complete when recorded — there is no worker step — and
+  `PENDING` would have the reconciler trying to re-drive an opt-out every minute forever.
+- **Boot is time-boxed with an asymmetric outcome**: Redis *unreachable* → degraded mode, API serves;
+  Redis *reachable but unsafe for BullMQ* → refuse to start, because that does not heal on its own and
+  silently loses every delayed job on the next restart.
+- **`/health/ready` returns 200 `degraded` when only Redis is down.** Failing readiness would pull the
+  instance out of rotation and stop webhook ingestion entirely — turning a recoverable delay into
+  permanent loss, since Twilio only retries so many times. The database is different: unreachable means
+  nothing can be stored, so that is a 503.
+
+**Terminal states, and why each.** `PROCESSED` on success and on a superseded reply (the work happened);
+`SKIPPED` for STOP and suppressed customers (deliberate, terminal); `PENDING` again when
+`SENDING_ENABLED` is off (temporary by design — the reconciler re-drives it once the switch is flipped);
+`FAILED` after retries are exhausted (a poisoned message must stop costing model calls every minute, and
+stay queryable). The `lastInboundAt` path doubles as the repair for a crash between the conversation
+write and the status write — without it that row would sit `QUEUED` forever.
+
+**Duplicate protection, verified as a system rather than assumed.** Four layers now overlap: webhook
+dedupe on `MessageSid`, the deterministic `inbound-${MessageSid}` job id, the processor's `lastInboundAt`
+check, and the unique lead per conversation. The reconciler was run twice against the same row on
+purpose — one job, one reply. The job-id layer is time-bounded (`removeOnComplete: {age: 86400}`), so
+long-term safety rests on `lastInboundAt`, not on BullMQ.
+
+**Verified 37/37 against a genuinely dead Redis, then a live one.** Phase A runs the API against port
+6399: it boots, logs `DEGRADED`, reports `degraded`/`unreachable` on `/health/ready` while still
+returning 200, answers a signed webhook in **2.1s** (not a hang), stores the reply `PENDING`, marks the
+webhook event `FAILED` with a reason, honours STOP synchronously and stores it `SKIPPED`, and dedupes a
+Twilio retry. Phase B brings Redis back: the index exists and the planner uses it, the reconciler
+re-drives the row to `QUEUED`, a second pass adds no duplicate, and the worker takes it to `PROCESSED`
+with exactly one reply reaching the customer. Regression: 42/42 processor, 25/25 closed loop, 163 unit
+and boot tests, both builds.
+
+**A fix found while verifying:** `markFailed` did not accept `businessId`, unlike `markProcessed` and
+`markIgnored`. Failed webhook events were therefore unattributable to a tenant — precisely the rows an
+operator most needs to find. Now consistent with its siblings.
+
+**Watch out for.** Between process start and the first Redis connection, `enableOfflineQueue: false`
+rejects enqueues. That window is real but self-healing: those messages are `PENDING` and the reconciler
+takes them within ~2 minutes.
+
+Second: a reply can still be delayed up to ~3 minutes (2 min staleness + up to 1 min until the next
+tick). That is the deliberate trade against re-driving a row the controller is enqueueing right now.
+
+Third: if Redis loses data outright, a `QUEUED` row whose job no longer exists is not re-driven — only
+`PENDING` is. It is visible (`processingStatus = 'QUEUED'` with an old `createdAt`) but nothing acts on
+it automatically. Closing that needs a job-existence check the current design deliberately omits.
+
+Fourth: the alerting the plan calls for is not built. The reconciler logs a `warn` naming the count and
+the oldest age, which is the hook a metric would read, but nothing pages anyone.
+
+### Backlog alert, and two bugs in the reconciler itself
+
+**Step 70** · 2026-08-03 · `inbound-reconciler.processor.ts`, `messages.controller.ts`,
+`health.controller.ts`
+
+Reviewing step 69 against a running system turned up two defects in the recovery mechanism that had
+just been added. Both were invisible to the step 69 test suite, and both would have caused exactly the
+silent loss the outbox was built to prevent.
+
+**Bug 1 — the re-drive was a no-op whenever the job had already run.** BullMQ treats `add()` with an
+existing job id as a no-op and returns the existing job, *including when that job is `completed`*.
+Measured directly: handler ran once, re-add, handler still ran once; remove-then-add, ran twice. The
+reconciler re-added and then marked the row `QUEUED` regardless — so the message was neither processed
+nor eligible for another attempt. Permanently stuck, and looking healthy.
+
+The path that walks straight into it is the one step 69 introduced deliberately: `SENDING_ENABLED=false`
+returns a message to `PENDING` *after* its job has completed. Flipping the kill switch back on would
+never have delivered those replies.
+
+Fixed by inspecting the job first: a `completed`/`failed` job is removed and re-added; a job still
+`waiting`/`active`/`delayed` is left alone and the row marked `QUEUED`, because re-adding *that* is what
+would genuinely double up.
+
+**Bug 2 — the post-add `QUEUED` write clobbered a finished worker.** Both the controller and the
+reconciler wrote `QUEUED` unconditionally after `add()`. The worker is a separate process already
+polling the queue: it can claim the job, finish it, and write `PROCESSED` before that line runs. The
+unconditional write then moved a fully-handled reply *backwards* to `QUEUED`, where nothing would ever
+touch it again. Fixed with compare-and-set — `updateMany` with `processingStatus: 'PENDING'` in the
+`where`, so the status can only ever advance.
+
+**Also closed: orphaned `QUEUED` rows**, previously documented as a known residual. If Redis loses job
+data, a row marked `QUEUED` has no job to run it and the reconciler only looked at `PENDING`. It now
+sweeps `QUEUED` rows older than 15 minutes, checks whether the job actually exists, and returns the
+genuinely orphaned ones to `PENDING`. Fifteen minutes is deliberately generous: a job retrying with
+exponential backoff must not be mistaken for a lost one.
+
+**The alert.** Two surfaces, on purpose, because log-based and metric-based alerting fail differently:
+
+- The reconciler escalates from `warn` to `error` prefixed with the constant `BACKLOG_ALERT`
+  (`INBOUND_BACKLOG_ALERT`) when the oldest pending reply passes 10 minutes **or** the batch comes back
+  full — the second because a full batch means the real backlog is larger than the number being
+  reported. The marker is a bare constant with no interpolation inside it, so an alert rule matching on
+  it cannot be silently broken by rewording the message around it.
+- `/health/ready` now carries `inboundBacklog: { pending, oldestAgeSeconds, alerting }`, so a monitor
+  that already polls readiness gets the signal without scraping logs, and the endpoint reports
+  `degraded` on a stale backlog even when both dependencies are up. The backlog query is one indexed
+  lookup that normally seeks into an empty range; a failure to compute it is swallowed, because not
+  knowing the backlog is a monitoring gap while refusing traffic over it would be an outage.
+
+**Verified 11/11**, each test written to fail against the code as it stood an hour earlier: a message
+returned to `PENDING` after its job completed is genuinely re-processed (the bug-1 proof), `PROCESSED`
+survives a reconciler pass (bug 2), an orphaned `QUEUED` row is released and re-driven, an in-flight job
+is never double-added, an old backlog alerts on the stable marker, and a fresh one only warns.
+Regression: 163 unit and boot tests, 37/37 outbox, 25/25 closed loop, 42/42 processor.
+
+### The same hang in the voice webhook
+
+**Step 71** · 2026-08-03 · `voice.controller.ts`, `inbound-reconciler.processor.ts`, `schema.prisma`
+
+Steps 69–70 fixed the inbound-SMS path and left the identical bug in the voice path, which is the
+**more damaging** of the two. `VoiceController` called `recoveryQueue.add()` unbounded, and it did so
+*before* returning the TwiML greeting. With Redis unreachable that hangs until Twilio abandons the
+webhook — so **the caller hears nothing at all**, which is worse than the voicemail this product
+replaced, and no recovery text is ever sent. One outage would lose every missed call outright.
+
+Fixed the same way, plus the recovery half of the reconciler:
+
+- **`addJobBounded` in `enqueueRecovery`.** The greeting is the promise that a text is coming; it must
+  not depend on Redis. Measured 2.1s against a dead Redis, with the greeting intact.
+- **`calls.recoverySmsQueuedAt` was already the outbox marker** — set at decision time, before the
+  enqueue — so no schema change was needed to make the work recoverable, only to make the sweep cheap.
+- **The sweep excludes already-recovered calls in SQL** (`messages: { none: { purpose: 'RECOVERY' } }`).
+  Without that every successful call stays eligible forever, and the reconciler re-enqueues the entire
+  history every minute.
+- **`@@index([recoverySmsQueuedAt])`** so the sweep is a bounded range scan over a window rather than a
+  scan of every call ever recorded.
+
+**A product decision fell out of it, not just a technical one.** A call whose recovery was never sent
+needs an answer at *some* age, or it is rescanned forever. The answer is **not** "send it eventually":
+a recovery text a day late reaches someone who booked a competitor that afternoon, and an unexplained
+text from an unknown number long after the fact reads as spam — exactly the territory rule 10 keeps
+these messages out of. So calls past 24 hours are marked with a new `NoRecoveryReason.EXPIRED` rather
+than sent. That is terminal, honest, visible in the existing "which missed calls never got a text, and
+why?" index, and it bounds the scan as a side effect rather than as the goal.
+
+**Verified 14/14** against a genuinely dead Redis: the webhook answers in 2.1s with the greeting intact,
+the call is recorded as owing a text and not written off, the reconciler re-drives it once Redis returns
+without duplicating on a second pass, an already-recovered call is never re-driven, and a two-day-old
+one is marked `EXPIRED` and **not** texted. Regression: 163 unit and boot, 37/37 outbox, 25/25 closed
+loop, 42/42 processor, 11/11 reconciler bugs.
+
+**Watch out for.** The 15-minute orphan sweep and the 2-minute staleness window are both wall-clock
+guesses, not measurements. If a legitimate job ever takes longer than 15 minutes — a long backoff chain
+after repeated model failures — the sweep could revert a row whose job is still alive but momentarily
+absent from the queue's lookup. The `lastInboundAt` guard makes the consequence a wasted model call
+rather than a duplicate reply, but the thresholds want revisiting once there is real traffic to measure.

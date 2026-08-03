@@ -2,16 +2,20 @@ import { Logger } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { Worker, type Job } from 'bullmq';
 import type IORedis from 'ioredis';
+import { Queue } from 'bullmq';
 import { AppModule } from './app.module';
 import { InboundMessageProcessor } from './jobs/processors/inbound-message.processor';
+import { InboundReconcilerProcessor } from './jobs/processors/inbound-reconciler.processor';
 import { RecoveryProcessor } from './jobs/processors/recovery.processor';
 import {
   QUEUE,
-  createRedisConnection,
+  createWorkerRedisConnection,
+  queueToken,
   type InboundMessageJobData,
   type QueueName,
   type RecoveryJobData,
 } from './jobs/queues';
+import { PrismaService } from './prisma/prisma.service';
 
 /**
  * The worker entrypoint. Same modules and same image as `main.ts`, different start
@@ -63,6 +67,24 @@ const RECOVERY_LIMITER = { max: 10, duration: 1000 };
  */
 const INBOUND_CONCURRENCY = 2;
 
+/**
+ * Maintenance runs alone.
+ *
+ * The reconciler reads a bounded batch and enqueues it; two of them running at once
+ * would select overlapping rows. That is safe — deterministic job ids and the
+ * processor's own idempotency absorb it — but it is wasted work, and concurrency 1
+ * makes the common case exact rather than merely tolerable.
+ */
+const MAINTENANCE_CONCURRENCY = 1;
+
+/**
+ * How often to look for inbound replies that were never queued.
+ *
+ * A minute is the trade: it bounds how long a customer waits after a Redis blip,
+ * while a normal tick costs one indexed query that returns nothing.
+ */
+const RECONCILE_EVERY_MS = 60_000;
+
 async function bootstrap(): Promise<void> {
   const logger = new Logger('Worker');
   const app = await NestFactory.createApplicationContext(AppModule);
@@ -101,9 +123,18 @@ async function bootstrap(): Promise<void> {
     name: QueueName,
     describe: (data: T) => string,
     process: (data: T) => Promise<void>,
-    options: { concurrency: number; limiter?: { max: number; duration: number } },
+    options: {
+      concurrency: number;
+      limiter?: { max: number; duration: number };
+      /** Called when a job has exhausted every attempt. */
+      onExhausted?: (data: T, error: Error) => Promise<void>;
+    },
   ): Worker<T> => {
-    const connection = createRedisConnection();
+    // Worker connections keep their offline queue ON and retry forever — the opposite
+    // of the API's producer connection, which fails fast because an HTTP request is
+    // waiting on it. Using the producer config here would make a worker abandon
+    // commands during exactly the blips it exists to ride out.
+    const connection = createWorkerRedisConnection();
     connections.push(connection);
 
     const worker = new Worker<T>(
@@ -126,6 +157,18 @@ async function bootstrap(): Promise<void> {
       logger.error(
         `[${name}] job ${job?.id} FAILED after ${job?.attemptsMade ?? 0} attempts: ${error.message}`,
       );
+
+      // Exhausted, not merely failed. BullMQ emits `failed` on every attempt; only
+      // the last one is terminal, and only then should the row stop being retryable.
+      const attempts = job?.opts?.attempts ?? 0;
+      if (job && attempts > 0 && job.attemptsMade >= attempts && options.onExhausted) {
+        void options.onExhausted(job.data, error).catch((cause: unknown) => {
+          logger.error(
+            `[${name}] could not record terminal failure for job ${job.id}: ` +
+              `${cause instanceof Error ? cause.message : String(cause)}`,
+          );
+        });
+      }
     });
 
     // A stalled job means the processor blocked the event loop or the process died
@@ -141,6 +184,8 @@ async function bootstrap(): Promise<void> {
 
   const recoveryProcessor = app.get(RecoveryProcessor);
   const inboundProcessor = app.get(InboundMessageProcessor);
+  const reconciler = app.get(InboundReconcilerProcessor);
+  const prisma = app.get(PrismaService);
 
   startWorker<RecoveryJobData>(
     QUEUE.RECOVERY,
@@ -153,13 +198,60 @@ async function bootstrap(): Promise<void> {
     QUEUE.INBOUND_MESSAGE,
     (data) => `message=${data.messageId}`,
     (data) => inboundProcessor.process(data),
-    { concurrency: INBOUND_CONCURRENCY },
+    {
+      concurrency: INBOUND_CONCURRENCY,
+      // Five attempts with backoff have failed. Leaving the row QUEUED would hide it
+      // forever; putting it back to PENDING would re-drive a poisoned message every
+      // minute and keep paying for model calls. FAILED stops both and stays queryable.
+      onExhausted: async (data, error) => {
+        await prisma.db.message.update({
+          where: { id: data.messageId, businessId: data.businessId },
+          data: {
+            processingStatus: 'FAILED',
+            processedAt: new Date(),
+            processingNote: `retries exhausted: ${error.message}`.slice(0, 500),
+          },
+        });
+        logger.error(
+          `[${QUEUE.INBOUND_MESSAGE}] message ${data.messageId} marked FAILED — ` +
+            'this customer received no reply and needs a human.',
+        );
+      },
+    },
   );
+
+  startWorker<Record<string, never>>(
+    QUEUE.MAINTENANCE,
+    () => 'reconcile-inbound',
+    () => reconciler.process(),
+    { concurrency: MAINTENANCE_CONCURRENCY },
+  );
+
+  // The repeatable schedule. Registered by the worker rather than the API so the API
+  // never needs to write to Redis at boot — it must be able to start without it.
+  //
+  // `upsertJobScheduler` is idempotent by id, so N worker replicas converge on one
+  // schedule instead of N.
+  const maintenanceQueue = app.get<Queue>(queueToken(QUEUE.MAINTENANCE));
+  try {
+    await maintenanceQueue.upsertJobScheduler(
+      'reconcile-inbound',
+      { every: RECONCILE_EVERY_MS },
+      { name: 'reconcile-inbound' },
+    );
+  } catch (error) {
+    // Non-fatal: the queues still work, only the automatic sweep is missing. Loud,
+    // because without it a failed enqueue is once again unrecoverable.
+    logger.error(
+      `Could not register the reconciliation schedule — stuck inbound replies will NOT ` +
+        `be re-driven automatically: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
 
   logger.log(
     `Worker started — consuming [${workers.map((w) => w.name).join(', ')}] ` +
       `(recovery ${RECOVERY_CONCURRENCY} @ ${RECOVERY_LIMITER.max}/s, ` +
-      `inbound ${INBOUND_CONCURRENCY})`,
+      `inbound ${INBOUND_CONCURRENCY}, maintenance every ${RECONCILE_EVERY_MS / 1000}s)`,
   );
 
   /**

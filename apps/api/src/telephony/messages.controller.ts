@@ -3,7 +3,12 @@ import { Queue } from 'bullmq';
 import { twiml } from 'twilio';
 import { SuppressionsService } from '../calls/suppressions.service';
 import { toE164 } from '../common/phone';
-import { QUEUE, queueToken, type InboundMessageJobData } from '../jobs/queues';
+import {
+  QUEUE,
+  addJobBounded,
+  queueToken,
+  type InboundMessageJobData,
+} from '../jobs/queues';
 import { PrismaService } from '../prisma/prisma.service';
 import { TwilioSignatureGuard } from './twilio-signature.guard';
 import { WebhookEventsService, dedupeKeys } from './webhook-events.service';
@@ -92,6 +97,11 @@ export class MessagesController {
 
       const customer = await this.upsertCustomer(businessId, from);
 
+      // A STOP is complete the moment it is recorded — there is no worker step, and
+      // SKIPPED says so terminally. Marking it PENDING would leave the reconciler
+      // trying to re-drive an opt-out every minute forever.
+      const isStop = keyword === 'stop';
+
       const message = await this.prisma.db.message.create({
         data: {
           businessId,
@@ -105,20 +115,52 @@ export class MessagesController {
           // Inbound segments are billed too, at a lower rate. Twilio reports the
           // count; falling back to 1 keeps the billing sum honest rather than zero.
           segments: Number.parseInt(body.NumSegments ?? '', 10) || 1,
+
+          // The outbox marker, written in the same statement as the message itself.
+          // PENDING is the honest state until Redis has actually accepted the job.
+          processingStatus: isStop ? 'SKIPPED' : 'PENDING',
+          processedAt: isStop ? new Date() : null,
+          processingNote: isStop ? 'STOP — opt-out honoured, no reply owed' : null,
         },
       });
 
-      await this.webhookEvents.markProcessed(outcome.event.id, businessId);
+      if (isStop) {
+        // Nothing further is owed. Replying to someone who asked us to stop is the
+        // exact thing the opt-out forbids, so the job must never exist — not be
+        // created and then filtered.
+        await this.webhookEvents.markProcessed(outcome.event.id, businessId);
+        return EMPTY_TWIML;
+      }
 
       // Extraction, the next question and lead creation all happen on the worker.
       // Running any of it inline would put a multi-second model call inside a webhook
       // Twilio abandons at ~15s (rule 8).
-      //
-      // A STOP reply is never enqueued: replying to someone who asked us to stop is
-      // the exact thing the opt-out forbids, and the cheapest way to guarantee that
-      // is for the job never to exist.
-      if (keyword !== 'stop') {
-        await this.enqueueReply(message.id, businessId, messageSid);
+      const queued = await this.enqueueReply(message.id, businessId, messageSid);
+
+      if (queued) {
+        // Only now is the delivery genuinely handled. Marking PROCESSED before the
+        // enqueue — as this did previously — made the audit table assert success for
+        // work that was never queued, and defeated the obvious recovery query
+        // ("find webhook_events that are not PROCESSED") at the same time.
+        //
+        // Compare-and-set, and the condition is load-bearing. The worker is a separate
+        // process already polling this queue: it can pick the job up, finish it, and
+        // write PROCESSED before this line runs. An unconditional write would then
+        // clobber PROCESSED back to QUEUED, leaving a row that has been fully handled
+        // looking permanently stuck. Only ever advance PENDING → QUEUED.
+        await this.prisma.db.message.updateMany({
+          where: { id: message.id, businessId, processingStatus: 'PENDING' },
+          data: { processingStatus: 'QUEUED' },
+        });
+        await this.webhookEvents.markProcessed(outcome.event.id, businessId);
+      } else {
+        // The message stays PENDING on purpose. It is durable, it is indexed, and the
+        // reconciler will re-drive it — so this is a delay, not a loss.
+        await this.webhookEvents.markFailed(
+          outcome.event.id,
+          'Inbound reply stored but not queued (Redis unavailable) — left PENDING for reconciliation',
+          businessId,
+        );
       }
 
       return EMPTY_TWIML;
@@ -201,40 +243,47 @@ export class MessagesController {
   }
 
   /**
-   * Hand the reply to the worker.
+   * Hand the reply to the worker. Returns whether Redis accepted it.
    *
    * `jobId` is derived from the MessageSid — unique per inbound message — so a
-   * duplicate webhook delivery that somehow gets past `webhook_events` still collapses
-   * to one job. Hyphens, not colons: BullMQ rejects a colon in a custom id.
+   * duplicate webhook delivery, or a race with the reconciler, collapses to one job.
+   * Hyphens, not colons: BullMQ rejects a colon in a custom id.
    *
-   * A failure to enqueue is logged and swallowed, matching `VoiceController`. Throwing
-   * would return a 500 and Twilio would retry — but the retry hits the idempotency
-   * check above, returns early as a duplicate, and never reaches this line. So a throw
-   * costs a retry storm and fixes nothing. The message row is already written, which
-   * is what makes the job re-drivable by hand.
+   * **Bounded, because the failure mode is a hang rather than an error.** With Redis
+   * unreachable, `add()` waits on BullMQ's own `waitUntilReady()`, which resolves on
+   * `ready` and rejects on `end` — a retrying client reaches neither, so the promise
+   * never settles and no catch block can fire. `addJobBounded` converts that into a
+   * rejection inside 2s, well within Twilio's ~15s budget.
    *
-   * This is the one failure that is silent to the customer: they replied, and nothing
-   * comes back. Hence `error`, not `warn`.
+   * The failure is still swallowed rather than thrown, but for a different reason than
+   * before: throwing would 500, Twilio would retry, and the retry hits the
+   * `webhook_events` dedupe and returns early without ever reaching this line. A throw
+   * would cost a retry storm and fix nothing. What makes swallowing acceptable now is
+   * that the message is durably PENDING and the reconciler owns it — previously it was
+   * simply lost.
    */
   private async enqueueReply(
     messageId: string,
     businessId: string,
     messageSid: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     try {
-      await this.inboundQueue.add(
+      await addJobBounded(
+        this.inboundQueue,
         'inbound',
         { messageId, businessId },
         { jobId: `inbound-${messageSid}` },
       );
       this.logger.log(`Inbound reply ${messageSid} queued for processing`);
+      return true;
     } catch (error) {
       this.logger.error(
         `Failed to enqueue inbound reply ${messageSid}: ` +
           `${error instanceof Error ? error.message : String(error)}. ` +
-          `Message ${messageId} is recorded and the job can be re-driven; ` +
-          `until then this customer gets no response.`,
+          `Message ${messageId} is stored as PENDING and will be re-driven by the ` +
+          `reconciler; the customer's reply is delayed, not lost.`,
       );
+      return false;
     }
   }
 

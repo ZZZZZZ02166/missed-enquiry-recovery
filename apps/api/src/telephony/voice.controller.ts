@@ -12,7 +12,7 @@ import { Queue } from 'bullmq';
 import { twiml } from 'twilio';
 import { CallsService } from '../calls/calls.service';
 import { toE164 } from '../common/phone';
-import { QUEUE, queueToken, type RecoveryJobData } from '../jobs/queues';
+import { QUEUE, addJobBounded, queueToken, type RecoveryJobData } from '../jobs/queues';
 import { PrismaService } from '../prisma/prisma.service';
 import { TwilioSignatureGuard } from './twilio-signature.guard';
 import { WebhookEventsService, dedupeKeys } from './webhook-events.service';
@@ -187,7 +187,14 @@ export class VoiceController {
     callSid: string,
   ): Promise<void> {
     try {
-      await this.recoveryQueue.add(
+      // Bounded. With Redis unreachable, `add()` waits on BullMQ's own
+      // `waitUntilReady()`, which never settles against a retrying client — so this
+      // used to hang until Twilio abandoned the webhook, and **the caller heard
+      // nothing at all**. That is worse than the voicemail this product replaces: the
+      // greeting below is the promise that a text is coming, and it must not depend
+      // on Redis being up.
+      await addJobBounded(
+        this.recoveryQueue,
         'recovery',
         { callId, businessId },
         { jobId: `recovery-${callSid}` },
@@ -197,7 +204,8 @@ export class VoiceController {
       this.logger.error(
         `Failed to enqueue recovery for call ${callSid}: ` +
           `${error instanceof Error ? error.message : String(error)}. ` +
-          `The call is recorded with recoverySmsQueuedAt set and can be re-driven.`,
+          `The call is recorded with recoverySmsQueuedAt set, which is what the ` +
+          `reconciler sweeps — this caller's text is delayed, not lost.`,
       );
     }
   }

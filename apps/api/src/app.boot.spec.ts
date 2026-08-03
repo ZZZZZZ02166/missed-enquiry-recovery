@@ -6,7 +6,9 @@ import { CallsService } from './calls/calls.service';
 import { SuppressionsService } from './calls/suppressions.service';
 import { ConversationsService } from './conversations/conversations.service';
 import { FakeLlmProvider, LLM_PROVIDER, type LlmProvider } from './conversations/llm.provider';
+import { HealthController } from './health/health.controller';
 import { InboundMessageProcessor } from './jobs/processors/inbound-message.processor';
+import { InboundReconcilerProcessor } from './jobs/processors/inbound-reconciler.processor';
 import { RecoveryProcessor } from './jobs/processors/recovery.processor';
 import { QUEUE, queueToken } from './jobs/queues';
 import { PrismaService } from './prisma/prisma.service';
@@ -110,6 +112,24 @@ describe('application boot', () => {
       expect(processor.sms).toBeDefined();
     });
 
+    it('resolves InboundReconcilerProcessor', () => {
+      const processor = app.get(InboundReconcilerProcessor, { strict: false });
+      expect(processor).toBeInstanceOf(InboundReconcilerProcessor);
+    });
+
+    it('gives InboundReconcilerProcessor its own dependencies', () => {
+      const processor = app.get(InboundReconcilerProcessor, { strict: false }) as unknown as {
+        prisma: unknown;
+        suppressions: unknown;
+        inboundQueue: unknown;
+      };
+      expect(processor.prisma).toBeInstanceOf(PrismaService);
+      expect(processor.suppressions).toBeInstanceOf(SuppressionsService);
+      // Without the queue it would find stuck rows and be unable to re-drive them —
+      // the silent half of a silent failure.
+      expect(processor.inboundQueue).toBeDefined();
+    });
+
     it('gives RecoveryProcessor its own dependencies', () => {
       // A provider can resolve while its constructor arguments are undefined — which
       // is precisely what happens when decorator metadata is missing. Checking the
@@ -137,6 +157,21 @@ describe('application boot', () => {
         (n) => app.get<Queue>(queueToken(n), { strict: false }).opts.connection,
       );
       expect(new Set(connections).size).toBe(1);
+    });
+  });
+
+  describe('health', () => {
+    it('reports both dependencies when they are up', async () => {
+      const health = app.get(HealthController, { strict: false });
+      const ready = await health.ready();
+      expect(ready.status).toBe('ok');
+      expect(ready.database).toBe('ok');
+      expect(ready.redis).toBe('ok');
+      // The scrapable alerting signal, present even in the healthy case so a monitor
+      // can distinguish "zero backlog" from "field missing".
+      expect(ready.inboundBacklog).toEqual(
+        expect.objectContaining({ pending: expect.any(Number), alerting: expect.any(Boolean) }),
+      );
     });
   });
 

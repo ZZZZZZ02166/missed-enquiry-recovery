@@ -254,6 +254,11 @@ enum NoRecoveryReason {
   CAP_REACHED
   /// The owner answered. Nothing to recover.
   ANSWERED
+  /// Queued but never sent, and now too old to be worth sending — a queue outage that
+  /// outlasted the window. Deliberately terminal rather than retried forever: a
+  /// recovery text a day late is worse than none, because the caller booked someone
+  /// else hours ago and an unexplained text from an unknown number reads as spam.
+  EXPIRED
 
   @@map("no_recovery_reason")
 }
@@ -316,6 +321,11 @@ model Call {
   @@index([businessId, startedAt])
   /// "Which missed calls never got a recovery text, and why?"
   @@index([businessId, noRecoveryReason])
+  /// The reconciler's query: calls whose recovery was queued but never sent. Ordered
+  /// by the marker itself so the sweep is a bounded range scan over a window rather
+  /// than a scan of every call ever recorded. Cross-tenant by necessity — the sweep
+  /// is not on behalf of one business.
+  @@index([recoverySmsQueuedAt])
   @@index([customerId])
   @@map("calls")
 }
@@ -513,6 +523,38 @@ enum MessageStatus {
 }
 
 /// Why an outbound message was sent. Inbound messages have no purpose.
+/// Whether an *inbound* reply has been handed to, and completed by, the conversation
+/// worker. Distinct from `MessageStatus`, which is about SMS delivery — the two answer
+/// different questions and conflating them would hide exactly the failure this exists
+/// to catch:
+///
+///   MessageStatus     did the SMS arrive?
+///   processingStatus  did we act on it?
+///
+/// Null on outbound messages: they have no processing lifecycle, and defaulting them to
+/// PENDING would fill the reconciler's queue with rows that are not work.
+enum MessageProcessingStatus {
+  /// Saved in Postgres, not yet accepted by Redis. **The durable outbox marker** — a
+  /// row sitting here is work nobody is doing, and the reconciler's only target.
+  PENDING
+  /// BullMQ confirmed the job was added.
+  QUEUED
+  /// The worker finished, including the deliberate no-ops (an already-superseded
+  /// reply, a permanent send failure that was recorded).
+  PROCESSED
+  /// Deliberately never processed, and terminal: a STOP, or a customer suppressed by
+  /// the time the worker reached them. Distinct from PROCESSED so "we chose not to"
+  /// is never confused with "we did", and distinct from PENDING so it does not look
+  /// stuck.
+  SKIPPED
+  /// Permanently unprocessable — wrong direction, no customer, or retries exhausted.
+  /// Exists so these rows stop being re-driven every minute and become queryable for
+  /// triage instead.
+  FAILED
+
+  @@map("message_processing_status")
+}
+
 enum MessagePurpose {
   /// The first message after a missed call.
   RECOVERY
@@ -555,6 +597,12 @@ model Message {
   status    MessageStatus
   /// Null for inbound.
   purpose   MessagePurpose?
+
+  /// Inbound only — see `MessageProcessingStatus`. Null on outbound.
+  processingStatus MessageProcessingStatus? @map("processing_status")
+  /// When it reached a terminal processing state, and why if it was not success.
+  processedAt      DateTime?                @map("processed_at")
+  processingNote   String?                  @map("processing_note")
 
   fromE164 String @map("from_e164")
   toE164   String @map("to_e164")
@@ -600,6 +648,11 @@ model Message {
   @@index([businessId, createdAt])
   /// "Which sends failed?" — the operational view.
   @@index([businessId, status])
+  /// The reconciler's only query: inbound replies stuck PENDING, oldest first. Leads
+  /// with `processingStatus` so an equality match on it seeks straight to the (usually
+  /// empty) PENDING range instead of scanning a table that grows with every message
+  /// ever sent. Cross-tenant by necessity — the sweep is not on behalf of one business.
+  @@index([processingStatus, createdAt])
   @@map("messages")
 }
 
