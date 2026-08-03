@@ -1,6 +1,5 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { Logger } from '@nestjs/common';
-import { env } from '../config/env';
 import {
   buildUserMessage,
   EXTRACTION_EFFORT,
@@ -53,7 +52,13 @@ export class AnthropicLlmProvider implements LlmProvider {
 
   private readonly client: Anthropic;
 
-  constructor(apiKey: string | undefined = env.ANTHROPIC_API_KEY) {
+  /**
+   * The key is supplied by `llm-provider.factory.ts` from the validated `env`
+   * schema. No default, for the same reason as the OpenAI adapter: an adapter that
+   * falls back to the ambient environment can run with a key the factory did not
+   * choose.
+   */
+  constructor(apiKey: string | undefined) {
     if (!apiKey) {
       // Fail at construction, not at the first customer reply. A provider that
       // builds successfully and then throws mid-conversation puts the error in the

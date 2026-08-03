@@ -102,6 +102,7 @@ decision rather than restating the argument.
 | 58  | 2026-08-03 | `apps/api/src/conversations/llm.provider.ts`            | LLM seam: interface, prompt, output schema, fake. Raw output cannot escape. 59/59   |
 | 59  | 2026-08-03 | `apps/api/src/conversations/anthropic-llm.provider.ts`  | Claude adapter — structured outputs, cached prompt, refusal handled not thrown     |
 | 60  | 2026-08-03 | `apps/api/src/conversations/openai-llm.provider.ts`     | OpenAI adapter — same interface, own schema dialect. 31/31 across both             |
+| 61  | 2026-08-03 | `apps/api/src/conversations/llm-provider.factory.ts`    | Provider selection (+ `config/env.ts`). Prod cannot run the fake. 26/26            |
 
 ---
 
@@ -3352,3 +3353,52 @@ Second: `gpt-5.6` is the documented alias. The SDK's own model union lists `gpt-
 
 Third: nothing chooses between the two providers yet. Both are dead code until the factory exists, and
 neither has been run against a live endpoint.
+
+#### `apps/api/src/conversations/llm-provider.factory.ts`
+
+**Step 61** · 2026-08-03 · _also touched `config/env.ts`, and both adapters' constructors_
+
+**What it does.** Chooses between Claude, OpenAI and the fake at boot, and binds the result to the
+`LLM_PROVIDER` token.
+
+**Why it is written this way.**
+
+- **It is the same shape as `telephony/sms-provider.factory.ts`, deliberately.** The failure it defends
+  against is the same one in a different costume: **a production deployment silently running the fake.**
+  Every extraction would return no fields, every conversation would ask its questions and learn nothing,
+  and every lead would reach the owner blank — with nothing erroring. It would look exactly like
+  customers had stopped answering. So: production cannot use the fake (the process refuses to start),
+  the choice is logged at boot, and selection needs explicit configuration plus a present key.
+- **There is no way to select the fake.** It is what you get when the chosen provider has no key — a
+  state reachable only by accident, and never in production. A `LLM_PROVIDER=fake` option would be a
+  footgun with a production-shaped blast radius.
+- **Selection is explicit, not inferred from which key is present.** With one provider, inference works
+  (that is what the SMS factory does). With two it is ambiguous the moment both keys are set, and "it
+  picked the other one" is not something anybody diagnoses quickly.
+- **A selected provider with the _other_ provider's key falls back to the fake, loudly.** Verified: with
+  `LLM_PROVIDER=openai` and only `ANTHROPIC_API_KEY` set, it does **not** quietly use Claude. Silently
+  honouring a provider nobody asked for would mean billing, latency and extraction quality all coming
+  from somewhere other than where the config says.
+- **The warning describes the symptom, not just the cause.** "No fields will be extracted from customer
+  replies" is what someone is actually looking at when a conversation never progresses past the first
+  question; "ANTHROPIC_API_KEY is not set" is only useful once you already know they are connected.
+- **Keys are passed to the adapters explicitly.** Both constructors lost their defaults in this step —
+  an adapter that falls back to the ambient environment can run with a key the factory did not choose,
+  which quietly defeats the point of having a factory.
+- **A blank `LLM_PROVIDER=` fails at boot**, because zod's `.default()` applies only when the variable is
+  absent. That is correct: a blank value in `.env` is a mistake, and a mistake in provider selection
+  should stop the process rather than be guessed at.
+
+**Verified 26/26** across seven configurations: default selection, both explicit selections, the
+cross-wiring case, missing-key behaviour in development and the production refusal for both providers,
+an unknown provider name, a blank one, and the Nest binding itself.
+
+**Watch out for.** `.env.example` does **not** yet document `LLM_PROVIDER` or `OPENAI_API_KEY`. An
+environment variable absent from the template is effectively undiscoverable — this needs adding before
+anyone else sets the project up.
+
+Second: still no real call. The factory now selects a provider that has never spoken to its API, so the
+first live request is where model name, schema acceptance and auth all get tested at once.
+
+Third: nothing injects `LLM_PROVIDER` yet — there is no `ConversationsModule`. The factory is correct
+and unreachable until that module registers it.

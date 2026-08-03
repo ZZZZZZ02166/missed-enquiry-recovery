@@ -89,14 +89,12 @@ export class OpenAiLlmProvider implements LlmProvider {
   private readonly client: OpenAI;
 
   /**
-   * The key is read from `process.env` rather than the validated `env` schema
-   * because `config/env.ts` has no `OPENAI_API_KEY` field yet — that one-line
-   * addition belongs with the factory that chooses between providers, and adding it
-   * from here would be a second file in this step. **Flagged rather than hidden:**
-   * this is the only place in the codebase that reads `process.env` directly, and it
-   * goes away in the next step.
+   * The key is supplied by `llm-provider.factory.ts`, which reads it from the
+   * validated `env` schema. No default: an adapter that can quietly fall back to
+   * whatever is in the ambient environment is an adapter that can run with a key
+   * the factory did not choose.
    */
-  constructor(apiKey: string | undefined = process.env.OPENAI_API_KEY) {
+  constructor(apiKey: string | undefined) {
     if (!apiKey) {
       throw new Error(
         'OpenAiLlmProvider requires OPENAI_API_KEY. The factory should have selected ' +

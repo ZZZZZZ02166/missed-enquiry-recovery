@@ -47,7 +47,14 @@ const schema = z.object({
   MAX_SMS_PER_NUMBER_PER_DAY: z.coerce.number().int().positive().default(1),
   SENDING_ENABLED: envBool('true'),
 
+  // Which model provider extracts fields from customer replies. Explicit rather
+  // than inferred from whichever key happens to be present: with two real providers
+  // that inference is ambiguous the moment both keys are set, and "it picked the
+  // other one" is not a failure anybody diagnoses quickly. The selected provider's
+  // key is then required — see conversations/llm-provider.factory.ts.
+  LLM_PROVIDER: z.enum(['anthropic', 'openai']).default('anthropic'),
   ANTHROPIC_API_KEY: z.string().optional(),
+  OPENAI_API_KEY: z.string().optional(),
 });
 
 const parsed = schema.safeParse(process.env);
