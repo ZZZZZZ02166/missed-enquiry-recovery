@@ -95,6 +95,8 @@ decision rather than restating the argument.
 | —   | 2026-08-03 | `apps/api/src/jobs/jobs.module.ts`                      | Restored: step 50/51 edits had reverted; worker was crashing again                  |
 | 52  | 2026-08-03 | `apps/api/src/app.boot.spec.ts`                         | Boot smoke test — catches missing DI registration the sweep cannot see. 17 tests    |
 | 53  | 2026-08-03 | `apps/api/src/telephony/messages.controller.ts`         | Inbound SMS + delivery status; **STOP now honoured**. 18/18                         |
+| 54  | 2026-08-03 | `apps/api/src/telephony/telephony.module.ts`            | Registers `MessagesController` — 6 routes live; signed STOP works over HTTP. 7/7    |
+| 55  | 2026-08-03 | `apps/api/prisma/schema.prisma`                         | `conversations` — the state machine's cursor. 13/13                                 |
 
 ---
 
@@ -2976,3 +2978,100 @@ warning true: **the column exists, the number does not.**
 
 Third: the conversation engine is a marked gap. An inbound reply is recorded and then nothing happens —
 no extraction, no next question, no lead. That is the next milestone.
+
+#### `apps/api/src/telephony/telephony.module.ts` — `MessagesController` registered
+
+**Step 54** · 2026-08-03
+
+**What it does.** Adds `MessagesController` to the module's controllers, making the inbound-SMS and
+message-status routes exist on the running application. Also extends `app.boot.spec.ts` to resolve it.
+
+**Why it is written this way.**
+
+- **No new imports were needed.** `MessagesController` depends on `SuppressionsService`, which already
+  arrives through the `CallsModule` import that `VoiceController` needs for `CallsService`. Worth stating
+  in the file, because a controller appearing with no accompanying import otherwise looks like an
+  oversight.
+- **The boot spec was extended in the same step.** Step 52 exists precisely to catch an unregistered or
+  mis-wired provider; adding a controller without adding it to that spec would leave the next regression
+  uncovered — the net only works if it grows with the graph.
+
+**Verified over real HTTP, 7/7 plus route inspection.** All six routes now map:
+
+```
+{/health, GET}                              {/webhooks/twilio/voice/incoming, POST}
+{/health/ready, GET}                        {/webhooks/twilio/voice/status, POST}
+{/webhooks/twilio/messages/incoming, POST}  {/webhooks/twilio/messages/status, POST}
+```
+
+An unsigned inbound POST returns **403**. A signed reply and a signed `STOP` both return **200** with
+`<Response/>` — empty TwiML, so Twilio sends nothing back. In the database afterwards: two `INBOUND`
+`RECEIVED` messages with the reply body stored verbatim, one customer created from the reply, two
+`webhook_events`, and **the STOP produced `OPTED_OUT` with the originating `MessageSid` kept as
+evidence**.
+
+**This is the compliance obligation closing end to end.** Since step 28 the suppression mechanism existed
+but nothing could trigger it, because no endpoint received a customer's reply. A real customer texting
+STOP is now honoured over the wire, synchronously, with an audit trail.
+
+**Watch out for.** Twilio still has to be _told_ about these URLs. The console webhook configuration for
+the messaging number must point at `/webhooks/twilio/messages/incoming`, and the recovery processor sets
+`statusCallback` to `/webhooks/twilio/messages/status` from `PUBLIC_API_URL` — if that variable does not
+match the deployed host, statuses silently never arrive and every message stays `QUEUED`
+(`docs/twilio-setup.md` §5).
+
+Second: an inbound reply is now recorded and then **nothing happens**. No extraction, no next question,
+no lead. The customer receives silence after their first answer, which is worse than not asking — the
+conversation engine is the next milestone and the product is not demonstrable to a business until it
+lands.
+
+#### `apps/api/prisma/schema.prisma` — `conversations` added
+
+**Step 55** · 2026-08-03
+
+**What it does.** Adds `Conversation` and `ConversationState`. The state machine's cursor for one
+qualification thread with one customer.
+
+**Why it is written this way.**
+
+- **Five states, not the plan's eleven.** The original lifecycle mixed _states_ with _flags_:
+  `NEEDS_HUMAN` can be true at any point, so modelling it as a state creates impossible combinations and
+  loses the transition it interrupted. It is a boolean here, and the test confirms it coexists with
+  `COLLECTING`.
+- **The cursor is separate from the transcript.** Messages live in `messages`, joined by customer. That
+  separation means a conversation can be replayed, reset or expired without touching the billing record
+  — and the billing record survives a conversation being deleted.
+- **`collected` is JSON, deliberately.** The question set is owner-configurable: a business asking about
+  carpet cleaning and one asking about lawn size do not share a schema. The subset the future pricing
+  matrix needs gets promoted onto `leads` as typed columns, where it can be queried and priced.
+- **`awaitingField` is stored, not derived.** An SMS reply arrives with no indication of what it answers.
+  Recording which question is outstanding is what lets a late or out-of-order reply be attributed
+  correctly instead of being re-parsed against the wrong field.
+- **`questionsAsked` is the loop guard.** An extraction that keeps failing must not keep texting — every
+  question costs money and patience. Without a counter, a model that cannot parse a reply would ask
+  forever.
+- **`@@unique([businessId, customerId, state])` is the important constraint.** Someone who rings a second
+  time mid-conversation must _continue_ the existing thread, not start a rival one asking the same
+  questions again — which is exactly what a customer would read as broken. Because `state` is part of the
+  key, completing a conversation frees the slot for a future one; both halves are tested.
+- **`callId` is unique and nullable.** One conversation per call, and nullable so a conversation can
+  later begin from a web form rather than a call.
+
+**Connects to.** `calls` (origin), `customers` (the thread), `messages` (the transcript, joined by
+customer). Migration `20260803092640_add_conversations`.
+
+**Verified against the live database, 13/13.** Guarded by the tenant extension; defaults are
+`AWAITING_FIRST_REPLY`, `{}`, zero and false. Collected answers round-trip as JSON and `awaitingField`
+tracks the outstanding question. `needsHuman` coexists with `COLLECTING`. **A second open conversation
+for the same customer is rejected**, a different customer is unaffected, and a duplicate `callId` is
+rejected. The worker's nudge query — `state=COLLECTING`, stale `lastInboundAt`, `nudgedAt` null —
+returns the right row. Completing a conversation frees the slot. Deleting the business cascades.
+
+**Watch out for.** `@@unique([businessId, customerId, state])` permits **one row per state**, not one
+open conversation outright — the same customer could hold one `COMPLETE` and one `EXPIRED` row
+simultaneously, which is intended, but it also means two `EXPIRED` conversations cannot coexist. If a
+customer goes quiet twice, the second expiry collides. The engine must reopen an `EXPIRED` conversation
+rather than create another, and that is a rule in code the schema only half-enforces.
+
+Second: nothing creates a conversation yet. The recovery processor sends the SMS without opening one, so
+`AWAITING_FIRST_REPLY` is currently unreachable — the table exists ahead of the engine that drives it.

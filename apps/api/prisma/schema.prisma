@@ -1,7 +1,7 @@
 // Schema grows table by table (CLAUDE.md build protocol), not all twelve at once.
 // Landed so far: businesses, users, phone_numbers, webhook_events, customers, calls,
-//                suppressions, messages.
-// Remaining: services, conversations, leads, attachments.
+//                suppressions, messages, conversations.
+// Remaining: services, leads, attachments.
 //
 // Conventions (.claude/skills/backend/SKILL.md §4):
 //   camelCase fields, snake_case tables and columns via @map/@@map
@@ -64,12 +64,13 @@ model Business {
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
 
-  users        User[]
-  phoneNumbers PhoneNumber[]
-  customers    Customer[]
-  calls        Call[]
-  suppressions Suppression[]
-  messages     Message[]
+  users         User[]
+  phoneNumbers  PhoneNumber[]
+  customers     Customer[]
+  calls         Call[]
+  suppressions  Suppression[]
+  messages      Message[]
+  conversations Conversation[]
 
   @@map("businesses")
 }
@@ -205,9 +206,10 @@ model Customer {
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
 
-  business Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
-  calls    Call[]
-  messages Message[]
+  business      Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  calls         Call[]
+  messages      Message[]
+  conversations Conversation[]
 
   /// The same phone number is a different customer for a different business.
   @@unique([businessId, phoneE164])
@@ -303,9 +305,10 @@ model Call {
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
 
-  business Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
-  customer Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
-  messages Message[]
+  business     Business      @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  customer     Customer?     @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  messages     Message[]
+  conversation Conversation?
 
   /// The dashboard's default view: this business's calls, newest first.
   @@index([businessId, startedAt])
@@ -394,6 +397,90 @@ model Suppression {
   /// Compliance: "show me every opt-out, newest first".
   @@index([businessId, optedOutAt])
   @@map("suppressions")
+}
+
+/// Where a qualification conversation has got to.
+///
+/// Deliberately small. The plan's original lifecycle mixed *states* with *flags* —
+/// NEEDS_HUMAN can be true at any point, so modelling it as a state guarantees
+/// impossible combinations and lost transitions (docs/decisions.md, Part 3).
+enum ConversationState {
+  /// The recovery SMS went out; nobody has replied yet.
+  AWAITING_FIRST_REPLY
+  /// They replied. We are asking for whatever is still missing.
+  COLLECTING
+  /// Everything required is answered. The lead is ready for the owner.
+  COMPLETE
+  /// No reply within the window. Terminal, but reopens if they text later.
+  EXPIRED
+  /// They asked us to stop. Terminal and never reopened.
+  OPTED_OUT
+
+  @@map("conversation_state")
+}
+
+/// One qualification thread with one customer.
+///
+/// The state machine's cursor, not the transcript — messages live in `messages` and
+/// are joined by customer. Keeping them apart means a conversation can be replayed,
+/// reset or expired without touching the billing record.
+///
+/// A conversation is created when the recovery SMS is sent, not when the call
+/// arrives: a call nobody answered has nothing to converse about (D5).
+model Conversation {
+  id         String @id @default(cuid())
+  businessId String @map("business_id")
+  customerId String @map("customer_id")
+
+  /// The call this began from. Null once conversations can start from a web form.
+  callId String? @unique @map("call_id")
+
+  state ConversationState @default(AWAITING_FIRST_REPLY)
+
+  /// Answers collected so far, keyed by field. JSON rather than columns because the
+  /// question set is owner-configurable — a business asking about carpet cleaning and
+  /// one asking about lawn size do not share a schema. The subset that the future
+  /// pricing matrix needs is promoted onto `leads` as typed columns.
+  collected Json @default("{}")
+
+  /// The field currently being asked about. Null when nothing is outstanding.
+  /// Stored rather than derived so an out-of-order reply can still be attributed to
+  /// the question it answers.
+  awaitingField String? @map("awaiting_field")
+
+  /// How many questions we have asked. The hard stop against an infinite loop: a
+  /// model that keeps failing to extract must not keep texting.
+  questionsAsked Int @default(0) @map("questions_asked")
+
+  /// Set when the state machine cannot proceed — an ambiguous reply, an unmatched
+  /// service, an angry customer. A flag, not a state: it can be true at any point
+  /// and does not interrupt the transition it accompanies.
+  needsHuman       Boolean @default(false) @map("needs_human")
+  needsHumanReason String? @map("needs_human_reason")
+
+  /// Last inbound activity. Drives the nudge and the expiry sweep, and must be
+  /// compared in the business's timezone, never the server's (CLAUDE.md rule 12).
+  lastInboundAt DateTime? @map("last_inbound_at")
+  /// Set when the single nudge has been sent, so a second one cannot be.
+  nudgedAt      DateTime? @map("nudged_at")
+  completedAt   DateTime? @map("completed_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  call     Call?    @relation(fields: [callId], references: [id], onDelete: SetNull)
+
+  /// One open conversation per customer per business. A second missed call from
+  /// someone mid-conversation must continue the existing thread, not start a rival
+  /// one that asks the same questions again.
+  @@unique([businessId, customerId, state])
+  /// The worker's view: conversations due a nudge or expiry.
+  @@index([state, lastInboundAt])
+  /// The dashboard's view.
+  @@index([businessId, updatedAt])
+  @@map("conversations")
 }
 
 enum MessageDirection {

@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { CallsModule } from '../calls/calls.module';
+import { MessagesController } from './messages.controller';
 import { smsProviderFactory } from './sms-provider.factory';
 import { SMS_PROVIDER } from './sms.provider';
 import { TwilioSignatureGuard } from './twilio-signature.guard';
@@ -38,7 +39,10 @@ import { WebhookEventsService } from './webhook-events.service';
  */
 @Module({
   imports: [CallsModule],
-  controllers: [VoiceController],
+  // Both webhook surfaces. `MessagesController` needs `SuppressionsService`, which
+  // arrives via the `CallsModule` import above — the same import that gives
+  // `VoiceController` its `CallsService`.
+  controllers: [VoiceController, MessagesController],
   providers: [WebhookEventsService, TwilioSignatureGuard, smsProviderFactory],
   exports: [WebhookEventsService, SMS_PROVIDER],
 })

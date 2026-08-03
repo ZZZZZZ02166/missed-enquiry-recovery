@@ -7,6 +7,7 @@ import { SuppressionsService } from './calls/suppressions.service';
 import { RecoveryProcessor } from './jobs/processors/recovery.processor';
 import { QUEUE, queueToken } from './jobs/queues';
 import { PrismaService } from './prisma/prisma.service';
+import { MessagesController } from './telephony/messages.controller';
 import { SMS_PROVIDER, type SmsProvider } from './telephony/sms.provider';
 import { VoiceController } from './telephony/voice.controller';
 import { WebhookEventsService } from './telephony/webhook-events.service';
@@ -70,6 +71,7 @@ describe('application boot', () => {
       ['CallsService', CallsService],
       ['SuppressionsService', SuppressionsService],
       ['VoiceController', VoiceController],
+      ['MessagesController', MessagesController],
     ])('resolves %s', (_name, token) => {
       expect(app.get(token, { strict: false })).toBeDefined();
     });
