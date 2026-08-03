@@ -4,7 +4,9 @@ import { Queue } from 'bullmq';
 import { AppModule } from './app.module';
 import { CallsService } from './calls/calls.service';
 import { SuppressionsService } from './calls/suppressions.service';
+import { ConversationsService } from './conversations/conversations.service';
 import { FakeLlmProvider, LLM_PROVIDER, type LlmProvider } from './conversations/llm.provider';
+import { InboundMessageProcessor } from './jobs/processors/inbound-message.processor';
 import { RecoveryProcessor } from './jobs/processors/recovery.processor';
 import { QUEUE, queueToken } from './jobs/queues';
 import { PrismaService } from './prisma/prisma.service';
@@ -84,6 +86,28 @@ describe('application boot', () => {
     it('resolves RecoveryProcessor', () => {
       const processor = app.get(RecoveryProcessor, { strict: false });
       expect(processor).toBeInstanceOf(RecoveryProcessor);
+    });
+
+    it('resolves InboundMessageProcessor', () => {
+      const processor = app.get(InboundMessageProcessor, { strict: false });
+      expect(processor).toBeInstanceOf(InboundMessageProcessor);
+    });
+
+    it('gives InboundMessageProcessor its own dependencies', () => {
+      // Same check as below, and for the same reason: a provider resolves happily
+      // with undefined constructor arguments when decorator metadata is missing.
+      // `conversations` is the one that matters — without it the processor loads,
+      // logs nothing unusual, and throws on the first customer reply.
+      const processor = app.get(InboundMessageProcessor, { strict: false }) as unknown as {
+        prisma: unknown;
+        conversations: unknown;
+        suppressions: unknown;
+        sms: unknown;
+      };
+      expect(processor.prisma).toBeInstanceOf(PrismaService);
+      expect(processor.conversations).toBeInstanceOf(ConversationsService);
+      expect(processor.suppressions).toBeInstanceOf(SuppressionsService);
+      expect(processor.sms).toBeDefined();
     });
 
     it('gives RecoveryProcessor its own dependencies', () => {

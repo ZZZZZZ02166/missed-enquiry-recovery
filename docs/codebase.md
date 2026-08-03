@@ -105,6 +105,9 @@ decision rather than restating the argument.
 | 61  | 2026-08-03 | `apps/api/src/conversations/llm-provider.factory.ts`    | Provider selection (+ `config/env.ts`). Prod cannot run the fake. 26/26            |
 | 62  | 2026-08-03 | `apps/api/src/conversations/conversations.module.ts`    | Registers the LLM provider; boot now proves it resolves. 158 tests                 |
 | 63  | 2026-08-03 | `apps/api/src/conversations/conversations.service.ts`   | The state machine — reply in, decision out. No DB, no sending. 61/61               |
+| 64  | 2026-08-03 | `apps/api/src/jobs/processors/inbound-message.processor.ts` | Reply → decision → persist → send. 42/42 against a real database              |
+| 65  | 2026-08-03 | `apps/api/src/jobs/jobs.module.ts`                      | Registers the inbound processor; boot proves its wiring. 22/22 boot, 160 tests     |
+| 66  | 2026-08-03 | `apps/api/src/worker.ts`                               | Inbound worker + **fixed a shutdown crash on every deploy**. 17/17 end to end       |
 
 ---
 
@@ -3505,3 +3508,144 @@ Second: the `services` list is threaded through to the model but nothing supplie
 
 Third: nothing calls `advance()`. The processor that loads the conversation, calls this, persists the
 result and sends the reply is the next step — and it is the last piece before the loop runs end to end.
+
+#### `apps/api/src/jobs/processors/inbound-message.processor.ts`
+
+**Step 64** · 2026-08-03 · _also documented `LLM_PROVIDER` / `OPENAI_API_KEY` in `.env.example`_
+
+**What it does.** Loads the thread, asks `ConversationsService` what to do, persists the answer, sends
+the reply. The plumbing around a decision it does not make — the same division as `RecoveryProcessor`,
+and the reason the state machine could be verified without a database.
+
+**Why it is written this way.**
+
+- **Idempotency comes from `conversation.lastInboundAt`, not a job id.** The column advances only once a
+  reply has been fully processed, so a retried job sees its own message already accounted for and stops.
+  A job id could not do more than that — but this key also handles what a job id cannot: **two replies
+  arriving seconds apart**. Whichever job runs second sees a `lastInboundAt` older than its own message
+  and proceeds, with the first reply already in the thread it sends the model. Out-of-order execution
+  collapses to one reply covering both, which is what a person would do. Verified in both orders.
+- **State is persisted _before_ sending — the opposite of the recovery path, for the opposite reason.**
+  There, a row written first could suppress a real send, so the send goes first. Here, a send that
+  succeeds while the state write is lost would re-ask the same question on the next reply, which the
+  customer experiences as the system not listening. Re-sending is the cheaper failure of the two; each
+  path orders its writes around whichever loss it can least afford.
+- **The reply goes out on the number they texted** (`to`/`from` swapped from the inbound row) rather
+  than looking the business's number up again. A number change mid-conversation cannot then move the
+  thread to a different sender, which to the customer would read as a stranger joining in.
+- **`EXPIRED` conversations reopen; only `OPTED_OUT` is terminal.** Someone who texts back two days
+  later is still a lead, and a fresh thread would re-ask everything they already answered. Verified: the
+  suburb they gave before the expiry survives, and is not asked for again.
+- **Suppression and the kill switch are re-checked here**, not trusted from the webhook. The job may
+  have waited while the customer sent STOP, and the state that matters is the state at send time.
+- **The thread is reconstructed from `messages`**, not stored on the conversation. `messages` is already
+  the record of what was actually said; a second copy would be a second thing to keep in sync.
+- **A reply that does not answer the question we asked is logged, not treated as an error.** People
+  reply out of order. A run of these is the signal that extraction is failing rather than that one
+  customer is confused — which is why `awaitingField` is stored rather than derived.
+
+**Verified 42/42 against a real database.** First reply creating a conversation and asking the right
+next question; the same job replayed sending nothing and not double-counting; a second reply continuing
+the same conversation to `COMPLETE` with earlier answers intact; the model receiving the prior thread in
+order; suppression blocking a reply before the model is even called; unknown, outbound, and
+cross-tenant messages each dropped; opted-out conversations never answered; an expired conversation
+reopening with its answers; and two rapid replies both processed and merged, with the older job's replay
+changing nothing.
+
+**Watch out for.** Nothing enqueues this yet. `MessagesController` persists inbound messages but does
+not queue the job, and `JobsModule` does not register this processor or run a worker for the
+`inbound-message` queue. Until all three land, a customer's reply is still recorded and ignored.
+
+Second: `decision.createLead` currently only logs. The `leads` table does not exist, so the lazy
+lead-creation seam is marked and not implemented — the owner still gets nothing.
+
+Third: the reply is sent whatever the send cap says. `MAX_SMS_PER_BUSINESS_PER_DAY` is read from the
+environment but enforced nowhere in either processor.
+
+#### `apps/api/src/jobs/jobs.module.ts` — step 65 revision
+
+**Step 65** · 2026-08-03 · _also two assertions in `app.boot.spec.ts`_
+
+**What changed.** `InboundMessageProcessor` is registered and exported, and `ConversationsModule` joins
+`CallsModule` and `TelephonyModule` in the imports.
+
+**Why.**
+
+- **`ConversationsModule` is the dependency that costs money.** Importing it here is what gives the
+  processor the model provider — and because `llmProviderFactory` runs at module construction, a worker
+  started with the wrong configuration now fails at **boot** rather than on the first customer reply.
+  That is the same property step 62 bought for the API, extended to the process that actually spends.
+- **Registered here, consumed only by `worker.ts`.** Unchanged from `RecoveryProcessor`: providing the
+  class makes it injectable in both processes, while only the worker creates a `Worker` and consumes.
+  It is what keeps the API from running a paid extraction inside a web request.
+- **No new import cycle.** `conversations` imports nothing from `jobs`, so this edge is one-way. Worth
+  stating explicitly given the history: the `jobs → telephony → voice.controller → jobs` cycle at step
+  51 typechecked cleanly and killed the API at boot.
+
+**The boot-spec assertions are the point of this step, not an extra.** Two are added: that the processor
+resolves, and that its four constructor arguments are real instances. The second matters more —
+a provider resolves perfectly happily with `undefined` arguments when decorator metadata is missing, and
+`conversations` is the one that would slip through: the processor would load, log nothing unusual, and
+throw on the first customer reply. That is precisely the class of failure `app.boot.spec.ts` exists for,
+and it is invisible to typecheck, lint, and every other test.
+
+**Verified.** Boot suite 22/22 (up from 20), full sweep 160 tests, both builds.
+
+**Watch out for.** The queue is registered and the processor is injectable, but **no worker consumes
+`inbound-message`** — `worker.ts` still only creates the recovery worker. Jobs enqueued now would sit
+unprocessed. Nothing enqueues them either, so at present the queue is simply empty.
+
+#### `apps/api/src/worker.ts` — step 66 revision
+
+**Step 66** · 2026-08-03
+
+**What changed.** A second worker for `inbound-message`; a `startWorker` helper replacing what would
+have been duplicated handler wiring; and a fix for a shutdown crash that predated this step.
+
+**Why it is written this way.**
+
+- **`INBOUND_CONCURRENCY = 2`, against recovery's 5, because the bottleneck is different.** Recovery
+  jobs are millisecond API posts throttled by Twilio; each inbound job is a paid model call taking
+  seconds. Parallelism there multiplies spend and token-per-minute pressure rather than throughput. Two
+  is also simply enough: a customer waits on their own reply, not on queue depth.
+- **Deliberately no limiter on the inbound worker.** With seconds-long jobs, concurrency is already the
+  binding constraint — a rate limit would be an inert knob that reads like protection, which is worse
+  than no knob.
+- **The `startWorker` helper exists for the `failed` and `stalled` handlers**, not for the `new Worker`
+  call. Those two are the easiest thing to forget on a new queue and the only ones whose absence is
+  *silent*: jobs would exhaust their attempts and vanish into the failed set with nothing in the log.
+
+**The bug this step surfaced.** `app.enableShutdownHooks()` installs Nest's own signal listeners, but
+the lifecycle hooks run from `app.close()` regardless — which this file already called. Two independent
+paths therefore closed the context on one SIGTERM, and the second reached
+`JobsModule.onApplicationShutdown` after the producer connection was gone:
+
+```
+Error: Connection is closed.
+  at JobsModule.onApplicationShutdown
+```
+
+The process died with a stack trace instead of exiting 0, so **an orchestrator would record a crash on
+every ordinary deploy** — and a worker that appears to crash-loop is exactly what a rolling deploy is
+meant to avoid. It was latent with one worker and one connection to close; the second worker widened
+the window enough to make it deterministic.
+
+Fixed by removing `enableShutdownHooks()` and handling signals in one place, so the ordering is
+explicit: workers, then their connections, then the context. Two defences remain around it — a
+`shuttingDown` guard (a repeated or second signal from an impatient orchestrator must not start a
+second teardown) and per-connection `quit()` isolation (one connection BullMQ already closed must not
+stop the others or crash the exit).
+
+**Verified 17/17 end to end, through real Redis and Postgres.** The compiled worker is spawned as a
+process, a job is enqueued on the real queue, and the assertions are made against the database — the
+fakes live inside the worker, so the database is the only honest shared surface. Covered: both queues
+announced with their settings, the provider chosen at boot, a queued reply producing an outbound
+`QUALIFICATION` message to the right number, the conversation created in `COLLECTING`, nothing in the
+failed set, and a clean SIGTERM with **exit code 0**.
+
+Worth recording: the first run of this verification failed because it booted a stale `dist`. That the
+assertions caught it rather than passing vacuously is the reason they assert on log *content* and
+database rows rather than on the process merely starting.
+
+**Watch out for.** Still nothing enqueues. `MessagesController` records an inbound message and does not
+queue the job, so the queue this worker now consumes stays empty.

@@ -10,7 +10,9 @@ import {
 import { Queue } from 'bullmq';
 import type IORedis from 'ioredis';
 import { CallsModule } from '../calls/calls.module';
+import { ConversationsModule } from '../conversations/conversations.module';
 import { TelephonyModule } from '../telephony/telephony.module';
+import { InboundMessageProcessor } from './processors/inbound-message.processor';
 import { RecoveryProcessor } from './processors/recovery.processor';
 import {
   DEFAULT_JOB_OPTIONS,
@@ -71,19 +73,26 @@ const queueProviders: Provider[] = Object.values(QUEUE).map((name) => ({
  * actually consumes jobs, which is what keeps the API from sending SMS inside a web
  * request.
  *
- * `CallsModule` and `TelephonyModule` are imported for the processors' dependencies.
- * Nothing imports `JobsModule` back — producers reach the queues through the
- * `@Global()` DI scope. Note that this avoids a *Nest* cycle only; the JavaScript
- * import cycle is avoided separately, by keeping the tokens in `queues.ts`.
+ * `CallsModule`, `TelephonyModule` and `ConversationsModule` are imported for the
+ * processors' dependencies. Nothing imports `JobsModule` back — producers reach the
+ * queues through the `@Global()` DI scope. Note that this avoids a *Nest* cycle only;
+ * the JavaScript import cycle is avoided separately, by keeping the tokens in
+ * `queues.ts`.
+ *
+ * `ConversationsModule` is the dependency that costs money. Importing it here is what
+ * gives `InboundMessageProcessor` the model provider — and because the factory runs at
+ * module construction, a worker started with the wrong configuration now fails at boot
+ * rather than on the first customer reply.
  */
 @Global()
 @Module({
-  imports: [CallsModule, TelephonyModule],
-  providers: [connectionProvider, ...queueProviders, RecoveryProcessor],
+  imports: [CallsModule, TelephonyModule, ConversationsModule],
+  providers: [connectionProvider, ...queueProviders, RecoveryProcessor, InboundMessageProcessor],
   exports: [
     REDIS_CONNECTION,
     ...queueProviders.map((p) => (p as { provide: string }).provide),
     RecoveryProcessor,
+    InboundMessageProcessor,
   ],
 })
 export class JobsModule implements OnModuleInit, OnApplicationShutdown {
