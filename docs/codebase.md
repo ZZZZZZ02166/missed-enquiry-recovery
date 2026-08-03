@@ -79,6 +79,10 @@ decision rather than restating the argument.
 | 39  | 2026-08-02 | `apps/api/src/jobs/jobs.module.ts`                      | Queues as injectable providers; durability check now runs at boot. 8/8              |
 | 40  | 2026-08-02 | `apps/api/src/common/gsm7.ts`                           | GSM-7 charset + segment counting — rule 5 becomes enforceable. 30/30                |
 | 41  | 2026-08-02 | `apps/api/src/notifications/templates.ts`               | The recovery SMS copy; rules 2, 5, 10 asserted at import. 18/18                     |
+| 42  | 2026-08-02 | `apps/api/src/telephony/sms.provider.ts`                | `SmsProvider` seam + `FakeSmsProvider` — telephony testable without a phone. 16/16  |
+| 43  | 2026-08-02 | `apps/api/src/businesses/business-name.ts`              | Rejects unsendable names at input — fixes a lead-losing flaw found in review. 21/21 |
+| 44  | 2026-08-02 | `apps/api/src/notifications/templates.ts`               | Send path degrades instead of throwing — lead-losing path CLOSED. 15/15             |
+| 45  | 2026-08-02 | `apps/api/src/telephony/twilio-sms.provider.ts`         | Real Twilio adapter; permanent vs retryable classification. 13/13                   |
 
 ---
 
@@ -2278,3 +2282,237 @@ name during onboarding rather than discovering it in a customer's inbox.
 Second: these templates are fixed strings. The plan allows owners to configure their own questions, and
 the moment a template becomes owner-editable this import-time guard no longer covers it — owner-supplied
 copy has to be asserted on save _and_ at send, because a boot-time check cannot see data.
+
+#### `apps/api/src/telephony/sms.provider.ts`
+
+**Step 42** · 2026-08-02
+
+**What it does.** Defines the `SmsProvider` interface (send + Lookup), the `PermanentSendError` type and
+the no-retry error-code set, and ships `FakeSmsProvider` — an in-memory implementation that records
+every send.
+
+**Why it's written this way.**
+
+- **The seam exists before the first real send, deliberately.** The `twilio` skill §8 says to build it
+  from commit one, and the reason is concrete: without it, every integration test costs money and needs
+  a physical handset, and by the time the SDK is called from six places the seam is expensive to
+  retrofit. Writing it now costs one file; writing it later costs a refactor of the send path.
+- **The fake enforces the same GSM-7 rule as the real provider.** This is the most important line in the
+  file. A fake that happily accepts `We’re on our way` would let a UCS-2 template pass every test and
+  then cost 3× in production — the failure would be _invisible in CI and expensive in production_, which
+  is the worst possible split. Verified: the fake rejects it and does not record the send.
+- **Permanent and transient failures are different types, not a flag.** Retrying a permanent failure
+  burns four more API calls to be rejected identically and buries the cause under a stack of timeouts
+  (`queues-redis` §4). `PermanentSendError` carries the Twilio code so the processor can act on it —
+  21610 in particular must write a suppression row rather than retry.
+- **21610 is called out in the code comment, not just listed.** Twilio maintains its own opt-out list per
+  sending number and rejects sends even when our database believes a number is fine. It is the
+  authoritative signal that the two lists have diverged, and treating it as a generic failure would mean
+  retrying a send that is legally required to stop.
+- **The interface is narrow — send and lookup, nothing else.** Small enough that the fake is obviously
+  correct, and short enough that replacing Twilio would be a contained job.
+- **`failNextSendWith` is one-shot.** A sticky failure mode makes a test that forgets to reset poison
+  every later assertion in the file, usually far from the cause.
+- **`setLineType` lets a test simulate a landline** without a real Lookup call, which costs ~US$0.008
+  each and would otherwise make the "do not text landlines" path untestable.
+
+**Connects to.** `common/gsm7.ts` (the shared assertion). `notifications/templates.ts` (what gets sent).
+`.claude/skills/twilio/SKILL.md` §4, §5, §8. The real Twilio adapter and the recovery processor both bind
+to `SMS_PROVIDER`.
+
+**Verified 16/16.** Sends are recorded with a Twilio-shaped `MessageSid` and a `queued` status; the fake
+rejects a curly-quote body _and does not record it_; a `PermanentSendError` is distinguishable from a
+plain `Error` and carries its code; the queued failure is one-shot; the no-retry set covers unsubscribed,
+invalid `To`, landline, bad `From` and geo-permissions; a landline can be simulated; and `reset` clears
+state between tests.
+
+**Watch out for.** `FakeSmsProvider` is exported from the same file as the interface, so it ships in the
+production bundle. That is deliberate — it keeps the contract and its reference implementation in one
+place, and it is a few hundred bytes — but nothing stops it being bound in production by mistake. The
+module that provides `SMS_PROVIDER` must make the choice explicit and log which implementation is active
+at boot.
+
+Second: the interface has no `getMessageStatus`. Delivery status arrives by webhook rather than polling,
+which is correct — but it means a message whose status callback is never delivered stays `queued`
+forever, with nothing to reconcile it. That reconciliation job is worth existing before a pilot.
+
+---
+
+### API — businesses
+
+#### `apps/api/src/businesses/business-name.ts`
+
+**Step 43** · 2026-08-02
+
+**What it does.** Validates a business name for SMS use and returns an owner-facing error naming the
+exact offending character. Also provides `businessNameForSms`, a last-resort strip used at the send
+boundary, and `previewRecoveryMessage` for onboarding.
+
+**Why it exists — a flaw found by review, not by a test.**
+
+Step 41 documented that `normaliseToGsm7` deliberately does not delete characters, on the principle that
+silently mangling a business name is worse than failing loudly. The principle is right. **It was applied
+in the wrong place.** Traced end to end:
+
+```
+prepareBusinessName('Sparkle Cleaning 🧼')  →  "Sparkle Cleaning 🧼"   emoji survives
+recoveryFirstMessage(...)                  →  UCS-2, 2 segments
+sendSms(...)                               →  THREW Gsm7ViolationError
+                                              messages sent: 0
+```
+
+The module-load guard does not catch it — `assertAllTemplates()` checks a worst-case _ASCII_ name, not
+runtime data. So the failure lands at the worst possible moment: a real customer rings, we answer and
+promise a text, and the send throws. **The lead is lost, for every call to that business, until someone
+reads the logs.**
+
+| Behaviour                                 | Cost | Lead     |
+| ----------------------------------------- | ---- | -------- |
+| Throw at send (what step 41 did)          | $0   | **lost** |
+| Send as UCS-2                             | 2×   | kept     |
+| Reject at input + strip as fallback (now) | 1×   | kept     |
+
+**Why it is written this way.**
+
+- **Rejection happens at input, where nobody is harmed.** The owner sees
+  `🧼 (emoji) cannot be sent in a text message. Please remove it — your name would need to be "Sparkle
+Cleaning".` They fix it before a single customer is affected. Validation belongs early and loud; the
+  send path should degrade, not fail.
+- **The message names the character and shows the result.** "Special characters are not allowed" sends
+  a cleaner hunting through a box that looks fine. Showing `🧼` and the corrected name makes the fix
+  obvious. `offenders` is returned so the UI can highlight it.
+- **Accented Latin is accepted, not rejected.** `é ñ ü à` are all in GSM-7, so `Café Cleaning` sends
+  perfectly and must not be refused. An owner told "special characters aren't allowed" while `Café`
+  works would rightly stop trusting the message. Over-rejecting is its own bug.
+- **Curly quotes are fixed, not refused.** Someone pasting `Dave’s Cleaning` from a document should not
+  be told their apostrophe is illegal — it is unambiguous and repairable.
+- **`stripToGsm7` is named for what it does and is separate from `normaliseToGsm7`.** One deletes, one
+  substitutes. Keeping them apart means the deleting one cannot be reached by accident, and it tidies
+  the double space that deleting a mid-string character leaves behind.
+- **`businessNameForSms` returns what it stripped**, so the caller can log a warning. Degrading silently
+  is how a mangled name goes unnoticed for months.
+
+**Connects to.** `common/gsm7.ts`, `notifications/templates.ts`, `telephony/sms.provider.ts`. The
+`businesses` module DTO will call `validateBusinessName` on create and update; the dashboard shows
+`message` verbatim.
+
+**Verified 21/21.** The emoji name is rejected with an actionable message; CJK likewise; blank and
+over-long have their own messages; `Café Cleaning`, `Ñoño & Sons`, `Dave's Cleaning` and
+`A-1 Cleaning (Melb)` are all accepted; a curly apostrophe is straightened rather than refused; 32
+characters is accepted and 33 is not; `stripToGsm7` leaves no double or trailing space. Most
+importantly: **the send that previously threw now succeeds, at one segment.**
+
+**Watch out for.** Nothing enforces this yet — the `businesses` module does not exist, so no write path
+calls `validateBusinessName`. The fallback in `businessNameForSms` is also not wired into the templates,
+which still call `prepareBusinessName`. **Until both are connected, an emoji name still loses leads.**
+The mechanism is built and correct; two call sites remain.
+
+Second: `MAX_BUSINESS_NAME` (32) is enforced here as a _rejection_, while `prepareBusinessName` silently
+truncates. Two different behaviours for the same limit. Rejection is right at input, truncation is right
+at send — but they must not drift, and the constant lives in `templates.ts` rather than somewhere both
+clearly own.
+
+#### `apps/api/src/notifications/templates.ts` — degrading fallback wired
+
+**Step 44** · 2026-08-02
+
+**What it does.** `prepareBusinessName` now strips unsendable characters instead of letting them reach
+the send path, and a new `prepareBusinessNameVerbose` reports what it removed. **This closes the
+lead-losing path identified in step 43** — the half that step 43 built but did not connect.
+
+**Why it is written this way.**
+
+- **The strip happens in the templates, not at the call site.** Every template interpolates the name, so
+  putting the guard anywhere else means each future template has to remember it. Here it cannot be
+  forgotten.
+- **`prepareBusinessNameVerbose` exists so degradation is reportable.** A business sending under a name
+  that is not quite theirs is recoverable, but the owner has to be _told_ — silently degrading is how a
+  mangled name goes unnoticed for months. `stripped` and `truncated` are separate flags because they are
+  different problems with different fixes.
+- **`businessNameForSms` was rewritten as a thin alias** rather than left as a parallel copy. Step 43
+  introduced a second "make this name sendable" implementation; two would eventually disagree, and the
+  one the send path actually uses is the one that must be right. There is now exactly one, and a test
+  asserts the two entry points agree.
+- **The dependency runs `businesses/business-name.ts` → `notifications/templates.ts`, never back.**
+  Templates must not depend on the businesses domain — and the reverse direction would make this file's
+  module-load assertion transitively import a validator that imports these templates, which is a cycle
+  that only shows up at runtime.
+- **Input validation still rejects.** Degradation is a fallback for data that predates the check, not a
+  licence to accept anything. `validateBusinessName` is unchanged and still refuses an emoji name with an
+  actionable message.
+
+**Verified 15/15.** The exact case from step 43 now sends:
+
+```
+"Sparkle Cleaning: sorry we missed your call. What do you need help with,
+ and which suburb are you in? Reply STOP to opt out."      GSM-7, 1 segment
+```
+
+Previously `Gsm7ViolationError`, 0 messages sent. All four templates are GSM-7 and one segment with an
+emoji business name; `é` is preserved and a curly quote straightened; a clean name reports nothing
+stripped; truncation is reported separately from stripping; and `businessNameForSms` and
+`prepareBusinessNameVerbose` return identical results.
+
+**Watch out for.** One call site remains unwired: nothing calls `prepareBusinessNameVerbose` yet, so the
+`stripped` warning is available but never logged. The recovery processor should log it when it sends —
+otherwise a business quietly messaging under a shortened name is invisible until someone asks.
+
+Second: `validateBusinessName` is still not called by any write path, because the `businesses` module
+does not exist. Input rejection — the part that actually prevents the problem — is built and unreachable.
+The send path is now safe regardless, which is the point of defence in depth, but the owner-facing error
+message has nowhere to appear yet.
+
+#### `apps/api/src/telephony/twilio-sms.provider.ts`
+
+**Step 45** · 2026-08-02
+
+**What it does.** The real `SmsProvider`: sends via the Twilio SDK, performs Lookup v2, and classifies
+SDK errors as permanent or retryable.
+
+**Why it is written this way.**
+
+- **GSM-7 is asserted before the network call.** Failing locally costs nothing; a UCS-2 message that
+  reaches Twilio is billed at three times the price and cannot be un-sent. The check is deliberately
+  duplicated between here and the fake so both providers behave identically — a fake that is more
+  permissive than the real one is worse than no fake.
+- **Error classification is the whole point of this file.** BullMQ's retry decision hangs on it:
+  retrying a permanent failure burns four more API calls to be rejected identically and buries the cause
+  under timeouts, while _not_ retrying a transient one loses a lead to a network blip. Permanent means
+  "will fail identically forever" — unsubscribed, invalid `To`, landline, bad `From`, geo-permissions.
+  A rate limit (20429) is explicitly **not** permanent.
+- **21408 logs at `error` with the fix in the message.** Geo-permissions is a configuration fault, not a
+  bad recipient: it fails for _every_ send and looks exactly like a code bug. Naming the console setting
+  in the log line is the difference between a five-minute fix and a day of debugging the wrong layer.
+- **API key + secret preferred over the auth token.** A leaked key can be revoked individually; the auth
+  token cannot, because signature validation depends on it. The boot log says which is in use, so
+  running on the weaker credential is visible rather than assumed.
+- **The constructor throws without `TWILIO_ACCOUNT_SID`.** `env.ts` makes Twilio credentials optional so
+  the app can boot before the AU regulatory bundle clears — that convenience must not silently produce a
+  provider that fails on first send. The error names the fix: bind `FakeSmsProvider` instead.
+- **A failed Lookup returns `unknown` rather than throwing.** The send path treats `unknown` as
+  "proceed", so a bad day at Lookup degrades to sending normally. Throwing would mean refusing to text
+  anyone whenever an auxiliary API is unavailable — a much worse failure than an occasional wasted send.
+- **Our own segment count wins over Twilio's `numSegments`.** Twilio reports it as a string and only
+  sometimes; ours is computed identically for every message whether sent or not, which is what makes
+  cost reporting comparable.
+
+**Connects to.** `sms.provider.ts` (the interface and error taxonomy), `common/gsm7.ts`,
+`config/env.ts`, `docs/twilio-setup.md` §2 and §6.
+
+**Verified 13/13, with no network calls and nothing billed.** All five permanent codes classify as
+`PermanentSendError` carrying their code; rate limit, queue overflow and 500 classify as retryable; a
+non-Twilio error passes through unchanged and a non-`Error` value is wrapped rather than rethrown raw; a
+UCS-2 body is rejected locally before Twilio is contacted; and the constructor refuses to build without
+credentials.
+
+**Watch out for — a bug the compiler caught, worth remembering.** The first version read
+`(raw && LINE_TYPE_MAP[raw]) ?? 'unknown'`. An empty string is **falsy but not nullish**, so `raw && …`
+short-circuits to `''` and `??` does not replace it — producing `''` as a line type, which is not a
+valid value and would have flowed into `Customer.lineType`. `noUncheckedIndexedAccess` surfaced it. The
+fix indexes with a fallback key instead: `LINE_TYPE_MAP[raw ?? ''] ?? 'unknown'`. The `&&`/`??` mix is
+an easy trap wherever empty strings are plausible.
+
+Second: **nothing binds this provider yet.** No module provides `SMS_PROVIDER`, so neither the real nor
+the fake implementation is injectable. The binding — and the decision of which to use per environment —
+is the next step, and it must log which one is active, because a production deployment silently running
+the fake would report every send as successful while sending nothing.

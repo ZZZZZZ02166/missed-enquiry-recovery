@@ -1,4 +1,10 @@
-import { assertSendable, normaliseToGsm7, segmentInfo, type SegmentInfo } from '../common/gsm7';
+import {
+  assertSendable,
+  findNonGsm7,
+  normaliseToGsm7,
+  segmentInfo,
+  type SegmentInfo,
+} from '../common/gsm7';
 
 /**
  * Outbound SMS copy.
@@ -37,18 +43,67 @@ export const MAX_BUSINESS_NAME = 32;
 const OPT_OUT = 'Reply STOP to opt out.';
 
 /**
- * Prepare a business name for interpolation.
+ * Prepare a business name for interpolation into an outbound message.
  *
- * Normalises the characters people actually paste (curly quotes in "Dave's
- * Cleaning"), then truncates. Anything still non-GSM-7 after normalisation — an
- * emoji, CJK — is left alone and will fail the assertion loudly, because silently
- * mangling a business's own name in every message is worse than a failing test.
+ * Three steps, in order:
+ *
+ *  1. Normalise what people paste — curly quotes in "Dave's Cleaning" become
+ *     straight ones, so an invisible character cannot triple the bill.
+ *  2. **Strip anything still unsendable** — an emoji, CJK — because the alternative
+ *     is throwing at send time, and a caller who has just been promised a text
+ *     would receive nothing at all. Names are rejected at input by
+ *     `validateBusinessName`; this is the fallback for data that predates that
+ *     check, and losing a lead is worse than a slightly shortened name.
+ *  3. Truncate to one segment.
+ *
+ * Callers that can log should use `prepareBusinessNameVerbose` instead — silently
+ * degrading is how a mangled name goes unnoticed for months.
  */
 export function prepareBusinessName(name: string): string {
+  return prepareBusinessNameVerbose(name).name;
+}
+
+/**
+ * As `prepareBusinessName`, but reports what had to be removed.
+ *
+ * `stripped` non-empty means a business is sending messages under a name that is not
+ * quite theirs — recoverable, but the owner should be told rather than left to
+ * discover it in a customer's inbox.
+ */
+export function prepareBusinessNameVerbose(name: string): {
+  name: string;
+  stripped: string[];
+  truncated: boolean;
+} {
   const normalised = normaliseToGsm7(name.trim());
-  return normalised.length <= MAX_BUSINESS_NAME
-    ? normalised
-    : `${normalised.slice(0, MAX_BUSINESS_NAME - 1).trimEnd()}.`;
+  const stripped = findNonGsm7(normalised);
+  const sendable = stripped.length === 0 ? normalised : stripNonGsm7(normalised, stripped);
+
+  if (sendable.length <= MAX_BUSINESS_NAME) {
+    return { name: sendable, stripped, truncated: false };
+  }
+  return {
+    name: `${sendable.slice(0, MAX_BUSINESS_NAME - 1).trimEnd()}.`,
+    stripped,
+    truncated: true,
+  };
+}
+
+/**
+ * Remove the given characters and tidy the gaps they leave.
+ *
+ * Local to this module rather than imported from `businesses/business-name.ts`:
+ * templates must not depend on the businesses domain, and this direction of
+ * dependency would make the assertion at the bottom of this file transitively
+ * import a validator that imports these templates back.
+ */
+function stripNonGsm7(text: string, offenders: string[]): string {
+  const remove = new Set(offenders);
+  let out = '';
+  for (const char of text) {
+    if (!remove.has(char)) out += char;
+  }
+  return out.replace(/\s{2,}/g, ' ').trim();
 }
 
 /**
