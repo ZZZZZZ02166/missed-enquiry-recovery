@@ -94,6 +94,7 @@ decision rather than restating the argument.
 | —   | 2026-08-03 | `apps/api/src/jobs/queues.ts`                           | Moved `queueToken`/`REDIS_CONNECTION` out of the module — fixed a circular import   |
 | —   | 2026-08-03 | `apps/api/src/jobs/jobs.module.ts`                      | Restored: step 50/51 edits had reverted; worker was crashing again                  |
 | 52  | 2026-08-03 | `apps/api/src/app.boot.spec.ts`                         | Boot smoke test — catches missing DI registration the sweep cannot see. 17 tests    |
+| 53  | 2026-08-03 | `apps/api/src/telephony/messages.controller.ts`         | Inbound SMS + delivery status; **STOP now honoured**. 18/18                         |
 
 ---
 
@@ -2926,3 +2927,52 @@ Second: it boots `AppModule`, which is what `main.ts` and `worker.ts` both load 
 execute either entrypoint. `main.ts`-specific setup (`rawBody`, `trust proxy`, the global validation
 pipe) and `worker.ts`-specific setup (`Worker` construction, shutdown handlers) are still unverified by
 the suite.
+
+#### `apps/api/src/telephony/messages.controller.ts`
+
+**Step 53** · 2026-08-03
+
+**What it does.** Two endpoints. `/incoming` receives a customer's reply — honouring STOP, recording the
+message, creating the customer. `/status` applies Twilio's delivery lifecycle to outbound messages.
+
+**Why it is written this way.**
+
+- **Every response is empty TwiML, and that is a safety property, not a formality.** Twilio delivers the
+  body of a messaging webhook response _as an SMS_. A stray string here is an unintended, billed message;
+  an error page would be delivered to the customer as text. `<Response/>` is how you say "no reply", and
+  even the `catch` returns it.
+- **STOP is handled first, synchronously, before the message is attributed to anyone.** It is the one
+  obligation here with legal weight, and it must take effect even if every later step fails. Twilio stops
+  delivery at its end regardless, but our database has to agree or every subsequent send burns an API
+  call to be rejected with 21610.
+- **A STOP reply is deliberately not processed further.** Replying to someone who asked us to stop is
+  exactly what the opt-out forbids, so the conversation-engine branch is skipped for it.
+- **`/status` is what makes `QUEUED` mean anything.** Without it every outbound message stays `QUEUED`
+  forever and the dashboard shows a recovery SMS as sent when it never arrived — worse than showing
+  nothing, because the owner stops chasing.
+- **Terminal statuses are never overwritten.** Callbacks arrive out of order; a late `sent` after
+  `delivered` must not walk the message backwards. Verified.
+- **The status lookup uses `prisma.unscoped`** — a status callback carries no tenant, and `MessageSid` is
+  globally unique. One of the few legitimate cross-tenant reads (D8).
+- **Inbound segments come from `NumSegments`, falling back to 1.** Inbound is billed too, at a lower
+  rate; defaulting to zero would quietly understate the cost picture.
+
+**Verified against the live database, 18/18.** Empty TwiML returned (`<Response/>`); the inbound message
+recorded as `RECEIVED` with the body stored verbatim and a customer created; a duplicate delivery
+produces one row. **`STOP` → `OPTED_OUT` synchronously**, with the `MessageSid` kept as evidence, and the
+STOP message itself recorded. **"please stop by tomorrow morning" does not opt out** — the substring trap
+from step 30, now exercised through the real webhook path. `START` resubscribes. On the status side:
+`queued → sent → delivered` with a timestamp, a late out-of-order `sent` ignored, `undelivered` captured
+with error code 30003, and a callback for an unknown Sid handled without throwing.
+
+**Watch out for.** The controller is **not registered** — `TelephonyModule` does not list it, so these
+routes do not exist on the running app and Twilio has nowhere to deliver. Registration is the next step;
+the boot spec from step 52 will catch it if the dependencies are wrong.
+
+Second: `/status` deliberately does **not** write `costCents`. Twilio reports price as a negative USD
+string, and storing that unconverted would corrupt the AUD-integer-cents contract (rule 11) — the margin
+figure would be wrong rather than absent. Left null until the conversion lands, which keeps the step 48
+warning true: **the column exists, the number does not.**
+
+Third: the conversation engine is a marked gap. An inbound reply is recorded and then nothing happens —
+no extraction, no next question, no lead. That is the next milestone.
