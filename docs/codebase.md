@@ -103,6 +103,8 @@ decision rather than restating the argument.
 | 59  | 2026-08-03 | `apps/api/src/conversations/anthropic-llm.provider.ts`  | Claude adapter — structured outputs, cached prompt, refusal handled not thrown     |
 | 60  | 2026-08-03 | `apps/api/src/conversations/openai-llm.provider.ts`     | OpenAI adapter — same interface, own schema dialect. 31/31 across both             |
 | 61  | 2026-08-03 | `apps/api/src/conversations/llm-provider.factory.ts`    | Provider selection (+ `config/env.ts`). Prod cannot run the fake. 26/26            |
+| 62  | 2026-08-03 | `apps/api/src/conversations/conversations.module.ts`    | Registers the LLM provider; boot now proves it resolves. 158 tests                 |
+| 63  | 2026-08-03 | `apps/api/src/conversations/conversations.service.ts`   | The state machine — reply in, decision out. No DB, no sending. 61/61               |
 
 ---
 
@@ -3402,3 +3404,104 @@ first live request is where model name, schema acceptance and auth all get teste
 
 Third: nothing injects `LLM_PROVIDER` yet — there is no `ConversationsModule`. The factory is correct
 and unreachable until that module registers it.
+
+#### `apps/api/src/conversations/conversations.module.ts`
+
+**Step 62** · 2026-08-03 · _also one line in `app.module.ts`, and two assertions in `app.boot.spec.ts`_
+
+**What it does.** Registers the LLM provider factory and exports the `LLM_PROVIDER` token. One
+registration, which is what turns steps 58–61 from correct-but-unreachable code into something the
+application can inject.
+
+**Why it is written this way.**
+
+- **No controllers**, the same as `CallsModule` and for the same reason: customer replies arrive through
+  Twilio webhooks, which belong to `TelephonyModule`. This module owns what happens *after* a reply is
+  authenticated and recorded.
+- **Registration is where a misconfiguration becomes a boot failure.** The factory's production guard
+  runs at module construction, not at first use — so a production deploy with no key now dies at
+  startup rather than serving blank leads for a day. That is the whole return on this file.
+- **`LLM_PROVIDER` is exported because the consumer is a job processor, not anything in this module.**
+  Extraction runs on the worker: it is slow, billed per call, and must never happen inside a Twilio
+  webhook, which times out around 15 seconds (rule 8). `JobsModule` will import this the same way it
+  already imports `CallsModule` and `TelephonyModule`.
+- **`ConversationsService` is deliberately not here yet.** The state machine belongs in its own file,
+  separate from the processor — the processor should own retries and idempotency, not conversation
+  logic, and the logic has to be testable without a queue.
+
+**Why the two sibling edits.** A module nobody imports is inert, so `app.module.ts` gains one line; and
+step 52 exists precisely because a missing DI registration passes typecheck, lint, every unit test and
+both builds while killing the worker at startup. Leaving the assertion out of `app.boot.spec.ts` would
+mean this module has no permanent guard at all.
+
+The second assertion is the more interesting one: it pins the test-environment provider to
+`FakeLlmProvider`. If that ever resolves to a real adapter, the test suite has quietly started making
+paid API calls — a failure that would surface as a bill rather than a red test.
+
+**Verified.** Boot suite 20/20, full sweep 158 tests, both builds. The worker loads this same graph, so
+the factory's boot-time selection is exercised on both entrypoints.
+
+**Watch out for.** `.env.example` still does not document `LLM_PROVIDER` or `OPENAI_API_KEY`.
+
+Second: nothing calls `extractFields` yet. The provider resolves, is injectable, and is never invoked —
+the conversation service and its processor are what close that gap.
+
+#### `apps/api/src/conversations/conversations.service.ts`
+
+**Step 63** · 2026-08-03 · _also registered in `conversations.module.ts`_
+
+**What it does.** Takes a conversation's state plus one new customer reply and returns what should
+happen next: the merged answers, the new state, and the exact message to send. It does not touch the
+database, does not send anything, and does not enqueue anything.
+
+**Why it is written this way.**
+
+- **The decision is separated from persistence on purpose.** The processor owns retries, idempotency
+  and writes; this owns the decision. Mixing them produces logic that can only be tested by standing up
+  Postgres, Redis and a queue — which in practice means it stops being tested at the edges, and the
+  edges are where conversations break: the fifth question, the reply that answers nothing, the customer
+  who corrects an earlier answer. All 61 checks here run with no database and no network.
+- **Ordered guards, most decisive first** — the same shape as `CallsService.decideRecovery`. A
+  conversation matching two conditions must resolve them in a defined order rather than by whichever
+  branch happens to be written first.
+- **`needsHuman` short-circuits everything.** Continuing to ask about carpeted rooms after someone has
+  raised a complaint or asked to negotiate is the single most damaging thing this system could do, and
+  no number of extra fields is worth it. It is also **sticky**: once raised it stays raised, because a
+  customer who mentioned a complaint halfway through has still mentioned it whatever they say next.
+- **The question ceiling hands over a partial lead rather than sending a sixth text.** Reaching
+  `MAX_QUESTIONS` incomplete means extraction is failing or the customer is answering something other
+  than what was asked; either way the right response is a person. The reason string names both the limit
+  and the missing fields so the owner sees why it arrived unfinished.
+- **Extraction failures are deliberately not caught.** An `LlmUnavailableError` is transient by
+  construction, and the queue retrying the whole turn is correct. Swallowing it would mean either
+  re-asking a question we already asked, or — worse — treating "the model was overloaded" as "they told
+  us nothing", which permanently loses whatever the customer just said.
+- **Every outgoing word comes from `notifications/templates.ts`.** The service picks a template; it
+  never composes copy. That is what makes rule 2 hold here without a runtime check: the model's own text
+  was already dropped at the schema, and nothing in this file can introduce a figure.
+
+**The currency guard that is deliberately absent.** An obvious-looking addition would be "reject any
+outbound body containing a currency symbol". It is a trap, and it is the emoji bug in new clothes: a
+business legitimately named `$5 Cleaning Co` would fail that check on **every** message, losing every
+lead for that business forever. The guard belongs on the *template*, not the rendered body — templates
+are already asserted at module load, and `PriceCalculator` will be the only thing permitted to introduce
+a figure. Both cases are pinned by tests here: an emoji name and a `$` name each produce a sendable
+message and no exception.
+
+**Verified 61/61, adversarially.** Full and partial first replies; never re-asking an answered field;
+correction (`3 bedrooms` overwrites `2`) versus silence (an unmentioned field is not cleared);
+`needsHuman` short-circuit and stickiness; the question ceiling with its reason string; a model
+attempting to quote (`price` + `quote` + `message` all dropped, no digits reach the reply, the
+legitimate `suburb` survives); GSM-7 and one-segment assertions on both reply kinds; the two
+business-name traps; transient failure propagating rather than being swallowed; and the exact prompt the
+model receives, including that the newest reply is last.
+
+**Watch out for.** `needsHuman` currently sends the same handoff template as a completed conversation.
+It is acceptable — "has your details and will confirm shortly" is not wrong for a complaint — but it is
+not right either. A dedicated template is a one-line addition to `notifications/templates.ts`.
+
+Second: the `services` list is threaded through to the model but nothing supplies it yet, so
+`serviceType` is still unmatched free text.
+
+Third: nothing calls `advance()`. The processor that loads the conversation, calls this, persists the
+result and sends the reply is the next step — and it is the last piece before the loop runs end to end.

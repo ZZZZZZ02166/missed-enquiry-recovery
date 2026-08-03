@@ -4,6 +4,7 @@ import { Queue } from 'bullmq';
 import { AppModule } from './app.module';
 import { CallsService } from './calls/calls.service';
 import { SuppressionsService } from './calls/suppressions.service';
+import { FakeLlmProvider, LLM_PROVIDER, type LlmProvider } from './conversations/llm.provider';
 import { RecoveryProcessor } from './jobs/processors/recovery.processor';
 import { QUEUE, queueToken } from './jobs/queues';
 import { PrismaService } from './prisma/prisma.service';
@@ -112,6 +113,23 @@ describe('application boot', () => {
         (n) => app.get<Queue>(queueToken(n), { strict: false }).opts.connection,
       );
       expect(new Set(connections).size).toBe(1);
+    });
+  });
+
+  describe('LLM provider', () => {
+    // The factory runs at module construction, so this also proves its production
+    // guard and its logging happen at boot rather than on first use.
+    it('resolves and satisfies the interface', () => {
+      const provider = app.get<LlmProvider>(LLM_PROVIDER, { strict: false });
+      expect(typeof provider.extractFields).toBe('function');
+    });
+
+    it('is the fake in test, never a billed provider', () => {
+      // No key is set in CI. If this ever resolves to a real adapter, the test suite
+      // has started making paid API calls — which is the failure the seam exists to
+      // prevent, and it would show up as a bill rather than a red test.
+      const provider = app.get<LlmProvider>(LLM_PROVIDER, { strict: false });
+      expect(provider).toBeInstanceOf(FakeLlmProvider);
     });
   });
 
