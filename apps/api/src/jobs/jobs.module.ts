@@ -9,6 +9,9 @@ import {
 } from '@nestjs/common';
 import { Queue } from 'bullmq';
 import type IORedis from 'ioredis';
+import { CallsModule } from '../calls/calls.module';
+import { TelephonyModule } from '../telephony/telephony.module';
+import { RecoveryProcessor } from './processors/recovery.processor';
 import {
   DEFAULT_JOB_OPTIONS,
   QUEUE,
@@ -54,10 +57,26 @@ const queueProviders: Provider[] = Object.values(QUEUE).map((name) => ({
     new Queue(name, { connection, defaultJobOptions: DEFAULT_JOB_OPTIONS }),
 }));
 
+/**
+ * Processors are *provided* here but no `Worker` is created — `worker.ts` does that.
+ * Registering the class makes it injectable in both processes; only the worker
+ * actually consumes jobs, which is what keeps the API from sending SMS from inside a
+ * web request.
+ *
+ * `CallsModule` and `TelephonyModule` are imported for the processors' dependencies.
+ * Note the direction: nothing imports `JobsModule` back, because it is `@Global()` —
+ * a producer reaches the queues without an import edge, which is what avoids a cycle
+ * when telephony starts enqueuing.
+ */
 @Global()
 @Module({
-  providers: [connectionProvider, ...queueProviders],
-  exports: [REDIS_CONNECTION, ...queueProviders.map((p) => (p as { provide: string }).provide)],
+  imports: [CallsModule, TelephonyModule],
+  providers: [connectionProvider, ...queueProviders, RecoveryProcessor],
+  exports: [
+    REDIS_CONNECTION,
+    ...queueProviders.map((p) => (p as { provide: string }).provide),
+    RecoveryProcessor,
+  ],
 })
 export class JobsModule implements OnModuleInit, OnApplicationShutdown {
   private readonly logger = new Logger(JobsModule.name);

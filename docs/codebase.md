@@ -87,6 +87,9 @@ decision rather than restating the argument.
 | 47  | 2026-08-02 | `apps/api/src/telephony/telephony.module.ts`            | Registers + exports `SMS_PROVIDER`; boot log now states delivery. 6/6               |
 | —   | 2026-08-03 | `apps/api/src/telephony/telephony.module.ts`            | Merged the duplicate doc block left by step 47 (cosmetic)                           |
 | 48  | 2026-08-03 | `apps/api/prisma/schema.prisma`                         | `messages` — transcript and billing record in one table. 12/12                      |
+| 49  | 2026-08-03 | `apps/api/src/jobs/processors/recovery.processor.ts`    | **The send.** Re-checks at send time, idempotent, 21610 back-fill. 20/20            |
+| 50  | 2026-08-03 | `apps/api/src/worker.ts`                                | Registers the recovery Worker — queue→worker→send proven through real Redis         |
+| —   | 2026-08-03 | `jobs.module.ts` + `app.module.ts`                      | Forced siblings: registering `RecoveryProcessor` so the worker can boot             |
 
 ---
 
@@ -2666,3 +2669,139 @@ Second: `costCents` is nullable and will _stay_ null unless something populates 
 price after the message reaches a terminal state, and only if the status callback asks for it. If the
 status webhook does not write cost, the margin figure the pilot depends on will be silently empty — the
 column existing is not the same as the number existing.
+
+---
+
+### API — jobs (processors)
+
+#### `apps/api/src/jobs/processors/recovery.processor.ts`
+
+**Step 49** · 2026-08-03
+
+**What it does.** Sends the recovery SMS. Reads the call, re-runs every safety check, performs Lookup on
+first contact, sends through `SMS_PROVIDER`, and records the outcome in `messages` either way.
+
+**Why it is written this way.**
+
+- **Every check the decision path already made is made again here.** That is not redundancy. The job may
+  have sat in the queue while the customer replied STOP to a different message, or while the owner threw
+  the kill switch. **The state that matters is the state at send time, not at decision time** — which is
+  the concrete reason job payloads carry ids rather than entities. Verified: an opt-out arriving _after_
+  the call was queued stops the send.
+- **Idempotency is a query, not a `jobId`.** Before sending, it looks for an existing `RECOVERY` message
+  for this call. BullMQ's `jobId` only dedupes while a job is _in_ the queue; once it completes, a
+  re-enqueue runs again. Without this query a retried job texts the caller twice.
+- **The `messages` row is written _after_ the provider call, deliberately.** Writing it first would mean
+  a crash mid-send leaves a row claiming a message that was never queued — and the idempotency check
+  above would then suppress the retry. Losing the record of a failure is recoverable; suppressing a real
+  send is not.
+- **Permanent failures are swallowed, transient ones rethrown.** That single distinction is what drives
+  BullMQ's retry. A `PermanentSendError` returns normally so the job completes; anything else throws so
+  it backs off and retries.
+- **21610 back-fills a suppression row.** Twilio rejected the send because _its_ opt-out list has this
+  number even though ours did not. Twilio is authoritative for what is actually delivered, so the
+  divergence is repaired at the first rejection — otherwise every future call from that number burns
+  another API call to be rejected identically.
+- **`recordNoSend` clears `recoverySmsQueuedAt`.** Easy to miss and quietly harmful: that timestamp is
+  what the 24-hour throttle counts. Leaving it set on a call that never sent would suppress a
+  _legitimate_ recovery the next time that person rang.
+- **Lookup runs only when `lineType` is `UNKNOWN`**, and writes to both `customers.lineType` and
+  `suppressions`. The customer row caches what Lookup said; the suppression is the decision not to send.
+  A number is paid for once, ever.
+- **A missing SMS number throws rather than returning.** The number may be mid-provisioning, so retrying
+  is right — and a throw leaves the job visible in the failed set instead of silently dropped.
+- **A stripped business name logs a warning.** This is the call site the step 44 entry said was missing.
+
+**Connects to.** `calls/suppressions.service.ts`, `notifications/templates.ts`,
+`telephony/sms.provider.ts` (`SMS_PROVIDER`, `PermanentSendError`), `jobs/queues.ts`
+(`RecoveryJobData`), `prisma` (`messages`, `calls`, `customers`).
+
+**Verified against the live database, 20/20.** The message that goes out:
+
+```
+Melbourne Sparkle Cleaning: sorry we missed your call. What do you need help
+with, and which suburb are you in? Reply STOP to opt out.
+```
+
+Sent from the `SMS_TWO_WAY` number rather than the voice number; one segment; `messages` row written with
+Sid and `sentAt`. A retried job sends nothing and writes no second row. An opt-out arriving after
+enqueue stops the send, marks the call `SUPPRESSED`, and clears the queued marker. A landline is looked
+up, cached, suppressed and not texted. A known contact receives the call-back wording instead of a
+question. A 21610 rejection writes a `FAILED` message with the code and back-fills an opt-out. A
+transient error rethrows. The kill switch stops the send at job time. An unknown call id drops cleanly
+rather than retrying forever.
+
+**Watch out for.** The per-business daily cap is checked in `CallsService.decideRecovery` but **not**
+re-checked here, unlike every other guard. A burst of queued jobs could therefore exceed the cap: the
+decision was made when each call arrived, and the cap counts calls rather than sends. The kill switch
+covers the emergency case, but the cap is currently advisory at send time.
+
+Second: nothing enqueues this job yet, and `worker.ts` does not register it. The processor is complete
+and proven, and no message is sent by the running system.
+
+#### `apps/api/src/worker.ts` — recovery Worker registered
+
+**Step 50** · 2026-08-03
+
+**What it does.** Creates the BullMQ `Worker` for the `recovery` queue, wires it to `RecoveryProcessor`,
+and handles graceful shutdown. **This is the step where the queue actually runs.**
+
+**Why it is written this way.**
+
+- **Workers are created here, never in a module.** Both processes load the same graph (D7), so a
+  `Worker` registered in `JobsModule` would make the **API** start consuming its own jobs — sending SMS
+  from inside a web request, which is precisely what the queue exists to prevent. `JobsModule` provides
+  producers and the processor _class_; only this file creates a consumer.
+- **Each worker gets its own Redis connection.** A blocking worker connection cannot also serve queue
+  commands; sharing one deadlocks under load.
+- **Concurrency 5, limiter 10/s.** Deliberately low. The bottleneck is Twilio, not us, and every job is a
+  message that costs money — parallelism buys nothing here and makes a runaway loop more expensive per
+  second. The limiter also protects against out-of-order delivery, which reads to a customer as a broken
+  conversation.
+- **The log line carries `attemptsMade + 1`.** Without the attempt number a retry is indistinguishable
+  from a duplicate in the logs, which is exactly the thing you need to tell apart when investigating a
+  double send.
+- **`failed` logs at `error`.** A job that exhausts its attempts is a message a caller never received. It
+  survives a week in the failed set for inspection, but it must also be loud when it happens.
+- **Shutdown closes workers before the app context.** In-flight jobs finish first; closing the context
+  first would pull a processor's dependencies out from under it mid-send.
+
+**Verified end to end through real Redis and a real worker process.** A business, both phone numbers and
+a missed call were seeded; the job was enqueued from a separate process; the running worker picked it up:
+
+```
+[Worker]            [recovery] job recovery-E2E68090 attempt 1 call=cmscrawo0...
+[RecoveryProcessor] Recovery SMS queued for call cmscrawo0... (1 segment)
+```
+
+and the resulting row (5/5):
+
+```
+"E2E Sparkle Cleaning: sorry we missed your call. What do you need help with,
+ and which suburb are you in? Reply STOP to opt out."
+from +61470068090 → +61413068090   OUTBOUND · RECOVERY · QUEUED · 1 segment
+```
+
+linked to both the call and the customer. **This is the first time the full asynchronous path has run:
+enqueue → worker → suppression re-check → Lookup → send → record.**
+
+**Watch out for — this step needed two sibling edits, and the worker was broken until they landed.**
+`worker.ts` alone crashed on boot:
+
+```
+UnknownElementException: Nest could not find RecoveryProcessor element
+```
+
+`RecoveryProcessor` was not a provider in any module, and `JobsModule` was never imported by `AppModule`
+at all — so the queues were unreachable from the running app as well. Both were fixed here:
+`JobsModule` now imports `CallsModule` + `TelephonyModule` and provides `RecoveryProcessor`, and
+`AppModule` imports `JobsModule`. Flagged rather than folded in silently: three files moved in one step,
+because the entrypoint cannot be verified — or even started — without them.
+
+Note the import direction that avoids a cycle: **nothing imports `JobsModule` back**. It is `@Global()`,
+so a producer reaches the queues without an import edge. That is what will let `TelephonyModule` enqueue
+in the next step even though `JobsModule` already imports it.
+
+Second: only the `recovery` queue has a worker. The other four (`inbound-message`, `notify-owner`,
+`followup`, `maintenance`) accept jobs that nothing will ever consume — they would sit in `waiting`
+forever, silently. Worth knowing before anything enqueues to them.
