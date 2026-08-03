@@ -100,6 +100,8 @@ decision rather than restating the argument.
 | 56  | 2026-08-03 | `apps/api/src/conversations/question-flow.ts`           | Question set + next-question logic; asks only what is missing. 26/26                |
 | 57  | 2026-08-03 | `apps/api/src/conversations/extraction.ts`              | Model boundary — rule 2 enforced structurally. 42/42 adversarial                    |
 | 58  | 2026-08-03 | `apps/api/src/conversations/llm.provider.ts`            | LLM seam: interface, prompt, output schema, fake. Raw output cannot escape. 59/59   |
+| 59  | 2026-08-03 | `apps/api/src/conversations/anthropic-llm.provider.ts`  | Claude adapter — structured outputs, cached prompt, refusal handled not thrown     |
+| 60  | 2026-08-03 | `apps/api/src/conversations/openai-llm.provider.ts`     | OpenAI adapter — same interface, own schema dialect. 31/31 across both             |
 
 ---
 
@@ -3259,3 +3261,94 @@ actually offers it.
 Third: `usage.cachedInputTokens` exists so the adapter can prove caching works. If it reads zero across
 repeated calls, the prefix is being invalidated somewhere and every request is paying full price — the
 kind of failure that shows up only on the bill.
+
+#### `apps/api/src/conversations/anthropic-llm.provider.ts`
+
+**Step 59** · 2026-08-03
+
+**What it does.** The Claude implementation of `LlmProvider`. Sends the shared prompt and schema to
+`messages.create`, reads the JSON back, and maps failures onto the retryable/not split.
+
+**Why it is written this way.**
+
+- **It contains no policy.** Model, effort, token ceiling, prompt and schema all arrive as constants
+  from `llm.provider.ts`, and the result leaves through `finaliseExtraction`. What lives here is only
+  what is specifically true of this API: how to ask, how to read the answer, which failures are worth
+  retrying. That is the whole reason the two adapters are comparable.
+- **The system prompt is sent as an array with `cache_control`, not a bare string.** It is identical on
+  every call for every business, which makes it the one part of the request worth caching. This is the
+  payoff for keeping per-request data out of it in step 58.
+- **`thinking: { type: 'adaptive' }` is stated explicitly** even though it is the default on this model.
+  The default differs by model, so a future change of `EXTRACTION_MODEL` must not silently turn thinking
+  off — and thinking-off is the documented cause of stray tags leaking into output.
+- **`stop_reason` is checked before `content` is touched.** On a refusal the content array can be empty,
+  and indexing it blindly is the documented way to turn a handled outcome into a crash.
+- **A refusal is not an error.** It returns an empty extraction and logs. A safety classifier firing on
+  "2 bed 2 bath in Southbank" would be extraordinary, but if it happens the conversation must continue —
+  the next question still gets asked and the owner still gets a lead. Stalling the thread would lose the
+  job outright.
+- **`max_tokens` is handled separately from a parse failure.** Truncated JSON fails to parse either way;
+  naming the real cause stops the next reader debugging the schema when the problem is the ceiling that
+  thinking and response share.
+- **One SDK retry, not the default two.** BullMQ already retries this job. Two retrying layers multiply
+  rather than add — three SDK attempts inside five job attempts is fifteen calls against an already
+  overloaded API.
+- **Retryability branches on HTTP status, not SDK error class names.** The status is the stable contract;
+  a class rename would otherwise turn a rate limit into a permanent failure with no compile error to
+  show for it. A non-retryable status is logged as "every extraction will fail", because a 400 here is a
+  deploy-time bug wearing a runtime failure's clothes.
+
+**Watch out for.** No real call has been made — there is no key in this environment. Everything below the
+type checker is unproven against the live endpoint: `output_config.format` acceptance, the refusal path,
+and whether the system prompt actually clears the 512-token cache minimum. `usage.cachedInputTokens`
+reading zero on repeat calls is how you would find out it does not.
+
+#### `apps/api/src/conversations/openai-llm.provider.ts`
+
+**Step 60** · 2026-08-03
+
+**What it does.** The OpenAI implementation of the same interface, via the Responses API. The only file
+that imports the OpenAI SDK.
+
+**Why it is written this way.**
+
+- **Two implementations is what makes the choice reversible.** Switching provider becomes a factory
+  change rather than a rewrite, and running both over the same conversations is the only honest way to
+  find out which extracts Australian suburb names and "2 bed 2 bath" better. That comparison is only
+  meaningful because everything except the API call is shared.
+- **`toOpenAiSchema` bridges a real dialect conflict.** The two providers disagree on exactly one point,
+  and it is the kind of disagreement that costs an afternoon if you meet it as a runtime 400: Anthropic
+  wants `null` listed among a nullable enum's values, OpenAI's strict mode wants it **absent** with
+  nullability carried by `type` alone. The shared schema keeps the conventional JSON Schema form and
+  this adapter translates. One canonical contract translated at each boundary beats a
+  lowest-common-denominator schema that is subtly wrong for both.
+- **The translation deep-clones.** Verified explicitly, because mutating the shared constant would send
+  the OpenAI dialect to Anthropic on the next call in the same process — a cross-provider corruption
+  that no type checker would catch.
+- **`instructions`, not a leading system message.** It is this API's dedicated system channel and what
+  makes the prompt eligible for automatic caching, which is prefix-based here too.
+- **The refusal path differs and is handled where it actually appears** — a content part inside an output
+  message, not a top-level status. Same posture as the Claude adapter: logged, empty extraction,
+  conversation continues.
+- **`status === 'incomplete'` mirrors `stop_reason === 'max_tokens'`.** Reasoning and output share
+  `max_output_tokens` exactly as thinking and response share `max_tokens` on the other provider, and the
+  symptom is identical — truncated JSON that would otherwise be misreported as a parse error.
+- **A 400 is called out as probably the schema.** This provider's strict mode accepts a narrower subset
+  of JSON Schema, so the error message points the next reader straight at `toOpenAiSchema` instead of
+  the request shape generally.
+
+**Verified 31/31** across both adapters: the dialect split in both directions (shared schema keeps null,
+translated schema drops it while preserving nullability on `type`), non-mutation of the shared constant,
+deep-clone of nested property objects, six translation edge cases, all four OpenAI strict-mode
+invariants asserted on the translated schema, and both adapters refusing to construct without a key.
+
+**Watch out for.** This adapter reads `process.env.OPENAI_API_KEY` directly — the **only** place in the
+codebase that bypasses the validated `env` schema. `config/env.ts` has no field for it yet; that
+one-line addition belongs with the factory, and the fallback goes away then. It is flagged in the file
+rather than hidden.
+
+Second: `gpt-5.6` is the documented alias. The SDK's own model union lists `gpt-5.6-sol`, `-terra` and
+`-luna`, so if extraction quality ever needs to be reproducible, pin one of those instead.
+
+Third: nothing chooses between the two providers yet. Both are dead code until the factory exists, and
+neither has been run against a live endpoint.
