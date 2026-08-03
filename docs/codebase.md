@@ -85,6 +85,8 @@ decision rather than restating the argument.
 | 45  | 2026-08-02 | `apps/api/src/telephony/twilio-sms.provider.ts`         | Real Twilio adapter; permanent vs retryable classification. 13/13                   |
 | 46  | 2026-08-02 | `apps/api/src/telephony/sms-provider.factory.ts`        | Binds real vs fake; production refuses to boot on the fake. 12/12                   |
 | 47  | 2026-08-02 | `apps/api/src/telephony/telephony.module.ts`            | Registers + exports `SMS_PROVIDER`; boot log now states delivery. 6/6               |
+| —   | 2026-08-03 | `apps/api/src/telephony/telephony.module.ts`            | Merged the duplicate doc block left by step 47 (cosmetic)                           |
+| 48  | 2026-08-03 | `apps/api/prisma/schema.prisma`                         | `messages` — transcript and billing record in one table. 12/12                      |
 
 ---
 
@@ -2612,3 +2614,55 @@ between "the pilot works" and "the pilot sent nothing".
 
 Second: `SMS_PROVIDER` is now injectable but **nothing injects it**. No message is sent anywhere in the
 system yet. The `messages` table and the recovery processor are what close that.
+
+#### `apps/api/prisma/schema.prisma` — `messages` added
+
+**Step 48** · 2026-08-03
+
+**What it does.** Adds `Message` and three enums (`MessageDirection`, `MessageStatus`,
+`MessagePurpose`). One table serving two jobs: the conversation transcript, and the billing record.
+
+**Why it is written this way.**
+
+- **`segments` and `costCents` live here because there is no other source for margin.** Twilio bills per
+  segment, and "gross profit per customer" is a sum over this table. Storing the segment count we
+  computed — rather than trusting Twilio's inconsistently-reported `numSegments` — means every message is
+  measured the same way whether it sent or not.
+- **`body` is the exact text, not a template id.** A template can change; what a customer was actually
+  told must not change with it. That matters in a dispute, and it is the difference between a transcript
+  and a reconstruction.
+- **`providerMessageSid` is nullable _and_ unique.** Nullable because a send that fails outright never
+  gets one, and that row is still the record of the attempt — losing it would mean failed sends vanish
+  from both the transcript and the cost picture. Unique because a replayed status callback must not
+  duplicate the row. Postgres treats NULLs as distinct, so many failed sends coexist happily; verified.
+- **`UNDELIVERED` and `FAILED` are distinct terminal states, not "not delivered".** A recovery SMS
+  marked `SENT` that never arrived is a lost lead the dashboard would otherwise show as contacted —
+  which is worse than showing nothing, because the owner stops chasing.
+- **`RECEIVED` exists for inbound**, which has no delivery lifecycle. Modelling inbound with a null
+  status would make every query filter on direction first.
+- **`purpose` is nullable, set only on outbound.** It answers "why did we send this?" — which is what
+  separates a recovery SMS from a nudge from a manual staff reply in the same thread.
+- **`costCents` is the converted AUD figure at time of sending** (rule 11). Twilio prices in USD; storing
+  the rate-converted value means a later exchange-rate move cannot silently rewrite historical margin.
+- **`onDelete: SetNull` on both customer and call.** An APP 12/13 erasure request removes the person, not
+  the business's billing record. Verified: the message survives with a null `customerId`.
+
+**Connects to.** `calls` and `customers` (both optional relations). `common/gsm7.ts` (the segment count).
+`telephony/sms.provider.ts` (`providerMessageSid`, `errorCode`). Migration `20260803034835_add_messages`.
+
+**Verified against the live database, 12/12.** Guarded by the tenant extension. An outbound message
+records with a null cost until Twilio reports it, then takes `DELIVERED` + `costCents` from a status
+callback. A duplicate `MessageSid` is rejected; several rows with a _null_ Sid are allowed. A failed send
+is recorded with `errorCode: 21610` and no Sid. Inbound has no purpose. The billing aggregate returns
+4 segments and 8 cents across the run. A three-message thread reads back in order. Deleting the customer
+leaves the message with a null `customerId`, and deleting the business cascades.
+
+**Watch out for.** Three indexes cover the thread view, billing and the failure list — but there is no
+index on `providerMessageSid` beyond the unique constraint, which is fine, and none on `callId`.
+"Which messages did this call produce?" is currently a scan; it is a one-row-per-call relationship today,
+so it will not matter until the conversation grows.
+
+Second: `costCents` is nullable and will _stay_ null unless something populates it. Twilio only reports
+price after the message reaches a terminal state, and only if the status callback asks for it. If the
+status webhook does not write cost, the margin figure the pilot depends on will be silently empty — the
+column existing is not the same as the number existing.

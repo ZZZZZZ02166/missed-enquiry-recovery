@@ -1,7 +1,7 @@
 // Schema grows table by table (CLAUDE.md build protocol), not all twelve at once.
 // Landed so far: businesses, users, phone_numbers, webhook_events, customers, calls,
-//                suppressions.
-// Remaining: services, conversations, messages, leads, attachments.
+//                suppressions, messages.
+// Remaining: services, conversations, leads, attachments.
 //
 // Conventions (.claude/skills/backend/SKILL.md §4):
 //   camelCase fields, snake_case tables and columns via @map/@@map
@@ -69,6 +69,7 @@ model Business {
   customers    Customer[]
   calls        Call[]
   suppressions Suppression[]
+  messages     Message[]
 
   @@map("businesses")
 }
@@ -204,8 +205,9 @@ model Customer {
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
 
-  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  business Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
   calls    Call[]
+  messages Message[]
 
   /// The same phone number is a different customer for a different business.
   @@unique([businessId, phoneE164])
@@ -303,6 +305,7 @@ model Call {
 
   business Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
   customer Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  messages Message[]
 
   /// The dashboard's default view: this business's calls, newest first.
   @@index([businessId, startedAt])
@@ -391,6 +394,122 @@ model Suppression {
   /// Compliance: "show me every opt-out, newest first".
   @@index([businessId, optedOutAt])
   @@map("suppressions")
+}
+
+enum MessageDirection {
+  INBOUND
+  OUTBOUND
+
+  @@map("message_direction")
+}
+
+/// Twilio's delivery lifecycle.
+///
+/// QUEUED → SENT → DELIVERED is the happy path. UNDELIVERED and FAILED are terminal
+/// and mean the customer received nothing — which matters more than it sounds: a
+/// "sent" recovery SMS that never arrived is a lost lead the dashboard would
+/// otherwise show as contacted.
+enum MessageStatus {
+  QUEUED
+  SENT
+  DELIVERED
+  UNDELIVERED
+  FAILED
+  /// Inbound messages have no delivery lifecycle — they already arrived.
+  RECEIVED
+
+  @@map("message_status")
+}
+
+/// Why an outbound message was sent. Inbound messages have no purpose.
+enum MessagePurpose {
+  /// The first message after a missed call.
+  RECOVERY
+  /// A question in the qualification conversation.
+  QUALIFICATION
+  /// One nudge after silence.
+  NUDGE
+  /// Handoff — the business has what it needs.
+  HANDOFF
+  /// Staff replying by hand from the dashboard.
+  MANUAL
+  /// The structured lead SMS to the owner.
+  OWNER_NOTIFICATION
+
+  @@map("message_purpose")
+}
+
+/// Every SMS, in and out.
+///
+/// This is the billing record as well as the conversation transcript. `segments` and
+/// `costCents` are stored per message because Twilio charges per segment, and margin
+/// per customer is derived from summing this table — there is no other source for it
+/// (`.claude/skills/queues-redis/SKILL.md` §9).
+///
+/// Retention: message bodies contain personal information and follow the 24-month
+/// rule, not the 90-day one that applies to `webhook_events` (docs/compliance.md §7).
+model Message {
+  id         String @id @default(cuid())
+  businessId String @map("business_id")
+
+  /// Null for a message to someone who never became a customer — an owner
+  /// notification, or a send to a number we could not attribute.
+  customerId String? @map("customer_id")
+
+  /// The call that triggered this message, for outbound recovery. Null for inbound
+  /// replies and owner notifications.
+  callId String? @map("call_id")
+
+  direction MessageDirection
+  status    MessageStatus
+  /// Null for inbound.
+  purpose   MessagePurpose?
+
+  fromE164 String @map("from_e164")
+  toE164   String @map("to_e164")
+
+  /// The exact text sent or received. Not a template id — a template can change, and
+  /// what a customer was actually told must not change with it.
+  body String
+
+  /// Twilio's MessageSid. Unique, and the join key for status callbacks.
+  ///
+  /// Nullable because the row is written *before* the provider call in some paths;
+  /// a send that fails outright never gets one, and that row is still the record of
+  /// the attempt.
+  providerMessageSid String? @unique @map("provider_message_sid")
+
+  /// Our own segment count, computed identically for every message whether it sent
+  /// or not (CLAUDE.md rule 5). Twilio reports its own, inconsistently.
+  segments Int @default(1)
+
+  /// Integer cents, AUD (CLAUDE.md rule 11). Twilio prices in USD, so this is the
+  /// converted figure at the time of sending — a rate that moves later must not
+  /// silently rewrite historical margin.
+  costCents Int? @map("cost_cents")
+
+  /// Twilio error code when delivery failed. 21610 means they had opted out at
+  /// Twilio's layer even though our suppression table said otherwise.
+  errorCode    Int?    @map("error_code")
+  errorMessage String? @map("error_message")
+
+  sentAt      DateTime? @map("sent_at")
+  deliveredAt DateTime? @map("delivered_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  business Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  customer Customer? @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  call     Call?     @relation(fields: [callId], references: [id], onDelete: SetNull)
+
+  /// The conversation thread, newest last.
+  @@index([businessId, customerId, createdAt])
+  /// Billing and margin: sum segments and cost over a period.
+  @@index([businessId, createdAt])
+  /// "Which sends failed?" — the operational view.
+  @@index([businessId, status])
+  @@map("messages")
 }
 
 enum WebhookProvider {
