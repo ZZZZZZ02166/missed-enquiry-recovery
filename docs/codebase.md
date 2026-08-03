@@ -83,6 +83,8 @@ decision rather than restating the argument.
 | 43  | 2026-08-02 | `apps/api/src/businesses/business-name.ts`              | Rejects unsendable names at input — fixes a lead-losing flaw found in review. 21/21 |
 | 44  | 2026-08-02 | `apps/api/src/notifications/templates.ts`               | Send path degrades instead of throwing — lead-losing path CLOSED. 15/15             |
 | 45  | 2026-08-02 | `apps/api/src/telephony/twilio-sms.provider.ts`         | Real Twilio adapter; permanent vs retryable classification. 13/13                   |
+| 46  | 2026-08-02 | `apps/api/src/telephony/sms-provider.factory.ts`        | Binds real vs fake; production refuses to boot on the fake. 12/12                   |
+| 47  | 2026-08-02 | `apps/api/src/telephony/telephony.module.ts`            | Registers + exports `SMS_PROVIDER`; boot log now states delivery. 6/6               |
 
 ---
 
@@ -2516,3 +2518,97 @@ Second: **nothing binds this provider yet.** No module provides `SMS_PROVIDER`, 
 the fake implementation is injectable. The binding — and the decision of which to use per environment —
 is the next step, and it must log which one is active, because a production deployment silently running
 the fake would report every send as successful while sending nothing.
+
+#### `apps/api/src/telephony/sms-provider.factory.ts`
+
+**Step 46** · 2026-08-02
+
+**What it does.** Decides whether `SMS_PROVIDER` resolves to the real Twilio adapter or the in-memory
+fake, and makes that decision loud.
+
+**The failure it is designed against.** A production deployment silently running the fake. Every send
+would be recorded as successful, every metric would look healthy, and **no customer would receive
+anything**. Nobody notices until a business asks why their leads stopped — by which point those callers
+are long gone. It is the worst class of bug this system can have: total functional failure that reports
+success.
+
+**Why it is written this way.**
+
+- **Production does not warn — it refuses to start.** A misconfiguration that silently sends nothing is
+  strictly worse than one that fails to boot, because the second is noticed in the first minute. The
+  error names the missing variables and explains that the fake does not deliver.
+- **Half-configured counts as not configured.** An account SID without `TWILIO_SMS_NUMBER` would
+  authenticate happily and then fail at the first message — putting the error in the wrong place, hours
+  later, inside a job retry. Both are required at boot.
+- **Selection is by credentials, never by a flag.** A `USE_FAKE_SMS=true` left set in a deployment is
+  exactly how the silent failure happens. There is no such flag; the presence of real credentials _is_
+  the switch.
+- **The boot log states the consequence, not the class name.** `Using TwilioSmsProvider — messages will
+be DELIVERED from +61488887777` and, in development, `messages are recorded in memory and NOT
+delivered`. Someone testing the recovery flow locally and wondering why no text arrived has the answer
+  in the startup output.
+- **`createSmsProvider` is exported separately from the Nest provider** so the decision can be tested
+  without a DI container — which is how all five environment combinations were checked cheaply.
+
+**Connects to.** `sms.provider.ts` (`SMS_PROVIDER` token, `FakeSmsProvider`),
+`twilio-sms.provider.ts`, `config/env.ts`, `docs/twilio-setup.md`.
+
+**Verified 12/12** across every environment combination:
+
+| `NODE_ENV`  | Twilio config       | Result                                      |
+| ----------- | ------------------- | ------------------------------------------- |
+| production  | none                | **throws — refuses to start**               |
+| production  | SID only, no number | **throws**                                  |
+| production  | complete            | real provider, boots                        |
+| development | none                | fake, warns "NOT delivered"                 |
+| development | complete            | real provider, log names the sending number |
+
+**Watch out for.** Nothing registers this factory yet — `TelephonyModule` does not include it, so
+`SMS_PROVIDER` is still not injectable anywhere. That is the next step.
+
+Second: the production guard checks `NODE_ENV`, which is set by the deployment. A staging environment
+running `NODE_ENV=development` with no Twilio credentials would quietly use the fake — correct
+behaviour, but it means "did anything actually send?" must be answered from the boot log rather than
+assumed. The log line exists for exactly that question.
+
+#### `apps/api/src/telephony/telephony.module.ts` — `SMS_PROVIDER` registered
+
+**Step 47** · 2026-08-02
+
+**What it does.** Adds `smsProviderFactory` to the providers and exports `SMS_PROVIDER`, making the SMS
+provider injectable and putting the delivery-mode line into every boot.
+
+**Why it is written this way.**
+
+- **`SMS_PROVIDER` is exported, unlike the signature guard.** The recovery job lives in the worker, not
+  in telephony, and it is what actually sends. Telephony owns the Twilio boundary; other modules consume
+  the interface and never import the SDK. That is what keeps `twilio` out of the dependency graph of
+  everything above this layer.
+- **The factory runs at module construction, so the log happens exactly once.** A `useClass` binding
+  would give no place to log the decision, and logging per injection would bury it.
+
+**Connects to.** `sms-provider.factory.ts`, `sms.provider.ts`, `twilio-sms.provider.ts`. The recovery
+processor will inject `SMS_PROVIDER` from here.
+
+**Verified 6/6 through DI, plus a real boot.** The provider resolves from `TelephonyModule`'s own scope,
+is a single shared instance (two would mean a test asserting on `sent` silently misses real sends),
+sends successfully through the injected instance, and is reachable from a downstream consumer module —
+which is exactly what the worker will be.
+
+The application boot log now carries the line the factory exists for:
+
+```
+WARN [SmsProvider] Using FakeSmsProvider — messages are recorded in memory and NOT
+delivered. Set TWILIO_ACCOUNT_SID and TWILIO_SMS_NUMBER to send for real.
+```
+
+`/health/ready` still returns `{"status":"ok","database":"ok"}` and all four routes still map.
+
+**Watch out for.** This repo currently has no `TWILIO_ACCOUNT_SID`, so **every environment resolves to
+the fake** — including anything deployed from here. That is correct and loudly announced, but it means
+the send path cannot be tested against a real handset until the AU regulatory bundle clears and the
+number is bought (`docs/twilio-setup.md` §3–4). The warning in the boot log is the only thing standing
+between "the pilot works" and "the pilot sent nothing".
+
+Second: `SMS_PROVIDER` is now injectable but **nothing injects it**. No message is sent anywhere in the
+system yet. The `messages` table and the recovery processor are what close that.

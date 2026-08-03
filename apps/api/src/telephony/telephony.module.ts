@@ -1,5 +1,7 @@
 import { Module } from '@nestjs/common';
 import { CallsModule } from '../calls/calls.module';
+import { smsProviderFactory } from './sms-provider.factory';
+import { SMS_PROVIDER } from './sms.provider';
 import { TwilioSignatureGuard } from './twilio-signature.guard';
 import { VoiceController } from './voice.controller';
 import { WebhookEventsService } from './webhook-events.service';
@@ -27,10 +29,19 @@ import { WebhookEventsService } from './webhook-events.service';
  * the recovery logic testable without a webhook and reusable if calls ever arrive from
  * somewhere other than Twilio.
  */
+/**
+ * `SMS_PROVIDER` is exported because the recovery job — which lives in the worker,
+ * not here — is what actually sends. Telephony owns the Twilio boundary; other
+ * modules consume it through the interface and never import the SDK.
+ *
+ * The factory runs once, at module construction, and logs whether messages will be
+ * delivered or only recorded. That line is the answer to "why did no text arrive?",
+ * so it must appear in every boot.
+ */
 @Module({
   imports: [CallsModule],
   controllers: [VoiceController],
-  providers: [WebhookEventsService, TwilioSignatureGuard],
-  exports: [WebhookEventsService],
+  providers: [WebhookEventsService, TwilioSignatureGuard, smsProviderFactory],
+  exports: [WebhookEventsService, SMS_PROVIDER],
 })
 export class TelephonyModule {}
