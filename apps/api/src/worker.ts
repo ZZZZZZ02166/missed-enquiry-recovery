@@ -7,6 +7,7 @@ import { AppModule } from './app.module';
 import { InboundMessageProcessor } from './jobs/processors/inbound-message.processor';
 import { InboundReconcilerProcessor } from './jobs/processors/inbound-reconciler.processor';
 import { RecoveryProcessor } from './jobs/processors/recovery.processor';
+import { RetentionProcessor } from './jobs/processors/retention.processor';
 import {
   QUEUE,
   createWorkerRedisConnection,
@@ -85,6 +86,14 @@ const MAINTENANCE_CONCURRENCY = 1;
  */
 const RECONCILE_EVERY_MS = 60_000;
 
+/**
+ * How often to enforce the retention policy (`docs/compliance.md` §7).
+ *
+ * Daily. The cutoff is 90 days, so the exact hour is irrelevant — what matters is
+ * that it runs unattended rather than being something somebody remembers to do.
+ */
+const RETENTION_EVERY_MS = 24 * 60 * 60 * 1000;
+
 async function bootstrap(): Promise<void> {
   const logger = new Logger('Worker');
   const app = await NestFactory.createApplicationContext(AppModule);
@@ -122,7 +131,10 @@ async function bootstrap(): Promise<void> {
   const startWorker = <T>(
     name: QueueName,
     describe: (data: T) => string,
-    process: (data: T) => Promise<void>,
+    // The job name is passed through because the maintenance queue carries more than
+    // one schedule. Dispatching on it there keeps a single worker and a single
+    // connection rather than one of each per periodic task.
+    process: (data: T, jobName: string) => Promise<void>,
     options: {
       concurrency: number;
       limiter?: { max: number; duration: number };
@@ -145,7 +157,7 @@ async function bootstrap(): Promise<void> {
         logger.log(
           `[${name}] job ${job.id} attempt ${job.attemptsMade + 1} ${describe(job.data)}`,
         );
-        await process(job.data);
+        await process(job.data, job.name);
       },
       { connection, ...options },
     );
@@ -185,6 +197,7 @@ async function bootstrap(): Promise<void> {
   const recoveryProcessor = app.get(RecoveryProcessor);
   const inboundProcessor = app.get(InboundMessageProcessor);
   const reconciler = app.get(InboundReconcilerProcessor);
+  const retention = app.get(RetentionProcessor);
   const prisma = app.get(PrismaService);
 
   startWorker<RecoveryJobData>(
@@ -220,10 +233,28 @@ async function bootstrap(): Promise<void> {
     },
   );
 
+  // One worker, several schedules, dispatched by job name. An unknown name is logged
+  // rather than silently ignored: a scheduler whose name drifts from its handler would
+  // otherwise look like it is running fine while doing nothing at all.
+  const MAINTENANCE_TASKS: Record<string, () => Promise<void>> = {
+    'reconcile-inbound': () => reconciler.process(),
+    retention: () => retention.process(),
+  };
+
   startWorker<Record<string, never>>(
     QUEUE.MAINTENANCE,
-    () => 'reconcile-inbound',
-    () => reconciler.process(),
+    () => 'scheduled',
+    async (_data, jobName) => {
+      const task = MAINTENANCE_TASKS[jobName];
+      if (!task) {
+        logger.error(
+          `[${QUEUE.MAINTENANCE}] no handler for scheduled job "${jobName}" — ` +
+            `it will never run. Known: ${Object.keys(MAINTENANCE_TASKS).join(', ')}`,
+        );
+        return;
+      }
+      await task();
+    },
     { concurrency: MAINTENANCE_CONCURRENCY },
   );
 
@@ -239,6 +270,11 @@ async function bootstrap(): Promise<void> {
       { every: RECONCILE_EVERY_MS },
       { name: 'reconcile-inbound' },
     );
+    await maintenanceQueue.upsertJobScheduler(
+      'retention',
+      { every: RETENTION_EVERY_MS },
+      { name: 'retention' },
+    );
   } catch (error) {
     // Non-fatal: the queues still work, only the automatic sweep is missing. Loud,
     // because without it a failed enqueue is once again unrecoverable.
@@ -251,7 +287,8 @@ async function bootstrap(): Promise<void> {
   logger.log(
     `Worker started — consuming [${workers.map((w) => w.name).join(', ')}] ` +
       `(recovery ${RECOVERY_CONCURRENCY} @ ${RECOVERY_LIMITER.max}/s, ` +
-      `inbound ${INBOUND_CONCURRENCY}, maintenance every ${RECONCILE_EVERY_MS / 1000}s)`,
+      `inbound ${INBOUND_CONCURRENCY}, reconcile every ${RECONCILE_EVERY_MS / 1000}s, ` +
+      `retention every ${RETENTION_EVERY_MS / 3_600_000}h)`,
   );
 
   /**

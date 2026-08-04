@@ -15,6 +15,7 @@ import { TelephonyModule } from '../telephony/telephony.module';
 import { InboundMessageProcessor } from './processors/inbound-message.processor';
 import { InboundReconcilerProcessor } from './processors/inbound-reconciler.processor';
 import { RecoveryProcessor } from './processors/recovery.processor';
+import { RetentionProcessor } from './processors/retention.processor';
 import {
   DEFAULT_JOB_OPTIONS,
   QUEUE,
@@ -105,6 +106,7 @@ const queueProviders: Provider[] = Object.values(QUEUE).map((name) => ({
     RecoveryProcessor,
     InboundMessageProcessor,
     InboundReconcilerProcessor,
+    RetentionProcessor,
   ],
   exports: [
     REDIS_CONNECTION,
@@ -112,6 +114,7 @@ const queueProviders: Provider[] = Object.values(QUEUE).map((name) => ({
     RecoveryProcessor,
     InboundMessageProcessor,
     InboundReconcilerProcessor,
+    RetentionProcessor,
   ],
 })
 export class JobsModule implements OnModuleInit, OnApplicationShutdown {

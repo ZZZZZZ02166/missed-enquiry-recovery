@@ -114,6 +114,7 @@ decision rather than restating the argument.
 | 70  | 2026-08-03 | _reconciler, controller, health_                       | Backlog alert + **two bugs in step 69's own reconciler**. 11/11                     |
 | 71  | 2026-08-03 | `voice.controller.ts`, reconciler, `schema.prisma`     | **Same hang in the voice webhook** — caller heard silence. 14/14                    |
 | 72  | 2026-08-03 | `apps/api/src/telephony/send-cap.service.ts`           | Spend breaker — cap counted calls, permitted ~7× the stated limit. 17/17            |
+| 73  | 2026-08-04 | `apps/api/src/jobs/processors/retention.processor.ts` | Retention sweep — a written policy nothing enforced. 13/13                          |
 
 ---
 
@@ -4017,6 +4018,49 @@ Second: the count is a read followed by a write with no lock, so N concurrent se
 `sent < cap` and proceed. At `INBOUND_CONCURRENCY = 2` the overshoot is at most a message or two, which
 is well inside the tolerance of a cost guard — but it is not a hard limit, and calling it one would be
 wrong.
+
+#### `apps/api/src/jobs/processors/retention.processor.ts`
+
+**Step 73** · 2026-08-04 · _also `jobs.module.ts`, `worker.ts`_
+
+**What it does.** Runs the retention policy in `docs/compliance.md` §7 on a daily schedule. Today that
+is one sweep: `webhook_events` older than 90 days.
+
+**Why it matters.** `WebhookEventsService.deleteOlderThan` has existed since step 21 and **nothing has
+ever called it**. The obligation was written down, the method was written, and the two were never
+connected — so the table has been accumulating verbatim caller phone numbers and message bodies with no
+expiry. A documented policy that nothing enforces is worse than no policy, because it is a written
+record of the breach.
+
+**Why only one sweep, deliberately.** The policy lists six rows; the other five are not safe to
+implement yet, and the file says so rather than leaving their absence to look like an oversight:
+
+- **Suppressions are never deleted, and that is the point.** The policy marks them indefinite on
+  purpose — deleting an opt-out re-enables messaging someone who said stop. Verified: a 400-day-old
+  opt-out survives the sweep untouched.
+- **Messages, conversations and calls (24 months) are blocked on a real conflict.** `Lead` cascades from
+  its conversation, and leads are retained *longer* — the life of the account plus 12 months. Deleting a
+  24-month-old conversation would silently take a lead the policy says to keep. Resolving that needs a
+  nulled relation, a lead-aware predicate, or an archive step, and picking one in passing would be
+  guessing. Nothing here is near 24 months old, so waiting costs nothing and getting the cascade wrong
+  costs an owner's record permanently.
+- **Attachments** have no table yet.
+
+**The worker now dispatches maintenance by job name.** Two schedules share one queue — reconcile every
+60s, retention every 24h — rather than one worker and one Redis connection per periodic task. An unknown
+job name is logged as an error instead of ignored: a scheduler whose name drifts from its handler would
+otherwise look like it is running while doing nothing, which is the same class of silent failure as the
+uncalled method above.
+
+**Verified 13/13** against the real database and a spawned worker: the 90-day boundary is exact (91 days
+deleted, 89 days kept), suppressions survive, business data is untouched, repeated sweeps are a no-op,
+both schedules are registered in Redis, and **retention actually executes** rather than merely being
+scheduled. Regression: 163 unit and boot, plus 37 / 25 / 42 / 11 / 14 / 17 across the six integration
+suites.
+
+**Watch out for.** The sweep is global, not per tenant, and `webhook_events` rows carry a nullable
+`businessId` — so this is one of the legitimate unscoped writes (D8). It deletes by age alone, which is
+correct for this table and would not be for any of the tenant-owned ones.
 
 **Watch out for.** The 15-minute orphan sweep and the 2-minute staleness window are both wall-clock
 guesses, not measurements. If a legitimate job ever takes longer than 15 minutes — a long backoff chain
