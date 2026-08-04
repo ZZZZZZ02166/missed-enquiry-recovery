@@ -4265,6 +4265,48 @@ resurrected, the concurrency claim, stale abandonment, `lastInboundAt` still gua
 late-arriving older messages, and the duplicate window. Regression: 164 unit and boot, plus
 37 / 25 / 42 / 11 / 14 / 13 / 43 / 30 / 19 / 17 across ten integration suites.
 
+### Audit — step 76 close-out
+
+A deliberate sweep for the same classes of defect, rather than only re-running the suites. Recorded here
+so the *absence* of findings is evidence rather than an assumption.
+
+**Clean:**
+
+- Every `prisma.unscoped` call site is one of the four documented D8 cases (tenant discovery by phone
+  number, the tenant-less status-callback lookup, the cross-tenant maintenance sweeps, the ops backlog
+  count) and each carries its justification in a comment.
+- `@typescript-eslint/no-floating-promises` is `error`, so a missing `await` on a database or provider
+  call cannot merge — worth knowing, because three of the bugs found this session were ordering
+  problems and a floating promise is the same failure with no ordering at all.
+- No empty `catch {}` or `.catch(() => {})` anywhere in product code.
+- No duplicate or missing build-log entries; `prisma migrate status` reports no drift across 12
+  migrations.
+- `RecoveryProcessor` and `NotifyOwnerProcessor` re-checked against rule 13: both write their markers
+  *after* the send, so both retry correctly.
+
+**Known gaps, none of them regressions:**
+
+- **`QUEUE.FOLLOWUP` has no processor and no worker.** It is declared with a typed payload, and
+  `conversations.nudgedAt` exists unused. The consequence is real: a conversation that gets no reply
+  stays open indefinitely — no nudge, no expiry to `LOST`, and "open conversations" is not a number
+  anyone can trust. This is plan item A6, never built rather than broken.
+- `SESSION_SECRET` and `SESSION_COOKIE_DOMAIN` are validated at boot and read by nothing, because
+  `auth` does not exist. `TWILIO_VOICE_NUMBER` is likewise unread — the voice number is resolved from
+  `phone_numbers`, so the variable may simply be redundant.
+- Columns with no writer: `serviceId`, `propertyCondition`, `quoteSnapshot` (all await the services
+  catalogue), `isSpam` / `isDuplicate` (no classifier), `costCents` (so margin per message is still
+  not computable).
+
+**Two small warts, deliberately left:**
+
+- `conversations.completedAt` is overwritten on every update while the state is `COMPLETE`, so it means
+  "last completed" rather than "first completed". Nothing reads it yet; worth pinning before the
+  dashboard does.
+- If a conversation is `OPTED_OUT` the processor returns before `flushUnsentReplies`, so a reserved
+  reply for that customer is never sent (correct) and never marked (untidy). It ages out of the send-cap
+  window in 24 hours and is invisible to the customer, but it would show up in any future "stuck sends"
+  query.
+
 **Watch out for.** The 15-minute orphan sweep and the 2-minute staleness window are both wall-clock
 guesses, not measurements. If a legitimate job ever takes longer than 15 minutes — a long backoff chain
 after repeated model failures — the sweep could revert a row whose job is still alive but momentarily

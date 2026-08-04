@@ -77,6 +77,13 @@ modules, same image, different start command. Never a separate worker package.
     how the owner entered it (ACL single-price rule).
 12. **Time comes from `businesses.timezone`** (`Australia/Melbourne`), never server local time. DST will
     otherwise break scheduling twice a year.
+13. **Never write an idempotency marker before the side effect it marks.** Send, then record. Enqueue,
+    then mark processed. A marker written first turns the retry into a no-op, so the work is skipped
+    *and* reported as done — and because the retry then succeeds, nothing lands in the failed set and
+    nothing alerts. This has caused four separate silent-loss bugs: `markProcessed` before the enqueue,
+    `QUEUED` overwriting `PROCESSED`, re-adding a completed BullMQ job id, and `lastInboundAt` before
+    the send. If the marker genuinely must come first, it has to be a **reservation** the retry can
+    find and complete (a row with a null `providerMessageSid`), never a claim that it is finished.
 
 ---
 
