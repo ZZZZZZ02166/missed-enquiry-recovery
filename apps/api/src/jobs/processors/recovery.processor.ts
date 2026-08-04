@@ -154,6 +154,12 @@ export class RecoveryProcessor {
    * first would mean a crash mid-send leaves a row claiming a message that was never
    * queued, and the idempotency check above would then suppress the retry. Losing the
    * record of a failure is recoverable; suppressing a real send is not.
+   *
+   * **The opposite of `InboundMessageProcessor`, and both are correct.** There, the
+   * row is reserved *before* the send, because an unsent row is what *drives* its
+   * retry rather than suppressing it. The difference is which side the idempotency
+   * marker sits on: here the row's existence means "already sent", there a null
+   * `providerMessageSid` means "not sent yet".
    */
   private async send(
     callId: string,

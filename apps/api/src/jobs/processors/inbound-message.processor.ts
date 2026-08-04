@@ -37,6 +37,25 @@ import { Queue } from 'bullmq';
 /** How much of the thread the model sees. Matches the provider's own cap. */
 const THREAD_WINDOW = 12;
 
+/**
+ * How long a claimed-but-unconfirmed send may sit before another worker may take it.
+ *
+ * Covers a process dying between claiming a row and calling the provider. Generous
+ * enough that a slow provider call is never mistaken for a dead worker.
+ */
+const STALE_CLAIM_MS = 5 * 60 * 1000;
+
+/**
+ * Past this, an unsent reply is abandoned rather than delivered.
+ *
+ * A product limit. A question about a job the customer raised yesterday reads as the
+ * system waking up at random; answering that late is worse than not answering.
+ */
+const MAX_UNSENT_AGE_MS = 15 * 60 * 1000;
+
+/** At most one or two can realistically be outstanding; the cap is a safety rail. */
+const MAX_FLUSH_BATCH = 5;
+
 @Injectable()
 export class InboundMessageProcessor {
   private readonly logger = new Logger(InboundMessageProcessor.name);
@@ -86,6 +105,15 @@ export class InboundMessageProcessor {
       return;
     }
 
+    // Deliver anything a previous attempt reserved but never sent, before deciding
+    // anything new. This must run *before* the guard below, because that guard is
+    // exactly what used to swallow the retry.
+    const flushed = await this.flushUnsentReplies(businessId, message.customerId);
+    if (flushed === 'blocked') {
+      await this.finish(messageId, businessId, 'PENDING', 'unsent reply blocked by the send cap');
+      return;
+    }
+
     // Idempotency by state, not by job id. `lastInboundAt` advances only once a
     // reply has been fully processed, so a retried job sees its own message already
     // accounted for and stops.
@@ -101,7 +129,12 @@ export class InboundMessageProcessor {
       // attempt of this job or in a later reply that superseded it. This is also the
       // path that repairs a crash between the conversation write and the status
       // write — without it the row would sit QUEUED forever.
-      await this.finish(messageId, businessId, 'PROCESSED', 'superseded by a later reply');
+      await this.finish(
+        messageId,
+        businessId,
+        'PROCESSED',
+        flushed === 'sent' ? 'reply re-sent after a failed attempt' : 'superseded by a later reply',
+      );
       return;
     }
 
@@ -345,24 +378,57 @@ export class InboundMessageProcessor {
     const to = inbound.fromE164;
     const purpose = kind === 'question' ? 'QUALIFICATION' : 'HANDOFF';
 
+    // **Reserved before the provider is called.** A row with a null
+    // `providerMessageSid` is a durable "we owe this customer these exact words" —
+    // which is what makes a transient send failure recoverable at all.
+    //
+    // This is the opposite ordering to `RecoveryProcessor`, deliberately. There, a row
+    // written first would *suppress* the retry, because its idempotency check is the
+    // existence of the row. Here the unsent row *drives* the retry instead. Both are
+    // correct; they defend opposite failures.
+    const reserved = await this.prisma.db.message.create({
+      data: {
+        businessId,
+        customerId: inbound.customerId,
+        direction: 'OUTBOUND',
+        status: 'QUEUED',
+        purpose,
+        fromE164: from,
+        toE164: to,
+        body,
+        providerMessageSid: null,
+        // Doubles as the concurrency claim — see `claim()`.
+        sentAt: new Date(),
+      },
+    });
+
+    await this.deliver(reserved.id, businessId, { from, to, body });
+  }
+
+  /**
+   * Send a reserved row and confirm it, or leave it recoverable.
+   *
+   * Split out so the retry path can reuse it without touching the model, the
+   * conversation or the lead.
+   */
+  private async deliver(
+    messageId: string,
+    businessId: string,
+    sms: { from: string; to: string; body: string },
+  ): Promise<void> {
     try {
       const result = await this.sms.sendSms({
-        to,
-        from,
-        body,
+        to: sms.to,
+        from: sms.from,
+        body: sms.body,
         statusCallbackUrl: `${env.PUBLIC_API_URL}/webhooks/twilio/messages/status`,
       });
 
-      await this.prisma.db.message.create({
+      // Confirmation. The sid is what takes this row out of the unsent set, so this
+      // write is the thing that makes the send idempotent.
+      await this.prisma.db.message.update({
+        where: { id: messageId, businessId },
         data: {
-          businessId,
-          customerId: inbound.customerId,
-          direction: 'OUTBOUND',
-          status: 'QUEUED',
-          purpose,
-          fromE164: from,
-          toE164: to,
-          body,
           providerMessageSid: result.providerMessageSid,
           segments: result.segments,
           sentAt: new Date(),
@@ -370,26 +436,132 @@ export class InboundMessageProcessor {
       });
     } catch (error) {
       if (error instanceof PermanentSendError) {
-        this.logger.warn(`Permanent failure replying to ${to}: ${error.message}`);
-        await this.prisma.db.message.create({
-          data: {
-            businessId,
-            customerId: inbound.customerId,
-            direction: 'OUTBOUND',
-            status: 'FAILED',
-            purpose,
-            fromE164: from,
-            toE164: to,
-            body,
-            errorCode: error.code,
-            errorMessage: error.message,
-          },
+        this.logger.warn(`Permanent failure replying to ${sms.to}: ${error.message}`);
+        // Terminal: FAILED takes it out of the unsent set for good, so nothing
+        // re-sends something guaranteed to be rejected again.
+        await this.prisma.db.message.update({
+          where: { id: messageId, businessId },
+          data: { status: 'FAILED', errorCode: error.code, errorMessage: error.message },
         });
-        if (error.code === 21610) await this.suppressions.optOut(businessId, to);
+        if (error.code === 21610) await this.suppressions.optOut(businessId, sms.to);
         // Swallowed: retrying is guaranteed to fail identically.
         return;
       }
+
+      // Transient. Release the claim so the retry can pick the row up, and rethrow so
+      // BullMQ actually retries. The row keeps its null sid, which is what the flush
+      // step looks for.
+      await this.prisma.db.message.updateMany({
+        where: { id: messageId, businessId, providerMessageSid: null },
+        data: { sentAt: null },
+      });
       throw error;
     }
+  }
+
+  /**
+   * Send any reply that was reserved but never confirmed, before doing anything else.
+   *
+   * The bug this closes: `lastInboundAt` proves the customer's reply was *processed*,
+   * not that the resulting SMS was *sent*. It was written before the send, so a
+   * transient Twilio failure left the conversation and lead saved, the SMS unsent, and
+   * the BullMQ retry skipping straight past on the `>=` comparison — marking the
+   * message PROCESSED with the note "superseded by a later reply" while the customer
+   * sat in silence. The job even completed successfully, so nothing alerted.
+   *
+   * Deliberately **flush and continue** rather than flush and return. If the unsent row
+   * belongs to an earlier inbound message, returning here would mark the *current*
+   * message processed without ever answering it — turning one lost reply into two. On
+   * the retry path the `lastInboundAt` guard below still stops the duplicate work,
+   * which is the intended behaviour.
+   *
+   * Scoping by customer is safe rather than approximate: every other outbound writer
+   * (`RecoveryProcessor`, `NotifyOwnerProcessor`) creates its row *after* the provider
+   * call, so a row with a null `providerMessageSid` and `status: QUEUED` can only have
+   * come from the reserve step above.
+   */
+  private async flushUnsentReplies(
+    businessId: string,
+    customerId: string,
+  ): Promise<'none' | 'sent' | 'blocked'> {
+    const now = Date.now();
+
+    const unsent = await this.prisma.db.message.findMany({
+      where: {
+        businessId,
+        customerId,
+        direction: 'OUTBOUND',
+        status: 'QUEUED',
+        providerMessageSid: null,
+        // Either unclaimed, or claimed so long ago that the claimant is presumed dead.
+        // Without the second case a process that died between claiming and sending
+        // would strand the row forever — the same silence this method exists to fix.
+        OR: [{ sentAt: null }, { sentAt: { lt: new Date(now - STALE_CLAIM_MS) } }],
+      },
+      orderBy: { createdAt: 'asc' },
+      take: MAX_FLUSH_BATCH,
+    });
+
+    if (unsent.length === 0) return 'none';
+
+    let sent = 0;
+    for (const row of unsent) {
+      // Too old to be worth sending. A question about a job the customer asked about
+      // yesterday reads as a system waking up at random, and answering it now is worse
+      // than not answering — the conversation has moved on.
+      if (row.createdAt.getTime() < now - MAX_UNSENT_AGE_MS) {
+        await this.prisma.db.message.update({
+          where: { id: row.id, businessId },
+          data: {
+            status: 'FAILED',
+            errorMessage: 'abandoned: never sent and now too old to be useful',
+          },
+        });
+        this.logger.error(
+          `Reply to ${row.toE164} was never sent and is now stale — abandoned. ` +
+            'That customer received no answer.',
+        );
+        continue;
+      }
+
+      // Re-checked at the moment of sending, not trusted from the first attempt. A
+      // STOP between attempts is the case that matters: sending after it is the one
+      // thing the opt-out absolutely forbids.
+      const suppressed = await this.suppressions.isSuppressed(businessId, row.toE164);
+      if (suppressed) {
+        await this.prisma.db.message.update({
+          where: { id: row.id, businessId },
+          data: { status: 'FAILED', errorMessage: `not sent: ${suppressed} before delivery` },
+        });
+        this.logger.log(`Unsent reply to ${row.toE164} cancelled: ${suppressed}`);
+        continue;
+      }
+
+      const cap = await this.sendCap.check(businessId);
+      if (!cap.allowed) {
+        // Left untouched so it is retried once the window rolls or the switch flips.
+        this.logger.warn(`Cannot flush unsent reply to ${row.toE164} — ${cap.detail}`);
+        return 'blocked';
+      }
+
+      // Compare-and-set claim. Two workers can be processing two different replies for
+      // the same customer at once (inbound concurrency is 2), and both would find this
+      // row. Only the update that actually changes it proceeds.
+      const claim = await this.prisma.db.message.updateMany({
+        where: { id: row.id, businessId, providerMessageSid: null, sentAt: row.sentAt },
+        data: { sentAt: new Date() },
+      });
+      if (claim.count === 0) continue;
+
+      await this.deliver(row.id, businessId, {
+        from: row.fromE164,
+        to: row.toE164,
+        body: row.body,
+      });
+      sent += 1;
+      this.logger.log(`Re-sent a reply to ${row.toE164} that a previous attempt never delivered`);
+    }
+
+    return sent > 0 ? 'sent' : 'none';
   }
 }

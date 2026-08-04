@@ -117,6 +117,7 @@ decision rather than restating the argument.
 | 73  | 2026-08-04 | `apps/api/src/jobs/processors/retention.processor.ts` | Retention sweep — a written policy nothing enforced. 13/13                          |
 | 74  | 2026-08-04 | `apps/api/src/leads/` (mapping, service, module)      | **Leads are real** — a reply now produces an owner record. 43/43                    |
 | 75  | 2026-08-04 | `notify-owner.processor.ts` + owner template          | **THE LOOP REACHES THE OWNER** — lead SMS delivered. 30/30 + 19/19 journey          |
+| 76  | 2026-08-04 | `inbound-message.processor.ts`                        | **Lost outbound reply** — customer silence on any Twilio blip. 36/36                |
 
 ---
 
@@ -4189,6 +4190,80 @@ ring the customer back, which is the bulk of the value, but cannot view or reply
 Second: the notification fires once, on the transition to `QUALIFIED`. A lead that later gains a
 detail does not re-notify, which is right — but there is also no digest, so a lead that never qualifies
 is never mentioned to the owner at all.
+
+### The lost outbound reply
+
+**Step 76** · 2026-08-04 · `inbound-message.processor.ts`, plus a clarifying comment in
+`recovery.processor.ts`
+
+**The bug.** `lastInboundAt` proved the customer's reply had been *processed*, not that the resulting
+SMS had been *sent* — and it was written before the send. So:
+
+```
+reply saved 10:00 -> conversation.lastInboundAt = 10:00 -> lead saved
+  -> reply() throws on a Twilio timeout
+  -> BullMQ retries
+  -> guard: lastInboundAt >= message.createdAt, both 10:00, `>=` is true
+  -> marked PROCESSED, note "superseded by a later reply"
+  -> the customer never receives anything
+```
+
+Reproduced before fixing: `SMS ever sent: 0`, `processingStatus: PROCESSED`.
+
+**Why it was invisible.** The retry *completed successfully*, so the job never reached the failed set,
+never triggered `onExhausted`, never logged a failure. The reconciler could not help either — it sweeps
+`PENDING`, and this row was `PROCESSED`. The stored note actively lied. The owner still received the
+lead, so from their side nothing looked wrong while the customer sat in silence.
+
+**Root cause, stated generally.** Every other processor writes its idempotency marker *after* the side
+effect — `RecoveryProcessor` writes the message row after the send, `NotifyOwnerProcessor` sets
+`ownerNotifiedAt` after it. This was the only one that marked work done before doing it. The same shape
+has now been found four times: `markProcessed` before enqueue (step 69), `QUEUED` clobbering `PROCESSED`
+(step 70), re-adding a completed job id (step 70), and this.
+
+**The fix: reserve, send, confirm.** The outbound row is created *before* the provider call with a null
+`providerMessageSid` — a durable "we owe this customer these exact words". On success the sid, segments
+and `sentAt` are written; that write is what makes the send idempotent. On a transient failure the row
+keeps its null sid and the error is rethrown, so BullMQ's retry has something to find.
+
+`flushUnsentReplies()` runs at the top of `process()`, before the guard, and delivers anything a
+previous attempt reserved but never sent — using the stored body, so **no model call, no conversation
+write, no lead sync**.
+
+**No migration was needed, and that was worth checking rather than assuming.** Every other outbound
+writer creates its row *after* the provider call, so those rows always carry a sid or are `FAILED`. A
+row with a null `providerMessageSid` and `status: QUEUED` can therefore only have come from the reserve
+step — scoping by customer is unambiguous, not approximate.
+
+**One deliberate deviation from the brief: flush and *continue*, not flush and return.** If the stranded
+row belongs to an *earlier* inbound message, returning early would mark the *current* message
+`PROCESSED` without ever answering it — turning one lost reply into two. Falling through lets the
+existing guard handle the retry case exactly as intended, and answers a genuinely new reply on its own
+merit. Verified: a newer reply arriving after a stranded one produces **two** outbound rows, both
+confirmed.
+
+**Concurrency.** Inbound concurrency is 2, so two jobs for the same customer can both find the same
+stranded row. A compare-and-set claim on `sentAt` means only one proceeds; the loser skips. Verified by
+racing two jobs against one stranded row and asserting the invariant that actually matters — **one send
+per row**. (The first attempt at that test asserted uniqueness by message *body*, which is meaningless
+here: every reply is the same first question when extraction returns nothing.)
+
+**Two safety limits.** A claim older than 5 minutes is reclaimable, so a process dying between claiming
+and sending cannot strand a row forever. An unsent reply older than 15 minutes is abandoned with a
+recorded reason rather than delivered — a question about a job raised an hour ago reads as the system
+waking up at random, and answering that late is worse than not answering.
+
+**The accepted trade-off, tested rather than merely documented.** If Twilio accepts the message and the
+confirming update is lost, the row still looks unsent and the retry sends the same question twice.
+**A duplicate question is preferable to permanent silence**, and it needs a database failure in the gap
+between two adjacent statements. Section 8 of the suite simulates exactly this and asserts the duplicate
+happens, so the behaviour is pinned rather than assumed.
+
+**Verified 36/36**, covering every point raised: the original bug, flush-and-continue, STOP arriving
+between attempts cancelling the reserved reply, permanent failures staying terminal and never
+resurrected, the concurrency claim, stale abandonment, `lastInboundAt` still guarding duplicates and
+late-arriving older messages, and the duplicate window. Regression: 164 unit and boot, plus
+37 / 25 / 42 / 11 / 14 / 13 / 43 / 30 / 19 / 17 across ten integration suites.
 
 **Watch out for.** The 15-minute orphan sweep and the 2-minute staleness window are both wall-clock
 guesses, not measurements. If a legitimate job ever takes longer than 15 minutes — a long backoff chain
