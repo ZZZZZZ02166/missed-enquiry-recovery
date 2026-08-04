@@ -87,6 +87,17 @@ export interface ConversationDecision {
   /** Required fields still outstanding — shown to the owner as gaps on the lead. */
   stillMissing: FieldKey[];
 
+  /**
+   * Urgency as read from *this* reply, if it said anything about timing.
+   *
+   * Passed through rather than merged into `collected`, because it is a signal and
+   * not an answer — the conversation never asks about it and it must not look like a
+   * satisfied question. Undefined means this reply was silent on urgency, which is
+   * not the same as "not urgent": whoever stores it should leave a previously
+   * detected value alone.
+   */
+  urgency?: 'low' | 'normal' | 'high';
+
   /** Cost and latency attribution for this turn. */
   usage: LlmUsage;
   model: string;
@@ -150,6 +161,7 @@ export class ConversationsService {
       model: result.model,
       latencyMs: result.latencyMs,
       attemptedToPrice: result.attemptedToPrice,
+      urgency: result.extraction.urgency,
     };
 
     // Ordered guards, most decisive first — the same shape as

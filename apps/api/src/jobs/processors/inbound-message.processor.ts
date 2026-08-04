@@ -2,6 +2,7 @@ import { Inject, Injectable, Logger } from '@nestjs/common';
 import { SuppressionsService } from '../../calls/suppressions.service';
 import { env } from '../../config/env';
 import { ConversationsService } from '../../conversations/conversations.service';
+import { LeadsService } from '../../leads/leads.service';
 import { SendCapService } from '../../telephony/send-cap.service';
 import type { LlmTurn } from '../../conversations/llm.provider';
 import type { CollectedAnswers } from '../../conversations/question-flow';
@@ -37,6 +38,7 @@ export class InboundMessageProcessor {
     private readonly prisma: PrismaService,
     private readonly conversations: ConversationsService,
     private readonly suppressions: SuppressionsService,
+    private readonly leads: LeadsService,
     private readonly sendCap: SendCapService,
     @Inject(SMS_PROVIDER) private readonly sms: SmsProvider,
   ) {}
@@ -167,14 +169,25 @@ export class InboundMessageProcessor {
       },
     });
 
-    if (decision.createLead) {
-      // A call is not a lead; a reply is (docs/decisions.md). The `leads` table does
-      // not exist yet, so this is the seam and not the implementation — logged so
-      // the gap is visible rather than silently skipped.
-      this.logger.log(
-        `First reply on conversation ${conversation.id} — lead creation pending the leads table`,
-      );
-    }
+    // A call is not a lead; a reply is (docs/decisions.md). Synced on **every**
+    // advance rather than only the first: a lead written once and never updated shows
+    // the owner whatever was known thirty seconds in — usually a suburb and nothing
+    // else — which is worse than no lead, because it looks complete.
+    //
+    // After the conversation write, deliberately. If this fails, the conversation
+    // state is still correct and the retry re-syncs from it; the reverse ordering
+    // would leave a lead describing a conversation that never advanced.
+    await this.leads.syncFromConversation({
+      businessId,
+      customerId: message.customerId,
+      conversationId: conversation.id,
+      collected: decision.collected,
+      conversationComplete: decision.state === 'COMPLETE',
+      needsHuman: decision.needsHuman,
+      needsHumanReason: decision.needsHumanReason,
+      stillMissing: decision.stillMissing,
+      urgency: decision.urgency,
+    });
 
     await this.reply(message, businessId, decision.reply.kind, decision.reply.body);
 

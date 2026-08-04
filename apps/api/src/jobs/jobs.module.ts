@@ -11,6 +11,7 @@ import { Queue } from 'bullmq';
 import type IORedis from 'ioredis';
 import { CallsModule } from '../calls/calls.module';
 import { ConversationsModule } from '../conversations/conversations.module';
+import { LeadsModule } from '../leads/leads.module';
 import { TelephonyModule } from '../telephony/telephony.module';
 import { InboundMessageProcessor } from './processors/inbound-message.processor';
 import { InboundReconcilerProcessor } from './processors/inbound-reconciler.processor';
@@ -99,7 +100,7 @@ const queueProviders: Provider[] = Object.values(QUEUE).map((name) => ({
  */
 @Global()
 @Module({
-  imports: [CallsModule, TelephonyModule, ConversationsModule],
+  imports: [CallsModule, TelephonyModule, ConversationsModule, LeadsModule],
   providers: [
     connectionProvider,
     ...queueProviders,

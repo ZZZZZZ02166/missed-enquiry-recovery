@@ -115,6 +115,7 @@ decision rather than restating the argument.
 | 71  | 2026-08-03 | `voice.controller.ts`, reconciler, `schema.prisma`     | **Same hang in the voice webhook** — caller heard silence. 14/14                    |
 | 72  | 2026-08-03 | `apps/api/src/telephony/send-cap.service.ts`           | Spend breaker — cap counted calls, permitted ~7× the stated limit. 17/17            |
 | 73  | 2026-08-04 | `apps/api/src/jobs/processors/retention.processor.ts` | Retention sweep — a written policy nothing enforced. 13/13                          |
+| 74  | 2026-08-04 | `apps/api/src/leads/` (mapping, service, module)      | **Leads are real** — a reply now produces an owner record. 43/43                    |
 
 ---
 
@@ -4061,6 +4062,57 @@ suites.
 **Watch out for.** The sweep is global, not per tenant, and `webhook_events` rows carry a nullable
 `businessId` — so this is one of the legitimate unscoped writes (D8). It deletes by age alone, which is
 correct for this table and would not be for any of the tenant-owned ones.
+
+### `apps/api/src/leads/` — lead creation
+
+**Step 74** · 2026-08-04 · `lead-mapping.ts`, `leads.service.ts`, `leads.module.ts`, plus wiring in
+`inbound-message.processor.ts`, `conversations.service.ts`, `jobs.module.ts`, `app.module.ts`
+
+**What it does.** Replaces the logging seam left at step 64 with a real write. A customer's reply now
+produces and maintains a `Lead` — the structured record the owner acts on.
+
+**Why it is split this way.**
+
+- **`lead-mapping.ts` is pure**, because it is the part with edges. `collected` is
+  `Partial<Record<FieldKey, unknown>>` — untyped on purpose, since it comes back out of a JSON column a
+  model wrote into. Everything narrows at runtime rather than trusting a cast, and anything
+  unrecognised becomes null rather than throwing: a lead missing a bedroom count is still actionable,
+  while an exception in the processor loses the whole reply.
+- **The enum-case trap flagged at step 68 is closed here.** Extraction emits `'apartment'`, the database
+  wants `'APARTMENT'`. Handing one to the other is a Prisma validation error at write time, which in a
+  processor is a retry loop rather than a lead.
+- **Synced on every advance, not only the first.** A lead written once and never updated shows the owner
+  whatever was known thirty seconds in — usually a suburb and nothing else — which is worse than no
+  lead, because it looks complete.
+- **`nextLeadStatus` never regresses past an owner-set outcome.** `QUOTED`, `WON` and `LOST` are things
+  a person recorded; a customer replying afterwards reopens the conversation, and an unconditional sync
+  would quietly drag a won job back to `QUALIFYING`. This is the same shape as the clobber bug found in
+  the outbox, caught this time before it shipped. Verified: `WON` and its `wonValueCents` survive a
+  later reply.
+- **The update deliberately does not touch `ownerNotifiedAt`, the quote fields, `wonValueCents` or
+  `closedAt`.** Those belong to the notification job and to the owner. A conversation update reaching
+  into them would re-notify on a late reply and discard a recorded outcome.
+
+**A modelling problem the compiler surfaced.** `urgency` is a *signal*, not an answer — step 57 keeps it
+out of `collected` so it cannot masquerade as a satisfied question — but `leads.urgency` exists for the
+future pricing matrix. So it had nowhere to travel. It is now carried on `ConversationDecision`
+separately, and **an undefined value leaves a stored urgency alone rather than clearing it**: a reply
+that says nothing about timing is silence, not a downgrade from "urgent". Verified.
+
+**Verified 43/43**: the mapping (case-insensitive enums, unknown values to null, `0` bedrooms kept as a
+real answer for a studio, string numbers not coerced), status transitions including all three
+owner-terminal states, and the end-to-end path — a reply creates a `QUALIFYING` lead with the suburb
+promoted to a column, the next reply updates *the same* lead to `QUALIFIED` without clearing the
+urgency, an owner's `WON` survives, and the notification queue includes only qualified, un-notified
+leads. Regression: 163 unit and boot, plus 37 / 25 / 42 / 11 / 14 / 13 / 17 across the integration
+suites.
+
+**Watch out for.** The owner still receives nothing. The lead exists and `LeadsService.unnotified` is
+the queue for it, but there is no notification job, no SMS and no magic link. This step makes the record
+correct; it does not deliver it.
+
+Second: `isSpam` and `isDuplicate` are never set. They are columns with no writer, which is honest for
+now but means the flags read as "false" rather than "unknown".
 
 **Watch out for.** The 15-minute orphan sweep and the 2-minute staleness window are both wall-clock
 guesses, not measurements. If a legitimate job ever takes longer than 15 minutes — a long backoff chain
