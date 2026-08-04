@@ -12,7 +12,14 @@ import {
   SMS_PROVIDER,
   type SmsProvider,
 } from '../../telephony/sms.provider';
-import type { InboundMessageJobData } from '../queues';
+import {
+  QUEUE,
+  addJobBounded,
+  queueToken,
+  type InboundMessageJobData,
+  type NotifyOwnerJobData,
+} from '../queues';
+import { Queue } from 'bullmq';
 
 /**
  * Turns a customer's reply into the next message.
@@ -41,6 +48,8 @@ export class InboundMessageProcessor {
     private readonly leads: LeadsService,
     private readonly sendCap: SendCapService,
     @Inject(SMS_PROVIDER) private readonly sms: SmsProvider,
+    @Inject(queueToken(QUEUE.NOTIFY_OWNER))
+    private readonly notifyQueue: Queue<NotifyOwnerJobData>,
   ) {}
 
   async process(data: InboundMessageJobData): Promise<void> {
@@ -177,7 +186,7 @@ export class InboundMessageProcessor {
     // After the conversation write, deliberately. If this fails, the conversation
     // state is still correct and the retry re-syncs from it; the reverse ordering
     // would leave a lead describing a conversation that never advanced.
-    await this.leads.syncFromConversation({
+    const lead = await this.leads.syncFromConversation({
       businessId,
       customerId: message.customerId,
       conversationId: conversation.id,
@@ -188,6 +197,29 @@ export class InboundMessageProcessor {
       stillMissing: decision.stillMissing,
       urgency: decision.urgency,
     });
+
+    // Tell the owner as soon as the lead is worth telling them about — not on every
+    // reply, which would text them once per question.
+    //
+    // Enqueue failures are swallowed on purpose: `ownerNotifiedAt` is the outbox
+    // marker, so the maintenance sweep re-drives anything Redis refused. The customer's
+    // reply must not fail because the owner's copy could not be queued.
+    if (lead.status === 'QUALIFIED' && lead.ownerNotifiedAt === null) {
+      try {
+        await addJobBounded(
+          this.notifyQueue,
+          'notify-owner',
+          { leadId: lead.id, businessId },
+          { jobId: `notify-${lead.id}` },
+        );
+      } catch (error) {
+        this.logger.error(
+          `Could not queue the owner notification for lead ${lead.id}: ` +
+            `${error instanceof Error ? error.message : String(error)}. ` +
+            'It stays un-notified and the sweep will re-drive it.',
+        );
+      }
+    }
 
     await this.reply(message, businessId, decision.reply.kind, decision.reply.body);
 

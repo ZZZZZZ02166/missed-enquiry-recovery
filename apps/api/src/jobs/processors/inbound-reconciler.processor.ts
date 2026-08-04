@@ -7,6 +7,7 @@ import {
   addJobBounded,
   queueToken,
   type InboundMessageJobData,
+  type NotifyOwnerJobData,
   type RecoveryJobData,
 } from '../queues';
 
@@ -90,12 +91,79 @@ export class InboundReconcilerProcessor {
     private readonly inboundQueue: Queue<InboundMessageJobData>,
     @Inject(queueToken(QUEUE.RECOVERY))
     private readonly recoveryQueue: Queue<RecoveryJobData>,
+    @Inject(queueToken(QUEUE.NOTIFY_OWNER))
+    private readonly notifyQueue: Queue<NotifyOwnerJobData>,
   ) {}
 
   async process(): Promise<void> {
     await this.releaseOrphanedQueued();
     await this.redriveStuckPending();
     await this.redriveStuckRecoveries();
+    await this.redriveUnnotifiedLeads();
+  }
+
+  /**
+   * Deliver leads the owner was never told about.
+   *
+   * `ownerNotifiedAt` is the outbox marker for the owner's copy, exactly as
+   * `processingStatus` is for the customer's reply — so the same failure (Redis
+   * unavailable at the moment of enqueue) gets the same recovery. Without this a
+   * qualified lead would sit in the table indefinitely while the owner assumed nobody
+   * had called.
+   *
+   * Also the delivery path for a business that had no `notifyPhoneE164` when the lead
+   * arrived: the query picks them up the moment one is configured, so the backlog
+   * arrives rather than being lost to a setup gap.
+   */
+  private async redriveUnnotifiedLeads(): Promise<void> {
+    const cutoff = new Date(Date.now() - STALE_AFTER_MS);
+
+    const pending = await this.prisma.unscoped.lead.findMany({
+      where: {
+        ownerNotifiedAt: null,
+        status: { in: ['QUALIFIED', 'QUOTED'] },
+        updatedAt: { lt: cutoff },
+        // Skip businesses that cannot receive one. Without this every lead for an
+        // unconfigured business is re-enqueued every minute forever.
+        business: { notifyPhoneE164: { not: null } },
+      },
+      orderBy: { createdAt: 'asc' },
+      take: BATCH_SIZE,
+      select: { id: true, businessId: true, createdAt: true },
+    });
+
+    if (pending.length === 0) return;
+
+    const oldestAgeMs = Date.now() - (pending[0]?.createdAt.getTime() ?? Date.now());
+    this.logger.error(
+      `${BACKLOG_ALERT} ${pending.length} qualified lead(s) never reached their owner ` +
+        `(oldest ${Math.round(oldestAgeMs / 60_000)}min). Re-driving.`,
+    );
+
+    for (const lead of pending) {
+      const jobId = `notify-${lead.id}`;
+      try {
+        const existing = await this.notifyQueue.getJob(jobId);
+        if (existing) {
+          const state = await existing.getState();
+          // A completed job whose lead is still un-notified means the send did not
+          // happen — re-adding the same id would be a no-op, so it has to go first.
+          if (state === 'completed' || state === 'failed') await existing.remove();
+          else continue;
+        }
+        await addJobBounded(
+          this.notifyQueue,
+          'notify-owner',
+          { leadId: lead.id, businessId: lead.businessId },
+          { jobId },
+        );
+      } catch (error) {
+        this.logger.error(
+          `Owner-notification reconciliation halted: ${error instanceof Error ? error.message : String(error)}`,
+        );
+        return;
+      }
+    }
   }
 
   /**

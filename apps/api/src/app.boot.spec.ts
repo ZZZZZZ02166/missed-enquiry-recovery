@@ -9,6 +9,7 @@ import { FakeLlmProvider, LLM_PROVIDER, type LlmProvider } from './conversations
 import { HealthController } from './health/health.controller';
 import { InboundMessageProcessor } from './jobs/processors/inbound-message.processor';
 import { InboundReconcilerProcessor } from './jobs/processors/inbound-reconciler.processor';
+import { NotifyOwnerProcessor } from './jobs/processors/notify-owner.processor';
 import { RecoveryProcessor } from './jobs/processors/recovery.processor';
 import { QUEUE, queueToken } from './jobs/queues';
 import { PrismaService } from './prisma/prisma.service';
@@ -113,6 +114,11 @@ describe('application boot', () => {
       expect(processor.suppressions).toBeInstanceOf(SuppressionsService);
       expect(processor.sendCap).toBeInstanceOf(SendCapService);
       expect(processor.sms).toBeDefined();
+    });
+
+    it('resolves NotifyOwnerProcessor', () => {
+      const processor = app.get(NotifyOwnerProcessor, { strict: false });
+      expect(processor).toBeInstanceOf(NotifyOwnerProcessor);
     });
 
     it('resolves InboundReconcilerProcessor', () => {

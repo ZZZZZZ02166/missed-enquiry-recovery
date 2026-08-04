@@ -159,6 +159,95 @@ export function recoveryNudgeMessage(businessName: string): string {
 }
 
 /**
+ * The structured lead, texted to the owner.
+ *
+ * This is the product's primary owner surface (`docs/decisions.md`), not a courtesy
+ * copy: a cleaner mid-job will not open a dashboard, so what fits in this message is
+ * what the owner actually acts on. Hence the ordering — **the phone number is second
+ * line, above every job detail**, because the useful action is ringing the customer
+ * back before a competitor does.
+ *
+ * Written as lines rather than prose so it is scannable on a lock screen. `\n` is in
+ * the GSM-7 basic set, so the layout costs nothing.
+ *
+ * The plan's mockup used an em dash and a middle dot. Both are outside GSM-7 and would
+ * have pushed every one of these into UCS-2 — 70 characters per segment instead of
+ * 160, roughly tripling the bill for decoration (rule 5). ASCII only here.
+ *
+ * No price appears, and there is no placeholder for one. Every currency figure comes
+ * from `PriceCalculator` (rule 2), which does not exist yet.
+ */
+export function ownerLeadMessage(lead: OwnerLeadSummary): string {
+  const lines: string[] = [];
+
+  lines.push(lead.serviceType ? `New lead: ${lead.serviceType}` : 'New lead');
+
+  // Name is optional; the number never is — a lead without a callback number is not
+  // a lead, and the caller should read it at a glance rather than parse E.164.
+  lines.push([lead.customerName, lead.customerPhoneDisplay].filter(Boolean).join(' '));
+
+  const property = [
+    lead.suburb,
+    rooms(lead.bedrooms, lead.bathrooms),
+    lead.carpetedRooms ? `${lead.carpetedRooms} carpeted` : null,
+  ]
+    .filter(Boolean)
+    .join(', ');
+  if (property) lines.push(property);
+
+  if (lead.preferredDate) lines.push(`Wants: ${lead.preferredDate}`);
+
+  // Surfaced above the gaps because it changes what the owner should do first.
+  if (lead.needsHuman) {
+    lines.push(lead.needsHumanReason ? `Needs you: ${lead.needsHumanReason}` : 'Needs you');
+  }
+
+  // What the conversation could not get. Turns "why is this blank?" into a question
+  // the owner can ask on the call they are about to make.
+  if (lead.missingFields.length > 0) {
+    lines.push(`Still to confirm: ${lead.missingFields.join(', ')}`);
+  }
+
+  return normaliseToGsm7(lines.join('\n'));
+}
+
+/** What the owner template needs. Deliberately not the Prisma row — see the service. */
+export interface OwnerLeadSummary {
+  serviceType: string | null;
+  customerName: string | null;
+  /** National format, e.g. `0412 345 678`. Easier to read and to dial. */
+  customerPhoneDisplay: string;
+  suburb: string | null;
+  bedrooms: number | null;
+  bathrooms: number | null;
+  carpetedRooms: number | null;
+  preferredDate: string | null;
+  needsHuman: boolean;
+  needsHumanReason: string | null;
+  missingFields: string[];
+}
+
+function rooms(bedrooms: number | null, bathrooms: number | null): string | null {
+  const parts: string[] = [];
+  // `0` is meaningful — a studio genuinely has no bedroom — so this cannot use
+  // truthiness, the same trap as everywhere else these counts are handled.
+  if (bedrooms !== null) parts.push(`${bedrooms} bed`);
+  if (bathrooms !== null) parts.push(`${bathrooms} bath`);
+  return parts.length > 0 ? parts.join(' ') : null;
+}
+
+/**
+ * Segment ceiling for the owner message.
+ *
+ * Unlike the caller templates this cannot be one segment — a name, a number, a
+ * suburb, room counts and a date do not fit in 160 characters. Two is the realistic
+ * target and three the hard stop, asserted below against a deliberately maximal lead.
+ * Without a ceiling, a long service name plus a wordy date would silently drift to
+ * four or five segments on every lead the business ever receives.
+ */
+export const MAX_OWNER_SEGMENTS = 3;
+
+/**
  * All caller-facing templates, with a representative name for assertion.
  *
  * The name used here is deliberately at `MAX_BUSINESS_NAME`, so the check is against
@@ -187,6 +276,38 @@ export const CALLER_TEMPLATES: Record<string, (businessName: string) => string> 
 function assertAllTemplates(): void {
   for (const [name, template] of Object.entries(CALLER_TEMPLATES)) {
     assertSendable(template(WORST_CASE_NAME), `template ${name} (worst-case business name)`);
+  }
+
+  // The owner message is variable-length by nature, so it is asserted against a
+  // deliberately maximal lead: every field populated, long values throughout. If the
+  // worst realistic case fits the budget, no real lead can exceed it.
+  const worstCaseLead = ownerLeadMessage({
+    serviceType: 'End of lease clean with carpet steam',
+    customerName: 'Alexandra Constantinou',
+    customerPhoneDisplay: '0412 345 678',
+    suburb: 'Templestowe Lower',
+    bedrooms: 4,
+    bathrooms: 3,
+    carpetedRooms: 4,
+    preferredDate: 'the Wednesday after next, before midday',
+    needsHuman: true,
+    needsHumanReason: 'asked about price matching',
+    missingFields: ['bedrooms', 'bathrooms', 'preferredDate'],
+  });
+
+  const info = segmentInfo(worstCaseLead);
+  if (info.encoding !== 'GSM-7') {
+    throw new Error(
+      `owner lead template is ${info.encoding}, not GSM-7 — one stray character cuts the ` +
+        `segment size from 160 to 70 and roughly triples the bill (CLAUDE.md rule 5). ` +
+        `Offending characters: ${findNonGsm7(worstCaseLead).join(' ')}`,
+    );
+  }
+  if (info.segments > MAX_OWNER_SEGMENTS) {
+    throw new Error(
+      `owner lead template is ${info.segments} segments for a worst-case lead, over the ` +
+        `budget of ${MAX_OWNER_SEGMENTS}. Every lead this business receives pays this.`,
+    );
   }
 }
 

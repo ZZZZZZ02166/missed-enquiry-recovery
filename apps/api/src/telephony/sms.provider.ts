@@ -18,8 +18,18 @@ export interface SendSmsParams {
   to: string;
   /** E.164. The business's Twilio number. */
   from: string;
-  /** GSM-7, one segment. Asserted before the provider is called. */
+  /** GSM-7. Asserted by the provider before anything is billed. */
   body: string;
+  /**
+   * Segment budget for this message. Defaults to 1.
+   *
+   * One is right for everything the *customer* receives — those templates are written
+   * to fit, and a second segment there means a template drifted. The owner's lead
+   * summary is the deliberate exception: a name, a number, a suburb, room counts and a
+   * date do not fit in 160 characters, and it carries its own budget rather than
+   * relaxing the default for everyone.
+   */
+  maxSegments?: number;
   /**
    * Where Twilio posts delivery status. Omitted in tests and when a status callback
    * would have nowhere to land.
@@ -98,6 +108,19 @@ export class FakeSmsProvider implements SmsProvider {
 
   private counter = 0;
 
+  /**
+   * Per-instance random prefix, so generated Sids are unique the way real ones are.
+   *
+   * Not cosmetic. A plain counter restarts at 1 on construction and on `reset()`, so
+   * two runs — or one run that resets midway — mint the same `SM000…0001` and collide
+   * on the unique `provider_message_sid`. That failure surfaces as a
+   * `P2002` deep inside a processor and reads exactly like a product bug; it cost
+   * three separate debugging detours before the fake was the suspect. Real Twilio Sids
+   * are unique forever, so a fake that manufactures collisions is testing something
+   * that cannot happen.
+   */
+  private seed = randomSeed();
+
   /** Queue a failure for the next send. Used to exercise retry and suppression paths. */
   private nextFailure: PermanentSendError | Error | null = null;
 
@@ -117,6 +140,9 @@ export class FakeSmsProvider implements SmsProvider {
     this.nextFailure = null;
     this.lineTypes.clear();
     this.counter = 0;
+    // Re-seeded, not just re-counted: rows written before the reset are still in the
+    // database, and reusing the sequence would collide with them.
+    this.seed = randomSeed();
   }
 
   async sendSms(params: SendSmsParams): Promise<SendSmsResult> {
@@ -128,10 +154,11 @@ export class FakeSmsProvider implements SmsProvider {
 
     // The same assertion the real provider applies. Catching a UCS-2 template in a
     // unit test is the entire point of having the seam.
-    const info = assertSendable(params.body, `send to ${params.to}`);
+    const info = assertSendable(params.body, `send to ${params.to}`, params.maxSegments ?? 1);
 
     this.counter += 1;
-    const providerMessageSid = `SM${String(this.counter).padStart(32, '0')}`;
+    // Same shape as a real Sid: `SM` plus 32 hex characters.
+    const providerMessageSid = `SM${this.seed}${String(this.counter).padStart(24, '0')}`;
     this.sent.push({ ...params, providerMessageSid, segments: info.segments });
 
     return { providerMessageSid, status: 'queued', segments: info.segments };
@@ -150,4 +177,11 @@ export class FakeSmsProvider implements SmsProvider {
   sentTo(phoneE164: string): SendSmsParams[] {
     return this.sent.filter((s) => s.to === phoneE164);
   }
+}
+
+/** Eight hex characters, enough that two instances never collide in practice. */
+function randomSeed(): string {
+  return Math.floor(Math.random() * 0xffffffff)
+    .toString(16)
+    .padStart(8, '0');
 }

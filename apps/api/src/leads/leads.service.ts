@@ -109,6 +109,18 @@ export class LeadsService {
       update: shared,
     });
 
+    // Promote a learned name onto the customer, so the next call from this number is
+    // from someone we can greet — and so the owner's lead SMS has more than a phone
+    // number on it. Only when we have one and they do not: `upsertCustomer` refuses to
+    // overwrite a known name with nothing, and this must not undo that.
+    const learnedName = typeof input.collected.name === 'string' ? input.collected.name.trim() : '';
+    if (learnedName.length > 0) {
+      await this.prisma.db.customer.updateMany({
+        where: { id: input.customerId, businessId, name: null },
+        data: { name: learnedName },
+      });
+    }
+
     if (!existing) {
       this.logger.log(
         `Lead ${lead.id} created from conversation ${conversationId} (${status})` +

@@ -78,7 +78,7 @@ export class TwilioSmsProvider implements SmsProvider {
    * and there is no way to un-send it.
    */
   async sendSms(params: SendSmsParams): Promise<SendSmsResult> {
-    const info = assertSendable(params.body, `send to ${params.to}`);
+    const info = assertSendable(params.body, `send to ${params.to}`, params.maxSegments ?? 1);
 
     try {
       const message = await this.client.messages.create({

@@ -6,6 +6,7 @@ import { Queue } from 'bullmq';
 import { AppModule } from './app.module';
 import { InboundMessageProcessor } from './jobs/processors/inbound-message.processor';
 import { InboundReconcilerProcessor } from './jobs/processors/inbound-reconciler.processor';
+import { NotifyOwnerProcessor } from './jobs/processors/notify-owner.processor';
 import { RecoveryProcessor } from './jobs/processors/recovery.processor';
 import { RetentionProcessor } from './jobs/processors/retention.processor';
 import {
@@ -13,6 +14,7 @@ import {
   createWorkerRedisConnection,
   queueToken,
   type InboundMessageJobData,
+  type NotifyOwnerJobData,
   type QueueName,
   type RecoveryJobData,
 } from './jobs/queues';
@@ -198,6 +200,7 @@ async function bootstrap(): Promise<void> {
   const inboundProcessor = app.get(InboundMessageProcessor);
   const reconciler = app.get(InboundReconcilerProcessor);
   const retention = app.get(RetentionProcessor);
+  const notifyOwner = app.get(NotifyOwnerProcessor);
   const prisma = app.get(PrismaService);
 
   startWorker<RecoveryJobData>(
@@ -240,6 +243,15 @@ async function bootstrap(): Promise<void> {
     'reconcile-inbound': () => reconciler.process(),
     retention: () => retention.process(),
   };
+
+  // Same limiter as recovery: these are outbound sends through the same Twilio
+  // number, and bursting produces out-of-order delivery.
+  startWorker<NotifyOwnerJobData>(
+    QUEUE.NOTIFY_OWNER,
+    (data) => `lead=${data.leadId}`,
+    (data) => notifyOwner.process(data),
+    { concurrency: RECOVERY_CONCURRENCY, limiter: RECOVERY_LIMITER },
+  );
 
   startWorker<Record<string, never>>(
     QUEUE.MAINTENANCE,

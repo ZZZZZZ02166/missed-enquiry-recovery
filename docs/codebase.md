@@ -116,6 +116,7 @@ decision rather than restating the argument.
 | 72  | 2026-08-03 | `apps/api/src/telephony/send-cap.service.ts`           | Spend breaker — cap counted calls, permitted ~7× the stated limit. 17/17            |
 | 73  | 2026-08-04 | `apps/api/src/jobs/processors/retention.processor.ts` | Retention sweep — a written policy nothing enforced. 13/13                          |
 | 74  | 2026-08-04 | `apps/api/src/leads/` (mapping, service, module)      | **Leads are real** — a reply now produces an owner record. 43/43                    |
+| 75  | 2026-08-04 | `notify-owner.processor.ts` + owner template          | **THE LOOP REACHES THE OWNER** — lead SMS delivered. 30/30 + 19/19 journey          |
 
 ---
 
@@ -4113,6 +4114,81 @@ correct; it does not deliver it.
 
 Second: `isSpam` and `isDuplicate` are never set. They are columns with no writer, which is honest for
 now but means the flags read as "false" rather than "unknown".
+
+### The owner notification — the loop reaches a person
+
+**Step 75** · 2026-08-04 · `notify-owner.processor.ts`, `notifications/templates.ts`,
+`schema.prisma`, `inbound-message.processor.ts`, `inbound-reconciler.processor.ts`, `sms.provider.ts`,
+`twilio-sms.provider.ts`, `worker.ts`, `jobs.module.ts`, `leads.service.ts`
+
+**What it does.** Texts the structured lead to the owner. Everything before this produced a record; this
+is what puts it in someone's hand inside a minute — the difference between a lead and a row in a table
+nobody looks at.
+
+**A gap in the schema, found by trying to use it.** Nothing stored the owner's phone number. The locked
+decision names SMS as the *primary* owner surface, and there was nowhere to send it —
+`businesses.notifyPhoneE164` now exists, nullable, on the business rather than the user because the MVP
+ships one role and pilot businesses have one to three people.
+
+**The template.** The plan's mockup used an em dash and a middle dot; **both are outside GSM-7** and
+would have pushed every owner notification into UCS-2 — 70 characters per segment instead of 160,
+roughly tripling the bill for punctuation (rule 5). ASCII only, laid out as lines because it is read on
+a lock screen, and **the phone number sits on line two, above every job detail**: the useful action is
+ringing the customer back before a competitor does. Asserted at module load against a deliberately
+maximal lead, with its own segment budget of three — the caller templates stay at one, since a second
+segment there means a template drifted.
+
+**The bug the end-to-end test found, that nothing else would have.** `assertSendable` hard-enforces one
+segment, and both SMS providers called it with that default. The owner summary is legitimately two
+segments, so **the notification could never be sent** — it failed four attempts and died in the failed
+set. Every unit and integration test passed; only walking the whole journey to the owner's phone
+surfaced it. Fixed by threading a per-send `maxSegments` through `SendSmsParams`, so the strict default
+holds for everything customer-facing and the one message that needs more asks for it explicitly.
+
+**Durability, by the same pattern as everything else.** `ownerNotifiedAt` is both the idempotency key
+and the outbox marker. The inbound processor enqueues on `QUALIFIED`, bounded; a failure there is
+swallowed because the maintenance sweep re-drives any qualified lead the owner was never told about.
+That sweep also skips businesses with no `notifyPhoneE164` — otherwise an unconfigured business would
+re-enqueue every lead every minute forever — and delivers the backlog the moment one is configured,
+which is verified.
+
+**Ordering deliberately favours a duplicate over a silence.** The lead is marked notified *after* the
+provider accepts it. Claiming first would prevent a rare double-text at the cost of losing the
+notification entirely if the process died in between. A duplicate lead text is mildly annoying; a lead
+the owner is never told about is a lost job.
+
+**A fake that was manufacturing failures.** `FakeSmsProvider` minted Sids from a counter that restarted
+at 1 on construction and on `reset()`, so two runs — or one run that reset midway — collided on the
+unique `provider_message_sid`. It surfaced as a `P2002` deep inside a processor and read exactly like a
+product bug; it cost three separate debugging detours across steps 67, 74 and 75 before the fake was the
+suspect. Sids now carry a per-instance random prefix, as real ones do.
+
+**Also closed:** `customers.name` was collected by the conversation and written nowhere. It is now
+promoted from the answers — only when we have one and the customer does not, so it cannot undo the
+existing refusal to overwrite a known name with nothing.
+
+**Verified 30/30 on the processor and 19/19 on the full journey.** The journey test runs the compiled
+API and worker as separate processes, posts six *signed* Twilio webhooks, and follows the whole chain:
+conversation stops at the question ceiling, hands over a partial lead flagged for a human, and the owner
+receives:
+
+```
+New lead
+0412 345 760
+Needs you: Reached the 5-question limit with serviceType, suburb, bedrooms, preferredDate unanswered
+Still to confirm: serviceType, suburb, bedrooms, preferredDate
+```
+
+Regression: 164 unit and boot, plus 37 / 25 / 42 / 11 / 14 / 13 / 43 / 30 / 17 across nine integration
+suites.
+
+**Watch out for.** **There is no magic link.** The locked decision is "structured lead SMS *plus* magic
+link", and only the first half exists — a link needs the `auth` module, which does not. The owner can
+ring the customer back, which is the bulk of the value, but cannot view or reply to the thread.
+
+Second: the notification fires once, on the transition to `QUALIFIED`. A lead that later gains a
+detail does not re-notify, which is right — but there is also no digest, so a lead that never qualifies
+is never mentioned to the owner at all.
 
 **Watch out for.** The 15-minute orphan sweep and the 2-minute staleness window are both wall-clock
 guesses, not measurements. If a legitimate job ever takes longer than 15 minutes — a long backoff chain

@@ -48,6 +48,18 @@ model Business {
   /// (CLAUDE.md rule 12) — otherwise DST breaks follow-ups twice a year.
   timezone String @default("Australia/Melbourne")
 
+  /// Where the structured lead SMS goes — the owner's own mobile, E.164.
+  ///
+  /// The owner surface is SMS first and the dashboard second (docs/decisions.md): a
+  /// cleaner mid-job will not open a web page, so this number is how the product
+  /// actually delivers. Nullable because a business can exist before it is configured,
+  /// and the notify job says so explicitly rather than failing silently.
+  ///
+  /// On `businesses` rather than `users` because the MVP ships one role and pilot
+  /// businesses have one to three people. Per-user routing is an additive change to
+  /// `users` when staff invitations land.
+  notifyPhoneE164 String? @map("notify_phone_e164")
+
   /// How the owner entered their prices. Caller-facing figures are always
   /// GST-inclusive regardless (ACL single-price rule, docs/compliance.md §5).
   pricesIncludeGst Boolean @default(false)
