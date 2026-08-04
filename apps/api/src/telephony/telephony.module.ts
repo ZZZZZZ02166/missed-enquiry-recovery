@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { CallsModule } from '../calls/calls.module';
 import { MessagesController } from './messages.controller';
+import { SendCapService } from './send-cap.service';
 import { smsProviderFactory } from './sms-provider.factory';
 import { SMS_PROVIDER } from './sms.provider';
 import { TwilioSignatureGuard } from './twilio-signature.guard';
@@ -43,7 +44,10 @@ import { WebhookEventsService } from './webhook-events.service';
   // arrives via the `CallsModule` import above — the same import that gives
   // `VoiceController` its `CallsService`.
   controllers: [VoiceController, MessagesController],
-  providers: [WebhookEventsService, TwilioSignatureGuard, smsProviderFactory],
-  exports: [WebhookEventsService, SMS_PROVIDER],
+  providers: [WebhookEventsService, TwilioSignatureGuard, smsProviderFactory, SendCapService],
+  // `SendCapService` is exported because the processors that actually send live in
+  // the worker. It belongs here rather than in a module of its own: the cap is a
+  // property of the outbound SMS boundary, which is what this module owns.
+  exports: [WebhookEventsService, SMS_PROVIDER, SendCapService],
 })
 export class TelephonyModule {}

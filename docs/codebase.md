@@ -113,6 +113,7 @@ decision rather than restating the argument.
 | 69  | 2026-08-03 | _9 files — see "Durable inbound outbox"_               | **Redis-outage data-loss fix**: outbox + reconciler + degraded boot. 37/37          |
 | 70  | 2026-08-03 | _reconciler, controller, health_                       | Backlog alert + **two bugs in step 69's own reconciler**. 11/11                     |
 | 71  | 2026-08-03 | `voice.controller.ts`, reconciler, `schema.prisma`     | **Same hang in the voice webhook** — caller heard silence. 14/14                    |
+| 72  | 2026-08-03 | `apps/api/src/telephony/send-cap.service.ts`           | Spend breaker — cap counted calls, permitted ~7× the stated limit. 17/17            |
 
 ---
 
@@ -3952,6 +3953,70 @@ the call is recorded as owing a text and not written off, the reconciler re-driv
 without duplicating on a second pass, an already-recovered call is never re-driven, and a two-day-old
 one is marked `EXPIRED` and **not** texted. Regression: 163 unit and boot, 37/37 outbox, 25/25 closed
 loop, 42/42 processor, 11/11 reconciler bugs.
+
+#### `apps/api/src/telephony/send-cap.service.ts`
+
+**Step 72** · 2026-08-03 · _also `recovery.processor.ts`, `inbound-message.processor.ts`,
+`calls.service.ts`, `telephony.module.ts`, `.env.example`_
+
+**What it does.** The spend circuit breaker: one place that answers "may this business send another
+message right now?", checked at send time by both processors.
+
+**The three problems it fixes.** The cap was not missing — it was wrong, in ways that each made it
+weaker than it looked:
+
+1. **It counted calls, not messages.** The check lived in `decideRecovery` and counted calls with a
+   recovery queued. But one recovered call becomes a whole conversation — recovery, up to
+   `MAX_QUESTIONS` questions, then a handoff. Seven messages from one call. A business configured for
+   "200 SMS per day" could send roughly **1,400**. The variable name promised a ceiling the code did not
+   implement.
+2. **The inbound reply path had no cap at all** — and it is the higher-volume path of the two.
+3. **`MAX_SMS_PER_NUMBER_PER_DAY` was dead config**: declared in the env schema, defaulted, documented,
+   and never read by anything. It implied a protection nobody had written. Now wired to the per-caller
+   recontact check, with identical default behaviour.
+
+**Why it is written this way.**
+
+- **Checked at send time in the worker, not at decision time.** A job can sit in the queue while other
+  sends drain the allowance, and after an outage the reconciler releases a backlog in batches — which is
+  exactly the moment a ceiling has to hold. The call-based check in `decideRecovery` survives as a cheap
+  pre-filter that keeps hopeless work out of the queue; it is no longer the ceiling.
+- **Checked _before_ extraction on the inbound path.** Order matters more than it looks: a capped
+  conversation that has already paid for a model call has spent money to discover it was not allowed to
+  spend money. Verified — a capped reply makes zero model calls.
+- **A rolling 24-hour window, not a calendar day.** A midnight reset lets a runaway send its full
+  allowance at 23:59 and again at 00:01 — double the ceiling in two minutes, which is the exact shape of
+  the failure being guarded. Rolling also sidesteps rule 12: no day boundary to get wrong in the
+  business's timezone, no DST edge twice a year.
+- **Failed sends count.** Twilio bills a processing fee on a rejected message, and a loop that fails
+  every time is precisely the runaway this exists to stop — not counting failures would make the breaker
+  useless in the case that matters most.
+- **A capped inbound reply goes back to `PENDING`, not `SKIPPED`.** Both the cap and the kill switch are
+  temporary by design — the window rolls, the switch gets flipped back — and those customers are still
+  owed an answer. The reconciler re-drives them, and each retry costs one indexed count with no model
+  call. Verified end to end: capped, then the window rolls, then the same customer gets their reply.
+- **The kill switch reports distinctly from the cap.** Same blocking behaviour, different cause, and
+  conflating them would send someone hunting for a traffic spike that never happened.
+
+**Verified 17/17**: it counts messages where a call-based cap counted zero, blocks at the limit with a
+detail string naming the limit, makes no model call when capped, self-heals when the window rolls,
+counts failed sends, distinguishes the kill switch, and does not leak across tenants. Regression:
+163 unit and boot, 37/37 outbox, 25/25 closed loop, 42/42 processor, 11/11 reconciler bugs, 14/14
+recovery gap.
+
+**A test caught a wording problem, not a logic one:** the note persisted on the message read
+`blocked: 23/20 messages in 24h`, which does not say *which* guard stopped it. That string is stored on
+the row and read later by whoever is investigating, so the message was improved rather than the
+assertion relaxed.
+
+**Watch out for.** The cap is per business, not global. A runaway affecting many businesses at once —
+a bug in shared code rather than one tenant's traffic — multiplies by the number of tenants before
+anything stops it. A global ceiling is the natural companion and does not exist.
+
+Second: the count is a read followed by a write with no lock, so N concurrent sends can each see
+`sent < cap` and proceed. At `INBOUND_CONCURRENCY = 2` the overshoot is at most a message or two, which
+is well inside the tolerance of a cost guard — but it is not a hard limit, and calling it one would be
+wrong.
 
 **Watch out for.** The 15-minute orphan sweep and the 2-minute staleness window are both wall-clock
 guesses, not measurements. If a legitimate job ever takes longer than 15 minutes — a long backoff chain

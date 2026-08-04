@@ -200,10 +200,19 @@ export class CallsService {
         recoverySmsQueuedAt: { gte: since },
       },
     });
-    if (recent > 0) return 'RECENTLY_CONTACTED';
+    // `MAX_SMS_PER_NUMBER_PER_DAY` (default 1) is what this enforces. It was declared
+    // in the env schema and never read — config that implied a protection nobody had
+    // actually written. Reading it here keeps the same default behaviour and makes the
+    // knob real.
+    if (recent >= env.MAX_SMS_PER_NUMBER_PER_DAY) return 'RECENTLY_CONTACTED';
 
-    // Per-business daily cap. Last because it is the most expensive check and the
-    // rarest trigger.
+    // Per-business cap, counting *calls with a recovery queued*.
+    //
+    // This is a cheap pre-filter, not the ceiling. One recovered call becomes a whole
+    // conversation — recovery, questions, handoff — so counting calls here would
+    // permit several times this number of actual messages. The real ceiling counts
+    // messages at send time in `SendCapService`; this exists to keep obviously
+    // hopeless work out of the queue before it costs anything.
     const dayStart = new Date(Date.now() - 24 * 60 * 60 * 1000);
     const today = await this.prisma.db.call.count({
       where: { businessId: input.businessId, recoverySmsQueuedAt: { gte: dayStart } },

@@ -13,6 +13,7 @@ import { RecoveryProcessor } from './jobs/processors/recovery.processor';
 import { QUEUE, queueToken } from './jobs/queues';
 import { PrismaService } from './prisma/prisma.service';
 import { MessagesController } from './telephony/messages.controller';
+import { SendCapService } from './telephony/send-cap.service';
 import { SMS_PROVIDER, type SmsProvider } from './telephony/sms.provider';
 import { VoiceController } from './telephony/voice.controller';
 import { WebhookEventsService } from './telephony/webhook-events.service';
@@ -104,11 +105,13 @@ describe('application boot', () => {
         prisma: unknown;
         conversations: unknown;
         suppressions: unknown;
+        sendCap: unknown;
         sms: unknown;
       };
       expect(processor.prisma).toBeInstanceOf(PrismaService);
       expect(processor.conversations).toBeInstanceOf(ConversationsService);
       expect(processor.suppressions).toBeInstanceOf(SuppressionsService);
+      expect(processor.sendCap).toBeInstanceOf(SendCapService);
       expect(processor.sms).toBeDefined();
     });
 

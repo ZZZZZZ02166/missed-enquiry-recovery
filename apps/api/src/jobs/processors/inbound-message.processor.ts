@@ -2,6 +2,7 @@ import { Inject, Injectable, Logger } from '@nestjs/common';
 import { SuppressionsService } from '../../calls/suppressions.service';
 import { env } from '../../config/env';
 import { ConversationsService } from '../../conversations/conversations.service';
+import { SendCapService } from '../../telephony/send-cap.service';
 import type { LlmTurn } from '../../conversations/llm.provider';
 import type { CollectedAnswers } from '../../conversations/question-flow';
 import { PrismaService } from '../../prisma/prisma.service';
@@ -36,6 +37,7 @@ export class InboundMessageProcessor {
     private readonly prisma: PrismaService,
     private readonly conversations: ConversationsService,
     private readonly suppressions: SuppressionsService,
+    private readonly sendCap: SendCapService,
     @Inject(SMS_PROVIDER) private readonly sms: SmsProvider,
   ) {}
 
@@ -93,14 +95,22 @@ export class InboundMessageProcessor {
     }
 
     // Re-checked here rather than trusted from the webhook: the job may have waited
-    // while the customer sent STOP, and the state that matters is the state now.
-    if (!env.SENDING_ENABLED) {
-      this.logger.warn(`Sending disabled — leaving message ${messageId} PENDING for later`);
-      // Back to PENDING, not SKIPPED. The kill switch is temporary by design, and
-      // these customers are owed a reply once it is flipped back — the reconciler
-      // re-drives them automatically. Bounded batches keep the retry cheap while the
-      // switch is off.
-      await this.finish(messageId, businessId, 'PENDING', 'sending disabled at process time');
+    // while the customer sent STOP or the business drained its allowance, and the
+    // state that matters is the state now.
+    //
+    // **Before extraction, deliberately.** Extraction is the expensive step; a capped
+    // conversation that has already paid for a model call has spent money to discover
+    // it was not allowed to spend money.
+    const cap = await this.sendCap.check(businessId);
+    if (!cap.allowed) {
+      this.logger.warn(
+        `Not replying to message ${messageId} — ${cap.detail}. Left PENDING for later.`,
+      );
+      // Back to PENDING, not SKIPPED. Both the kill switch and the cap are temporary
+      // by design — the switch gets flipped back, the rolling window rolls — and these
+      // customers are owed a reply when that happens. The reconciler re-drives them
+      // automatically, and each retry costs one indexed count, no model call.
+      await this.finish(messageId, businessId, 'PENDING', `blocked: ${cap.detail}`);
       return;
     }
     const suppressed = await this.suppressions.isSuppressed(businessId, message.fromE164);

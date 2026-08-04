@@ -7,6 +7,7 @@ import {
   recoveryKnownContactMessage,
 } from '../../notifications/templates';
 import { PrismaService } from '../../prisma/prisma.service';
+import { SendCapService } from '../../telephony/send-cap.service';
 import {
   PermanentSendError,
   SMS_PROVIDER,
@@ -49,6 +50,7 @@ export class RecoveryProcessor {
   constructor(
     private readonly prisma: PrismaService,
     private readonly suppressions: SuppressionsService,
+    private readonly sendCap: SendCapService,
     @Inject(SMS_PROVIDER) private readonly sms: SmsProvider,
   ) {}
 
@@ -84,9 +86,16 @@ export class RecoveryProcessor {
     }
 
     // Re-checked at send time, not trusted from the decision. The kill switch may
-    // have been thrown while this job waited.
-    if (!env.SENDING_ENABLED) {
-      this.logger.warn(`Sending disabled — not sending recovery for call ${callId}`);
+    // have been thrown, or the business may have drained its allowance, while this
+    // job waited — and after an outage the reconciler releases a backlog in batches,
+    // which is exactly when a ceiling has to hold.
+    //
+    // Note this counts *messages*, while `decideRecovery` counts calls. Both exist on
+    // purpose: the call-based check keeps hopeless work out of the queue cheaply, and
+    // this one is the actual ceiling on spend.
+    const cap = await this.sendCap.check(businessId);
+    if (!cap.allowed) {
+      this.logger.warn(`Not sending recovery for call ${callId} — ${cap.detail}`);
       await this.recordNoSend(call.id, businessId, 'CAP_REACHED');
       return;
     }
