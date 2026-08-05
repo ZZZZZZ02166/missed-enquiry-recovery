@@ -1,7 +1,7 @@
 // Schema grows table by table (CLAUDE.md build protocol), not all twelve at once.
 // Landed so far: businesses, users, phone_numbers, webhook_events, customers, calls,
-//                suppressions, messages, conversations, leads.
-// Remaining: services, attachments.
+//                suppressions, messages, conversations, leads, services.
+// Remaining: attachments.
 //
 // Conventions (.claude/skills/backend/SKILL.md §4):
 //   camelCase fields, snake_case tables and columns via @map/@@map
@@ -84,6 +84,7 @@ model Business {
   messages      Message[]
   conversations Conversation[]
   leads         Lead[]
+  services      Service[]
 
   @@map("businesses")
 }
@@ -676,6 +677,131 @@ model Message {
 /// qualified lead turns out to be spam. `CONTACTED` is also absent — contact is
 /// automatic and instant here, so it would be true of every lead the moment it exists
 /// (Part 3 of the plan).
+/// How a service is priced. The four MVP strategies (docs/decisions.md, Part 6).
+///
+/// The advanced beds x baths x carpet x suburb matrix arrives as a **fifth** value
+/// plus `pricingRules`, leaving these four and every column below untouched — a purely
+/// additive migration. That constraint is why the shape is a discriminated type rather
+/// than a pile of nullable columns with implicit meaning.
+enum PricingType {
+  /// One price, always. "Oven cleaning is $70."
+  FIXED
+  /// A floor, not a price. "Prices start from $280."
+  STARTING_FROM
+  /// Rate x quantity. "3 rooms x $40 = $120."
+  PER_UNIT
+  /// No figure at all. Collect the answers and hand over.
+  MANUAL_QUOTE
+
+  @@map("pricing_type")
+}
+
+/// Whether a computed figure is binding, which decides the wording the caller sees.
+enum PriceConfidence {
+  /// The business will honour it. Rendered as a price.
+  FIRM
+  /// Rendered with "the business will confirm the final price".
+  ESTIMATE
+
+  @@map("price_confidence")
+}
+
+enum ServiceAvailability {
+  ACTIVE
+  /// Removed from the catalogue but kept for historical leads.
+  DISABLED
+  /// Booked out or seasonal. Never matched or quoted, but still visible to the owner.
+  TEMPORARILY_UNAVAILABLE
+
+  @@map("service_availability")
+}
+
+/// A thing the business sells, and how it is priced.
+///
+/// **This is the differentiator.** Without it the product is a missed-call auto-texter,
+/// which is a commodity feature resold at a third of the price. With it, a caller gets a
+/// real number in the same minute they rang — which is what actually wins the job
+/// (docs/decisions.md, Part 6).
+///
+/// **The model never reads a price from here.** Extraction returns `{ serviceId,
+/// fieldValues }` matched against this catalogue; every currency figure is computed by
+/// `PriceCalculator` from these columns (CLAUDE.md rule 2). The prices are deliberately
+/// not sent to the model at all — a figure it never sees is one it cannot improvise.
+model Service {
+  id         String @id @default(cuid())
+  businessId String @map("business_id")
+
+  /// What the owner calls it, and what the caller is told they are getting.
+  name        String
+  description String?
+
+  /// Alternative wordings the caller might use — "bond clean", "vacate clean".
+  /// Matching is the conversation's job; this is the vocabulary it matches against.
+  aliases String[]
+
+  pricingType PricingType @map("pricing_type")
+
+  /// Integer cents, AUD (rule 11). The unit rate for `PER_UNIT`, the price or floor
+  /// otherwise, null for `MANUAL_QUOTE`.
+  ///
+  /// Stored exactly as the owner entered it — `businesses.pricesIncludeGst` says
+  /// whether that included GST. The caller-facing figure is always GST-inclusive
+  /// regardless (ACL single-price rule), and that conversion is `PriceCalculator`'s,
+  /// not a second column here.
+  priceCents Int? @map("price_cents")
+
+  /// For `PER_UNIT`: what is being counted, and the bounds of a believable answer.
+  /// "12 rooms" from a two-bedroom flat is a misread, not a big job.
+  unitLabel String? @map("unit_label")
+  minUnits  Int?    @map("min_units")
+  maxUnits  Int?    @map("max_units")
+
+  /// May the system state this price unprompted?
+  ///
+  /// Separate from having a price at all: an owner may want a figure computed for the
+  /// lead without it being said to the caller. Off means the lead carries the number
+  /// and the message does not.
+  showPriceAutomatically Boolean @default(true) @map("show_price_automatically")
+
+  priceConfidence PriceConfidence @default(ESTIMATE) @map("price_confidence")
+
+  /// The owner wants to approve before anything is promised, whatever the type says.
+  requiresConfirmation Boolean @default(true) @map("requires_confirmation")
+
+  /// Field keys that must be answered before a price may be computed. Quoting a
+  /// per-room rate without knowing the rooms is how a caller is told a number the
+  /// owner will not honour.
+  requiredFields String[] @map("required_fields")
+
+  /// Per-service question overrides, same shape as `DEFAULT_QUESTIONS`. Null means the
+  /// default flow — the part that genuinely varies per business, which is why this is
+  /// JSON here rather than an `automation_rules` table (Part 3 cuts).
+  questions Json?
+
+  availability ServiceAvailability @default(ACTIVE)
+
+  /// Reserved for the `MATRIX` type: base by bedroom count, extra-bathroom charge,
+  /// carpet, suburb surcharge, weekend and urgency loading, minimum job value. Null in
+  /// the MVP, and present now so that migration adds no column to this table.
+  pricingRules Json? @map("pricing_rules")
+
+  /// The owner's own ordering in the dashboard and in any list read to a caller.
+  sortOrder Int @default(0) @map("sort_order")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  leads    Lead[]
+
+  /// One service per name per business — the owner's own list must not contain two
+  /// "End of lease clean" entries priced differently.
+  @@unique([businessId, name])
+  /// The matcher's view: this business's live catalogue, in the owner's order.
+  @@index([businessId, availability, sortOrder])
+  @@map("services")
+}
+
 enum LeadStatus {
   /// Created on the customer's first reply, before anything is known.
   NEW
@@ -769,9 +895,10 @@ model Lead {
   /// What the customer called it, in their words. Always populated.
   serviceType String? @map("service_type")
 
-  /// The matched catalogue entry. Null until the `services` table exists — at which
-  /// point this becomes a relation. Kept as a plain column now so the matching step
-  /// is an additive migration rather than a reshape.
+  /// The matched catalogue entry. Became a real relation when `services` landed —
+  /// exactly the additive migration step 68 designed for, with no reshape of the
+  /// answer columns. Null when nothing matched, which falls through to a manual quote
+  /// rather than a guess.
   serviceId String? @map("service_id")
 
   suburb        String?
@@ -834,6 +961,10 @@ model Lead {
   business     Business     @relation(fields: [businessId], references: [id], onDelete: Cascade)
   customer     Customer     @relation(fields: [customerId], references: [id], onDelete: Cascade)
   conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  /// `SetNull` rather than `Cascade`: deleting a service must not delete the leads it
+  /// produced. The lead keeps its `quoteSnapshot`, so what the customer was told
+  /// survives the service being removed.
+  service      Service?     @relation(fields: [serviceId], references: [id], onDelete: SetNull)
 
   /// The owner's inbox: open leads, newest first.
   @@index([businessId, status, createdAt])

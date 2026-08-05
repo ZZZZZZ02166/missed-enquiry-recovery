@@ -119,6 +119,8 @@ decision rather than restating the argument.
 | 75  | 2026-08-04 | `notify-owner.processor.ts` + owner template          | **THE LOOP REACHES THE OWNER** — lead SMS delivered. 30/30 + 19/19 journey          |
 | 76  | 2026-08-04 | `inbound-message.processor.ts`                        | **Lost outbound reply** — customer silence on any Twilio blip. 36/36                |
 | 77  | 2026-08-04 | `apps/api/src/jobs/processors/followup.processor.ts`  | Nudge + expiry — conversations finally have an exit. 38/38                          |
+| 78  | 2026-08-05 | `apps/api/prisma/schema.prisma`                       | `services` — the catalogue. 11th of 12 tables; `Lead.service` now a relation        |
+| 79  | 2026-08-05 | `apps/api/src/services/price-calculator.ts`           | **The only thing allowed to produce a price.** Rule 2, executable. 47/47            |
 
 ---
 
@@ -4328,6 +4330,89 @@ the database directly until a settings screen exists.
 
 Second: `EXPIRE_AFTER_HOURS` is fixed at 48 and not configurable, which is right for a pilot and wrong
 the first time a business asks for a different window.
+
+#### `apps/api/prisma/schema.prisma` — step 78 revision (`services`)
+
+**Step 78** · 2026-08-05 · _eleventh of twelve tables; only `attachments` remains_
+
+**What it does.** Adds `Service` plus three enums (`PricingType`, `PriceConfidence`,
+`ServiceAvailability`), and turns `Lead.serviceId` into a real relation.
+
+**Why it matters commercially.** Without a catalogue the product is a missed-call auto-texter, which is
+a commodity feature resold at a third of the price. With one, a caller gets a real number in the same
+minute they rang — the thing that actually wins the job (Part 6).
+
+**Why it is shaped this way.**
+
+- **Four pricing types, and a `pricingRules` column that is null in the MVP.** The advanced
+  beds × baths × carpet × suburb matrix arrives as a *fifth* enum value plus that column, leaving the
+  four strategies and every other field untouched. The reserved column is what makes that a purely
+  additive migration rather than a reshape — the extensibility promise from `docs/decisions.md` made
+  concrete rather than asserted.
+- **`priceCents` is stored exactly as the owner entered it**, with `businesses.pricesIncludeGst` saying
+  whether that included GST. The caller-facing figure is always GST-inclusive regardless, and that
+  conversion lives in `PriceCalculator` rather than in a second column that could drift.
+- **`showPriceAutomatically` is separate from having a price.** An owner may want a figure on the lead
+  without it being promised to the caller on their behalf. Two booleans would be one boolean too few.
+- **`aliases String[]`** — "bond clean", "vacate clean". Matching is the conversation's job; this is the
+  vocabulary it matches against.
+- **`Lead.service` is `onDelete: SetNull`, not `Cascade`.** Deleting a service must not delete the leads
+  it produced; the lead keeps its `quoteSnapshot`, so what the customer was told survives the service
+  being removed. Verified live.
+
+**Verified against the migrated database:** the duplicate-name constraint bites, the tenant guard covers
+`Service` (it was already in `TENANT_MODELS`), and deleting a service leaves its lead intact with a
+null `serviceId`.
+
+#### `apps/api/src/services/price-calculator.ts`
+
+**Step 79** · 2026-08-05
+
+**What it does.** Computes every currency figure this system produces. Pure, dependency-free, and the
+executable form of CLAUDE.md rule 2 — the model returns `{ serviceId, fieldValues }` and is never even
+shown the prices, so a figure it never saw is one it cannot improvise.
+
+**Why it is pure.** Money is the part where a subtle bug is a refund and a complaint rather than a stack
+trace, so it has to be exhaustively testable without a database, a queue or a model. All 47 checks run
+in milliseconds with no infrastructure.
+
+**The decisions inside it.**
+
+- **Out-of-range quantities are refused, never clamped.** "12 rooms" from a two-bedroom flat is a
+  misread; clamping it to a maximum of 8 would quote a number for work nobody described. Asking again is
+  the only honest response.
+- **Required answers gate the price.** Quoting a per-room rate without knowing the rooms is how a caller
+  is told a number that is then withdrawn — the single worst outcome for a product whose pitch is
+  "a real price in 90 seconds".
+- **`requiresConfirmation` downgrades rather than silences.** The caller still gets a figure; the
+  wording says the business will confirm. Silence loses the job, and an unqualified promise the owner
+  has not agreed to would be worse.
+- **A `STARTING_FROM` price never becomes `FIXED`**, however the owner sets confidence. A floor is not a
+  price, and the wording obligation differs.
+- **`priceCents: 0` is allowed; `null` and negatives are not.** A free callout is a legitimate choice; a
+  half-configured catalogue entry is not a free job.
+- **GST rounds half-up.** Rounding down would quote fractionally under the true GST-inclusive figure,
+  which is the direction that matters under the ACL single-price rule.
+- **It never throws.** Word-numbers, `NaN`, `Infinity`, nulls and missing keys all produce
+  `amountCents: null` with a reason, because falling through to a manual quote is always available and
+  always better than a wrong number.
+
+**Verified 47/47**, working through the plan's own Part 6 checklist: each of the four types renders
+correctly, `MANUAL_QUOTE` emits no figure at all, `PER_UNIT` respects min/max, price is withheld until
+every required answer is in, `showPriceAutomatically` off keeps the figure off the message,
+**the plan's exact GST case** (owner enters $280 ex-GST, caller is quoted $308), disabled and
+temporarily-unavailable services are never quoted, and a later price change does not rewrite an existing
+snapshot.
+
+**Watch out for.** **Nothing calls it yet.** No service matching exists, so `leads.serviceId` is still
+always null and no caller has been quoted anything. The calculator is correct and unreachable — the
+matching step and the quote wording are what connect it.
+
+Second: the `MATRIX` type is designed for but unbuilt, and the plan asks for a scratch-branch stub to
+prove the four strategies need no changes when it lands. That check has not been run.
+
+Third: `Service.questions` (per-service question overrides) has no reader — the conversation still uses
+`DEFAULT_QUESTIONS` for every business.
 
 ### Audit — step 76 close-out
 
