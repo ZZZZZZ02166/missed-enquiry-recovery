@@ -128,6 +128,7 @@ decision rather than restating the argument.
 | 83  | 2026-08-05 | `packages/shared-types/*`                            | The workspace's first shared package — catalogue rules both apps import. 80/80      |
 | 84  | 2026-08-05 | `apps/api/src/services/service-options.ts`            | **No silent `.slice(0,6)`.** Over-sized catalogue is a named failure. 142/142       |
 | 85  | 2026-08-05 | `service-catalogue.ts` + `service-options.ts`         | Block at save (`assertCatalogueValid`); alarm at send (`MISCONFIGURED`). 241/241    |
+| 86  | 2026-08-05 | `apps/api/prisma/schema.prisma`                       | `conversations.pendingChoice` + `selectedServiceId`. 15th migration. 18/18 live     |
 
 ---
 
@@ -4753,3 +4754,62 @@ matches exactly and does not stop matching when the wording around it changes.
 declared locally, so a name that validates in the dashboard is a name that appears in the menu in full.
 An unusable name still counts towards the active ceiling — the owner has it switched on and must be told
 to fix it, not have it silently ignored.
+
+---
+
+#### `apps/api/prisma/schema.prisma` — the service-selection columns
+
+**Step 86** · 2026-08-05 · migration `20260805181043_add_conversation_service_selection`
+
+**What it does.** Adds two nullable columns to `conversations`, plus the `Service` back-relation Prisma
+requires. This is the persistence the numbered menu has been waiting on since step 81.
+
+```sql
+ALTER TABLE "conversations" ADD COLUMN "pending_choice" JSONB,
+                            ADD COLUMN "selected_service_id" TEXT;
+ALTER TABLE "conversations" ADD CONSTRAINT ... FOREIGN KEY ("selected_service_id")
+  REFERENCES "services"("id") ON DELETE SET NULL ON UPDATE CASCADE;
+```
+
+Two nullable columns and one foreign key: no backfill, no default change, and in Postgres 11+ adding a
+nullable column is a metadata-only operation, so no table rewrite and no lock worth worrying about.
+Nothing reads either column until the state machine lands, so the migration is safe to deploy ahead of
+the code.
+
+**`pendingChoice` — why a JSON column and not a table.** It holds the menu exactly as sent:
+`{ stage, options: [{ position, serviceId, name }], otherPosition, reprompts }`. **This is the durable
+position-to-id mapping, and it is the entire reason the column exists.** A reply of "2" resolves against
+what was *sent*, never against a fresh catalogue read — an owner reordering services while the caller
+types would otherwise repoint that choice at a different job and therefore a different price. Same
+principle as `leads.quoteSnapshot`: what the customer was shown must not change when the owner edits
+their catalogue.
+
+It is JSON rather than a `conversation_options` table because the data is scoped to one open exchange,
+read only by the conversation that owns it, and dead the moment the choice is made. A table would be
+four columns, a foreign key and a cleanup job for something with a lifetime of two SMS.
+
+**`selectedServiceId` — why a real column and not a key in `collected`.** `collected` holds *answers to
+questions*; a service id is not an answer, it is a resolution. Keeping it a column also makes it a real
+foreign key, so a deleted service cannot leave a dangling id behind. It stays null permanently when the
+caller picked "Other" and described something the catalogue does not sell — that is a manual-quote lead,
+and inventing an id for it is the guess the whole selection flow exists to remove.
+
+**Proven against the live database, not assumed** (18 checks):
+
+- Deleting a service **nulls** `conversations.selectedServiceId` and `leads.serviceId` and deletes
+  neither row. The transcript is the record of what a customer was told; it has to survive an owner
+  tidying their catalogue.
+- The sent menu inside `pendingChoice` — including the label the customer read — outlives the service
+  row it points at.
+- Deleting the *business* still cascades, so tenant deletion is unaffected.
+
+**One finding worth the trip: `jsonb` normalises object key order.** The snapshot round-trips intact by
+value, but not byte-for-byte. Harmless for reads, and the array order that actually matters (`options`
+is the menu) is preserved. The hazard is elsewhere: this codebase uses compare-and-set writes —
+`updateMany` with the prior state in `where` — as its standard defence against state regression, and a
+CAS on `pendingChoice` would match nothing and silently do nothing. Recorded in the schema comment right
+above the column, because that is where the person about to write it will be looking. Guard the
+transition on `awaitingField` or `updatedAt` instead.
+
+**Watch out for.** No index on `selectedServiceId`. Nothing queries by it yet, and an index with no
+reader is cost without benefit — worth adding when the dashboard reports leads by service, not before.

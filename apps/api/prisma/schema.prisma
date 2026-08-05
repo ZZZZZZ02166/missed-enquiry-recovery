@@ -473,6 +473,51 @@ model Conversation {
   /// the question it answers.
   awaitingField String? @map("awaiting_field")
 
+  /// The numbered service menu exactly as it was sent, and where we are in that exchange.
+  ///
+  /// ```
+  /// { stage: 'LIST' | 'DESCRIPTION',
+  ///   options: [{ position, serviceId, name }],
+  ///   otherPosition: number,
+  ///   reprompts: number }
+  /// ```
+  ///
+  /// **This is the durable position-to-id mapping, and it is why the column exists.** A
+  /// reply of "2" is resolved against what was *sent*, never against a fresh read of the
+  /// catalogue: an owner reordering their services while the caller is typing would
+  /// otherwise repoint that choice at a different job, and therefore a different price.
+  /// `options` is a snapshot for the same reason `leads.quoteSnapshot` is — what the
+  /// customer was shown must not change when the owner edits their catalogue.
+  ///
+  /// JSON rather than a table because it is scoped to one open exchange, read only by
+  /// the conversation it belongs to, and dead the moment the choice is made. A
+  /// `conversation_options` table would be four columns, a foreign key and a cleanup job
+  /// for data with a lifetime of two SMS.
+  ///
+  /// Null when no choice is outstanding, which is most of the time.
+  ///
+  /// **Never put this column in a `where` clause.** Postgres `jsonb` normalises object
+  /// key order on write, so the value read back is equal by *value* but not by string —
+  /// proven, not assumed. A compare-and-set of the form
+  /// `updateMany({ where: { pendingChoice: <what we last wrote> } })`, which is the
+  /// pattern used elsewhere in this schema to stop state regressing, would therefore
+  /// match nothing and silently do nothing. Guard the transition on `awaitingField` or
+  /// `updatedAt` instead. Array order *is* preserved, which is what matters: `options`
+  /// is the menu.
+  pendingChoice Json? @map("pending_choice")
+
+  /// The catalogue service this conversation is about, once the customer has chosen one.
+  ///
+  /// Null until they choose, and null *permanently* when they picked "Other" and
+  /// described something the catalogue does not sell — that is a manual-quote lead, and
+  /// inventing an id for it is exactly the guess the whole selection flow exists to
+  /// remove. Nothing downstream may read a price without this being set.
+  ///
+  /// Deliberately not part of `collected`: that JSON holds answers to questions, and a
+  /// service id is not an answer, it is a resolution. Keeping it a real column also makes
+  /// it a real foreign key, so a deleted service cannot leave a dangling id behind.
+  selectedServiceId String? @map("selected_service_id")
+
   /// How many questions we have asked. The hard stop against an infinite loop: a
   /// model that keeps failing to extract must not keep texting.
   questionsAsked Int @default(0) @map("questions_asked")
@@ -498,6 +543,11 @@ model Conversation {
   call     Call?    @relation(fields: [callId], references: [id], onDelete: SetNull)
   /// Created lazily, on the customer's first reply. Null until then.
   lead     Lead?
+
+  /// `SetNull`, matching `Lead.service`. Deleting a service must never delete the
+  /// conversation that discussed it — the transcript is the record of what a customer
+  /// was told, and it has to survive the owner tidying their catalogue.
+  selectedService Service? @relation(fields: [selectedServiceId], references: [id], onDelete: SetNull)
 
   /// One open conversation per customer per business. A second missed call from
   /// someone mid-conversation must continue the existing thread, not start a rival
@@ -791,8 +841,11 @@ model Service {
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
 
-  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
-  leads    Lead[]
+  business      Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  leads         Lead[]
+  /// Conversations that resolved to this service. The back-relation Prisma requires for
+  /// `Conversation.selectedService`; nothing reads it from this side yet.
+  conversations Conversation[]
 
   /// One service per name per business — the owner's own list must not contain two
   /// "End of lease clean" entries priced differently.
@@ -912,8 +965,8 @@ model Lead {
   /// wrong silently books the wrong week.
   preferredDate String? @map("preferred_date")
 
-  urgency          LeadUrgency?
-  propertyCondition String?     @map("property_condition")
+  urgency           LeadUrgency?
+  propertyCondition String?      @map("property_condition")
 
   /// Owner-configurable add-ons — oven, windows, balcony. Shape varies per business.
   extras Json?
