@@ -121,6 +121,13 @@ decision rather than restating the argument.
 | 77  | 2026-08-04 | `apps/api/src/jobs/processors/followup.processor.ts`  | Nudge + expiry — conversations finally have an exit. 38/38                          |
 | 78  | 2026-08-05 | `apps/api/prisma/schema.prisma`                       | `services` — the catalogue. 11th of 12 tables; `Lead.service` now a relation        |
 | 79  | 2026-08-05 | `apps/api/src/services/price-calculator.ts`           | **The only thing allowed to produce a price.** Rule 2, executable. 47/47            |
+| 80  | 2026-08-05 | `apps/api/src/services/service-matcher.ts`            | Caller's words → a catalogue entry, or a refusal. The only fuzzy logic here. 45/45  |
+| 81  | 2026-08-05 | `apps/api/src/services/service-options.ts`            | The numbered list. Demotes fuzzy matching to a fallback. 83/83                      |
+| 82  | 2026-08-05 | `apps/api/src/services/service-options.ts`            | **Strict numeric only.** One bare integer or nothing; heuristics deleted. 120/120   |
+| 82a | 2026-08-05 | `apps/api/src/services/service-options.ts`            | Audit: cap-before-filter lost services; drop-loop could emit a 1-option menu. 142/142 |
+| 83  | 2026-08-05 | `packages/shared-types/*`                            | The workspace's first shared package — catalogue rules both apps import. 80/80      |
+| 84  | 2026-08-05 | `apps/api/src/services/service-options.ts`            | **No silent `.slice(0,6)`.** Over-sized catalogue is a named failure. 142/142       |
+| 85  | 2026-08-05 | `service-catalogue.ts` + `service-options.ts`         | Block at save (`assertCatalogueValid`); alarm at send (`MISCONFIGURED`). 241/241    |
 
 ---
 
@@ -4458,3 +4465,291 @@ guesses, not measurements. If a legitimate job ever takes longer than 15 minutes
 after repeated model failures — the sweep could revert a row whose job is still alive but momentarily
 absent from the queue's lookup. The `lastInboundAt` guard makes the consequence a wasted model call
 rather than a duplicate reply, but the thresholds want revisiting once there is real traffic to measure.
+
+---
+
+#### `apps/api/src/services/service-matcher.ts`
+
+**Step 80** · 2026-08-05
+
+**What it does.** Turns what a caller said — "bond clean", "can you do my oven", "just a general tidy
+up" — into the id of something the business actually sells, or refuses to decide. The step between
+extraction and `PriceCalculator`: without it there is nothing to price.
+
+**Why refusing is a first-class outcome.** No match falls through to a `MANUAL_QUOTE` lead, which is a
+lead the owner rings back — a slightly worse experience. A *wrong* match quotes the wrong price for the
+wrong job, which is a number the owner has to withdraw in front of a customer. The whole file is built
+around that asymmetry, and every threshold in it is tuned toward silence rather than a guess
+(`docs/decisions.md`, Part 6 — "never guess").
+
+**Why it is pure, like `price-calculator.ts`.** This is the only fuzzy logic in a system that is
+otherwise deterministic, so it gets the most adversarial suite in the repo: 45 checks, no database, no
+model. Two of them were written after the code and both found real defects (below).
+
+**The decisions inside it.**
+
+- **Distinctiveness is computed from the catalogue, not hard-coded.** "Clean" is meaningless in a
+  catalogue of five cleaning services and decisive in one that also does gardening. `distinctiveTokens`
+  keeps only tokens owned by exactly one service, so a word every service shares can never decide a
+  match. This is what stops "I need a clean" picking whichever of five cleaning services sorted first.
+- **Three scoring tiers, descending confidence:** the phrases are the same thing (100), one contains the
+  other at word boundaries (70–95, longer phrases score higher), or they share distinctive words. Real
+  messages — "hi, after a bond clean for next week" — almost always land in the containment tier; the
+  token tier is the fallback for short utterances.
+- **A runner-up within ten points makes the result `ambiguous`, not a winner.** Deliberately not "pick
+  the highest": if the caller's words did not distinguish two services, the conversation should ask.
+  `tiedWith` carries the candidates so the question can name them.
+- **Only `ACTIVE` services are matchable**, for the same reason `PriceCalculator` refuses the others —
+  matching a paused service quotes work that cannot be done.
+- **Plural folding is blunt on purpose.** A trailing `s` is dropped so "carpets" matches "carpet", but no
+  real stemmer is used: a stemmer folds "cleaning" and "cleaner" together, and for a business selling
+  both a clean and a cleaner that is exactly the distinction that must survive.
+
+**Two defects the suite found, both worth recording.**
+
+1. **Scoring on coverage of the catalogue name was wrong in the most common case there is.** "Can you do
+   my oven" shares one token with `Oven cleaning` — 50% of the name — and scored below the threshold, so
+   the clearest possible request matched nothing. What carries the signal is that "oven" identifies
+   exactly one service; how long the catalogue name happens to be is irrelevant to the caller. Scoring
+   moved to distinctiveness, with name coverage kept only as a small tie-breaker so "carpet steam" still
+   outranks "carpet" against `Carpet steam cleaning`.
+2. **Distinctiveness alone is meaningless in a one-service catalogue** — every token is trivially unique,
+   so after fix 1 the words "bond clean" matched `Regular home clean` on the shared word "clean". That is
+   the wrong-price failure this file exists to prevent, and it appeared *because of* the previous fix.
+   The second half of the rule is `MIN_TEXT_COVERAGE`: the overlap must also explain most of what the
+   caller said. "Bond" is left unaccounted for, which is precisely the evidence that they meant something
+   this catalogue does not sell. The `NOISE` set gained a short list of filler words ("doing", "just",
+   "hi") so that a clear request like "windows need doing" is not sunk by the same test.
+
+**Connects to.** `services` in `schema.prisma` (`name`, `aliases`, `availability`) for input;
+`price-calculator.ts` downstream — a `serviceId` from here is what gets priced. Not yet wired into
+`ConversationsService`; the `services` parameter already threaded to the LLM provider is where it lands.
+
+**Watch out for.** `MIN_CONFIDENCE`, `AMBIGUITY_MARGIN` and `MIN_TEXT_COVERAGE` are judgement calls
+tuned against invented cases, not measured ones. The pilot's job is to produce the real distribution —
+every `no_match` and every `ambiguous` should be logged with the caller's text so the thresholds can be
+set from evidence. Both defects above were of the form "a fix in one direction opened a hole in the
+other", so any retune needs the whole suite re-run, not the one case being fixed.
+
+---
+
+#### `apps/api/src/services/service-options.ts`
+
+**Step 81** · 2026-08-05 — **revised by step 82**
+
+**What it does.** Builds the numbered service list a caller picks from, and resolves their reply back to
+a service id. The list comes from the business's live `services` rows in the owner's `sortOrder`, never
+a hard-coded array:
+
+```
+What service do you need? Reply with one number only.
+
+1. End-of-lease cleaning
+2. Regular house cleaning
+3. Deep cleaning
+4. Carpet steam cleaning
+5. Other
+```
+
+**Why it exists.** `service-matcher.ts` is careful and well tested and still fuzzy. A caller replying
+"2" is not. Where the business has a catalogue, the caller picks and nothing infers.
+
+**Two safety properties hold the file up.**
+
+1. **A list position means nothing on its own.** The mapping from `2` to a service id is decided when
+   the list is *sent* and persisted with the conversation. Re-deriving it at reply time would mean an
+   owner reordering their catalogue while the caller types silently repoints the choice at a different
+   job, and therefore a different price. `isStillSelectable` is the second half: the snapshot decides
+   what the number *meant*, the live catalogue decides whether it can *still* be chosen. A service
+   disabled in between degrades to a fresh list — never to a price, never to a neighbouring service.
+2. **A reply is a selection or it is nothing.** The entire trimmed message must be one integer in range.
+   Everything else is `invalid`, gets a re-prompt, and is never fed to extraction or to the matcher.
+
+**Why strict, and what it deleted (step 82).** The first version accepted a number found *inside* a
+reply — "option 2", "two", "1,3". That flexibility cost two heuristic layers: a `UNIT_WORDS` table so
+that "2 bedrooms" could not select option 2, and a comma-splitting rule so that "1,3" was recognised as
+two choices rather than one. Both are now gone. A rule with no exceptions needs no exceptions handled,
+and the failure mode of strictness is one extra message, whereas the failure mode of a misread digit is
+the wrong job at the wrong price. The written forms `one`/`two`/`three` are rejected for the same
+reason — the moment words are accepted, "one" competes with "won" and "want".
+
+Consequence worth knowing: **`1.` and `1)` are rejected too.** Both are unambiguous, and both cost the
+caller a re-prompt. That follows the rule as specified rather than a judgement that it is ideal.
+
+**The decisions inside it.**
+
+- **No list below two active services.** A one-item menu reads as a machine failing to ask a question.
+  Zero active services is also the backward-compatibility path: every business today has no catalogue,
+  so every conversation keeps its current behaviour until an owner adds services.
+- **A two-segment budget, asserted, not assumed.** The four-service list above is 156 characters — one
+  segment today, but a business with longer names must not silently start costing three.
+  `buildServiceList` drops options from the end until it fits.
+- **No pagination, deliberately.** More round trips is the failure mode the product is designed against
+  (plan R3). Six options maximum, the owner's ordering decides who makes the cut, `Other` absorbs the
+  rest.
+- **`Other` is a conversation option, never a `Service` row.** It has no id and cannot be priced, which
+  is what stops an unmatched enquiry acquiring a price by accident.
+- **Two re-prompts, then stop** (`MAX_SELECTION_REPROMPTS`). Someone who has sent two replies that are
+  not a number will not send one on the third, and repeating the menu is both annoying and billable. At
+  the limit the enquiry is preserved for the owner with no service id and no price.
+- **The re-prompt range is generated from `otherPosition`**, so a three-service business is told "1 to
+  4" rather than a hard-coded "1 to 5".
+
+**Two defects the suite found.**
+
+1. **An emoji in a service name survived into the message body.** `normaliseToGsm7` maps lookalikes —
+   curly quotes, en dashes — which is right for text a developer wrote, and it does not remove
+   characters with no GSM-7 equivalent. Service names are not developer text: an owner typing
+   "Sarah's premium clean ✨" into the dashboard would turn every caller's list into a UCS-2 message,
+   where the limit drops from 160 characters to 70 (rule 5). Labels now strip anything still outside the
+   charset after mapping, and a name left empty by that is dropped rather than sent as a bare "3.".
+2. **`1,3` resolved to a non-choice instead of being recognised as two.** Fixed under the loose parser
+   by splitting on commas; made moot by step 82, which rejects it outright along with every other reply
+   that is not a single integer.
+
+**Two more from the step 82a audit**, both in `buildServiceList` and neither visible from the outside.
+
+3. **The option cap was applied before unusable names were dropped**, so a business whose first six
+   catalogue entries had names that clean down to nothing — emoji, punctuation — got **no list at all**,
+   even with good services further down. The good ones were sliced away before anyone noticed the first
+   six were empty. Order is now sort → clean → cap. Reachable today, and the kind of failure that would
+   have looked like "the menu just doesn't work for this customer".
+4. **The segment drop-loop could exit holding a single option** — the bound was `>=` where it needed to
+   be `>` — producing exactly the one-item menu `MIN_SERVICES_TO_LIST` exists to prevent. A probe showed
+   the loop is *currently unreachable*: six labels at the maximum length come to 279 characters against
+   a 306-character two-segment budget, so nothing is ever dropped. It would have become reachable the
+   moment anyone lengthened the header or raised a cap, which is the worst kind of latent bug — dormant
+   until an unrelated edit wakes it. The invariant is now pinned by tests that pass whether or not the
+   loop runs.
+
+Also removed in that pass: a `Number.isSafeInteger` branch in `resolveSelection` that could not change
+any answer — a 30-digit reply and a 400-digit one both fail the membership check and land on
+`out_of_range` regardless. And truncation now strips trailing dots before adding its own, so a long name
+reads as `Deep clean.` rather than `Deep clean..`.
+
+**Connects to.** `services` in `schema.prisma` (`name`, `availability`, `sortOrder`); `common/gsm7.ts`
+for the budget and the module-load assertions. Nothing calls it yet — the wiring is steps 83-85: two
+nullable columns on `conversations` (`pendingChoice Json?` holding the sent snapshot plus `stage` and
+`reprompts`, `selectedServiceId String?` FK with `SetNull`), then `ConversationsService.advance()`, then
+the processor.
+
+**Watch out for.** `resolveSelection` must be passed the **stored** snapshot, never a fresh catalogue
+read — passing a live list would compile cleanly and reintroduce the exact bug the snapshot prevents.
+And the rule that a pending numeric selection **skips the model entirely** lives in the processor, not
+here: this module can only report that a reply was invalid, it cannot stop anyone from calling the LLM
+anyway.
+
+---
+
+#### `packages/shared-types/`
+
+**Step 83** · 2026-08-05 · `package.json`, `tsconfig.json`, `eslint.config.mjs`, `src/index.ts`,
+`src/service-catalogue.ts`
+
+**What it does.** The workspace's first shared package. Holds the rules a service catalogue must satisfy
+and the defaults a new business starts with — `validateServiceName`, `validateCatalogue`,
+`MAX_ACTIVE_SERVICES`, `DEFAULT_CLEANING_SERVICES`.
+
+**Why a package rather than a file in the API.** The dashboard has to reject a bad service name while
+the owner types, and the API has to reject it again on save, because a browser is not a trust boundary.
+Two implementations of "what is a valid name" drift within weeks, and the failure is silent in both
+directions: the form accepts what the server rejects, or the server accepts what the form would have
+caught. One module imported by both is the only version of this that stays true. It is wired into
+`apps/api` and `apps/web` as `workspace:*`; `pnpm -r` builds it first because it is a dependency of both.
+
+**Runtime-agnostic on purpose.** `types: []` in its tsconfig, no `process`, no `Buffer`, no Prisma
+import. The moment a rule here reaches for a Node global it stops working in the browser, which is half
+the point of the package.
+
+**The rules, and why each one.**
+
+- **A character allowlist narrower than GSM-7.** Two reasons, and the second is the important one. The
+  name is echoed into a customer-facing SMS, so anything outside GSM-7 drops the segment limit from 160
+  characters to 70 (rule 5). And GSM-7 *includes the currency symbols* — a service called
+  "Deep clean $99" would put a price in front of a caller that never passed through `PriceCalculator`.
+  Rule 2 says every currency figure comes from the calculator; the cheapest way to keep that true is to
+  make it impossible to type one into a name. Currency gets its own issue code so the owner is told to
+  use the pricing fields rather than just "invalid character".
+- **Case-insensitive, whitespace-collapsed duplicate detection.** The database's unique index on
+  `(businessId, name)` is case-*sensitive*, so it would happily accept both "Deep clean" and
+  "deep clean" — two rows that are one service to any caller reading the menu.
+- **At least one letter.** A service named "12" is unreadable in a numbered list.
+- **Duplicate `sortOrder` rejected among active services only.** Ties make menu order depend on a
+  tiebreak the owner never chose, so the list in the dashboard stops matching the one the caller gets.
+  Among disabled services a tie cannot affect anybody, and rejecting it would be a rule the owner
+  cannot understand.
+- **Every issue returned, not the first.** A form that reveals one problem per save is how a five-field
+  mistake takes five round trips. Each issue carries a row index and an owner-readable sentence that
+  says what to do.
+- **The defaults carry no prices.** All four are `MANUAL_QUOTE` with `showPriceAutomatically: false`,
+  and that is not a placeholder — a default *price* would be a number this system invented on a
+  business's behalf and then quoted to their customers. Defaults supply the vocabulary, the owner
+  supplies every figure. They are validated against the rules at module load, so shipping a default set
+  the validator would reject is not possible.
+
+**`assertCatalogueValid` is the enforcement point (step 85).** `validateCatalogue` returns issues,
+which a caller can ignore by accident; the throwing form cannot be ignored, and every write of
+`services` rows — the dashboard endpoint, onboarding, a seed script, a future bulk import — must go
+through it. It raises `CatalogueValidationError` carrying every issue, so the API layer can turn it into
+a 422 the dashboard renders against the offending rows rather than a generic "save failed". Guarding
+writes here is precisely what turns the equivalent check at send time from a fallback into an alarm.
+
+**One defect the suite found.** `validateServiceName` threw on a non-string input, which is the worst
+possible property for validation code: the one job it has is to be the thing that does not fall over,
+and it runs against a browser form as well as a validated request body. Non-strings now read as an
+empty name. `validateCatalogue` still throws on a non-*array* deliberately — reporting "valid" for
+garbage would be a far more dangerous tolerance than a crash.
+
+**Watch out for.** `ServiceAvailability` is duplicated here rather than imported from Prisma, because
+the package must not depend on the generated client. Drift is caught for free at the call sites: the API
+passes `service.availability` into these functions, so if Prisma's enum gains a member this union lacks,
+that assignment stops compiling. The package has its own eslint config purely because `pnpm -r lint`
+silently skips a package with no `lint` script — new code that is never linted, with nothing saying so.
+
+---
+
+#### `apps/api/src/services/service-options.ts` — the silent slice removed
+
+**Step 84** · 2026-08-05
+
+**What changed.** `buildServiceList` returned `ServiceListPrompt | null` and quietly kept the first six
+active services. It now returns a discriminated `ServiceListResult` and refuses to trim.
+
+**Why the slice was wrong.** An owner with seven active services had one that was configured, switched
+on, visible in their dashboard, and unreachable by every caller — with nothing anywhere saying so. That
+is the worst class of bug in this system: not an error, just a service that never gets sold. The ceiling
+belongs where the owner can act on it, so `MAX_ACTIVE_SERVICES` is enforced at save time by the shared
+rules, and here an over-sized catalogue is reported as the configuration error it is.
+
+**Why a result and not a throw.** This runs inside a job processor answering a real customer. A throw
+fails the job, retries forever, and leaves the caller in silence. Every failure is recoverable by
+falling back to the open question — the conversation continues, the owner gets told, nobody is left
+unanswered. The three reasons are distinct because each implies a different response:
+
+| `kind` | Reason | Means | Response |
+| --- | --- | --- | --- |
+| `NO_MENU` | `NO_CATALOGUE` | fewer than two usable active services | normal; ask the open question |
+| `MISCONFIGURED` | `TOO_MANY_ACTIVE` | more active than the menu can carry | **unreachable**; alert + hand to owner |
+| `MISCONFIGURED` | `DOES_NOT_FIT` | names longer than validation allows | **unreachable**; alert + hand to owner |
+
+`null` conflated the first two, which is why the seventh service vanished quietly.
+
+**Step 85 sharpened this.** The two `MISCONFIGURED` reasons no longer fall back to the open-question
+flow, because `assertCatalogueValid` now blocks both at save: an owner *cannot* activate a seventh
+service, and cannot save a name past the validated maximum. That changes what reaching them means.
+It is no longer a configuration state to route around — it is proof that a write bypassed validation
+(a seed, a bulk import, direct SQL, a bug), so the catalogue in the database is not one any owner
+agreed to. Quietly asking an open question would hide that for as long as it took someone to notice
+by hand.
+
+Hence the union splits on `kind` rather than flattening into one list of reasons: it makes it
+*impossible* to write a handler that treats corrupt data the same way as a business that simply has not
+finished setting up. The processor's response to `MISCONFIGURED` is a handoff to the owner plus a
+`CATALOGUE_ALERT` log line — never a degraded conversation. `CATALOGUE_ALERT` follows the same
+convention as `BACKLOG_ALERT`: a constant string with no interpolation inside it, so an alert rule
+matches exactly and does not stop matching when the wording around it changes.
+
+**Also.** The old per-label cap and option ceiling are now re-exported from the shared rules rather than
+declared locally, so a name that validates in the dashboard is a name that appears in the menu in full.
+An unusable name still counts towards the active ceiling — the owner has it switched on and must be told
+to fix it, not have it silently ignored.

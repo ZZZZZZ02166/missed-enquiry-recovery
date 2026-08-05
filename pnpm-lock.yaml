@@ -68,6 +68,9 @@ importers:
       rxjs:
         specifier: ^7.8.2
         version: 7.8.2
+      shared-types:
+        specifier: workspace:*
+        version: link:../../packages/shared-types
       twilio:
         specifier: ^6.0.2
         version: 6.0.2(debug@4.4.3(supports-color@8.1.1))(supports-color@8.1.1)
@@ -138,6 +141,9 @@ importers:
       react-dom:
         specifier: ^19.2.8
         version: 19.2.8(react@19.2.8)
+      shared-types:
+        specifier: workspace:*
+        version: link:../../packages/shared-types
     devDependencies:
       '@types/node':
         specifier: ^26.1.1
@@ -157,6 +163,21 @@ importers:
       typescript:
         specifier: ^5.9.3
         version: 5.9.3
+
+  packages/shared-types:
+    devDependencies:
+      '@eslint/js':
+        specifier: ^10.0.1
+        version: 10.0.1(eslint@10.8.0(jiti@2.7.0)(supports-color@8.1.1))
+      eslint:
+        specifier: ^10.8.0
+        version: 10.8.0(jiti@2.7.0)(supports-color@8.1.1)
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
+      typescript-eslint:
+        specifier: ^8.65.0
+        version: 8.65.0(eslint@10.8.0(jiti@2.7.0)(supports-color@8.1.1))(supports-color@8.1.1)(typescript@5.9.3)
 
 packages:
 

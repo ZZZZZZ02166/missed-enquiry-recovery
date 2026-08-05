@@ -1,0 +1,30 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    // Same node16/CJS choice as apps/api, and for the same reason: this package has no
+    // "type" field, so Node treats the emitted .js as CommonJS, which is what NestJS
+    // consumes without ceremony. Next.js reads CJS packages fine, so one build output
+    // serves both apps.
+    "module": "node16",
+    "moduleResolution": "node16",
+    "lib": ["ES2023"],
+
+    "rootDir": "./src",
+    "outDir": "./dist",
+
+    // Both apps consume this as a built package, so declarations are the contract.
+    // declarationMap means "go to definition" in either app lands on the source here
+    // rather than on a .d.ts.
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true,
+    "isolatedModules": true,
+
+    // Deliberately empty: this package must stay runtime-agnostic. Pulling in @types/node
+    // would let a validation rule reach for `process` or `Buffer` and silently become
+    // unusable in the browser, which is exactly what it exists to avoid.
+    "types": []
+  },
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
+}
