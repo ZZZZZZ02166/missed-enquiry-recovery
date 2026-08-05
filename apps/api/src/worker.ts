@@ -4,6 +4,7 @@ import { Worker, type Job } from 'bullmq';
 import type IORedis from 'ioredis';
 import { Queue } from 'bullmq';
 import { AppModule } from './app.module';
+import { FollowupProcessor } from './jobs/processors/followup.processor';
 import { InboundMessageProcessor } from './jobs/processors/inbound-message.processor';
 import { InboundReconcilerProcessor } from './jobs/processors/inbound-reconciler.processor';
 import { NotifyOwnerProcessor } from './jobs/processors/notify-owner.processor';
@@ -13,6 +14,7 @@ import {
   QUEUE,
   createWorkerRedisConnection,
   queueToken,
+  type FollowupJobData,
   type InboundMessageJobData,
   type NotifyOwnerJobData,
   type QueueName,
@@ -95,6 +97,14 @@ const RECONCILE_EVERY_MS = 60_000;
  * that it runs unattended rather than being something somebody remembers to do.
  */
 const RETENTION_EVERY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * How often to look for conversations that have gone quiet.
+ *
+ * Five minutes. Nudges and expiries are measured in hours, so a tighter cadence buys
+ * nothing and a looser one delays the nudge window closing at 8pm local.
+ */
+const FOLLOWUP_EVERY_MS = 5 * 60 * 1000;
 
 async function bootstrap(): Promise<void> {
   const logger = new Logger('Worker');
@@ -201,6 +211,7 @@ async function bootstrap(): Promise<void> {
   const reconciler = app.get(InboundReconcilerProcessor);
   const retention = app.get(RetentionProcessor);
   const notifyOwner = app.get(NotifyOwnerProcessor);
+  const followup = app.get(FollowupProcessor);
   const prisma = app.get(PrismaService);
 
   startWorker<RecoveryJobData>(
@@ -236,12 +247,22 @@ async function bootstrap(): Promise<void> {
     },
   );
 
+  // Nudges are outbound sends through the same number, so they share recovery's
+  // limiter. Expiry writes no message at all, but it costs nothing to share a worker.
+  startWorker<FollowupJobData>(
+    QUEUE.FOLLOWUP,
+    (data) => `${data.kind} conversation=${data.conversationId}`,
+    (data) => followup.process(data),
+    { concurrency: RECOVERY_CONCURRENCY, limiter: RECOVERY_LIMITER },
+  );
+
   // One worker, several schedules, dispatched by job name. An unknown name is logged
   // rather than silently ignored: a scheduler whose name drifts from its handler would
   // otherwise look like it is running fine while doing nothing at all.
   const MAINTENANCE_TASKS: Record<string, () => Promise<void>> = {
     'reconcile-inbound': () => reconciler.process(),
     retention: () => retention.process(),
+    followup: () => followup.sweep(),
   };
 
   // Same limiter as recovery: these are outbound sends through the same Twilio
@@ -287,6 +308,11 @@ async function bootstrap(): Promise<void> {
       { every: RETENTION_EVERY_MS },
       { name: 'retention' },
     );
+    await maintenanceQueue.upsertJobScheduler(
+      'followup',
+      { every: FOLLOWUP_EVERY_MS },
+      { name: 'followup' },
+    );
   } catch (error) {
     // Non-fatal: the queues still work, only the automatic sweep is missing. Loud,
     // because without it a failed enqueue is once again unrecoverable.
@@ -300,7 +326,8 @@ async function bootstrap(): Promise<void> {
     `Worker started — consuming [${workers.map((w) => w.name).join(', ')}] ` +
       `(recovery ${RECOVERY_CONCURRENCY} @ ${RECOVERY_LIMITER.max}/s, ` +
       `inbound ${INBOUND_CONCURRENCY}, reconcile every ${RECONCILE_EVERY_MS / 1000}s, ` +
-      `retention every ${RETENTION_EVERY_MS / 3_600_000}h)`,
+      `retention every ${RETENTION_EVERY_MS / 3_600_000}h, ` +
+      `followup every ${FOLLOWUP_EVERY_MS / 60_000}min)`,
   );
 
   /**

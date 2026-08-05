@@ -13,6 +13,7 @@ import { CallsModule } from '../calls/calls.module';
 import { ConversationsModule } from '../conversations/conversations.module';
 import { LeadsModule } from '../leads/leads.module';
 import { TelephonyModule } from '../telephony/telephony.module';
+import { FollowupProcessor } from './processors/followup.processor';
 import { InboundMessageProcessor } from './processors/inbound-message.processor';
 import { InboundReconcilerProcessor } from './processors/inbound-reconciler.processor';
 import { NotifyOwnerProcessor } from './processors/notify-owner.processor';
@@ -110,6 +111,7 @@ const queueProviders: Provider[] = Object.values(QUEUE).map((name) => ({
     InboundReconcilerProcessor,
     RetentionProcessor,
     NotifyOwnerProcessor,
+    FollowupProcessor,
   ],
   exports: [
     REDIS_CONNECTION,
@@ -119,6 +121,7 @@ const queueProviders: Provider[] = Object.values(QUEUE).map((name) => ({
     InboundReconcilerProcessor,
     RetentionProcessor,
     NotifyOwnerProcessor,
+    FollowupProcessor,
   ],
 })
 export class JobsModule implements OnModuleInit, OnApplicationShutdown {

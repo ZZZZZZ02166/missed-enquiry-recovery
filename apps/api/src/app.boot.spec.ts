@@ -7,6 +7,7 @@ import { SuppressionsService } from './calls/suppressions.service';
 import { ConversationsService } from './conversations/conversations.service';
 import { FakeLlmProvider, LLM_PROVIDER, type LlmProvider } from './conversations/llm.provider';
 import { HealthController } from './health/health.controller';
+import { FollowupProcessor } from './jobs/processors/followup.processor';
 import { InboundMessageProcessor } from './jobs/processors/inbound-message.processor';
 import { InboundReconcilerProcessor } from './jobs/processors/inbound-reconciler.processor';
 import { NotifyOwnerProcessor } from './jobs/processors/notify-owner.processor';
@@ -114,6 +115,10 @@ describe('application boot', () => {
       expect(processor.suppressions).toBeInstanceOf(SuppressionsService);
       expect(processor.sendCap).toBeInstanceOf(SendCapService);
       expect(processor.sms).toBeDefined();
+    });
+
+    it('resolves FollowupProcessor', () => {
+      expect(app.get(FollowupProcessor, { strict: false })).toBeInstanceOf(FollowupProcessor);
     });
 
     it('resolves NotifyOwnerProcessor', () => {

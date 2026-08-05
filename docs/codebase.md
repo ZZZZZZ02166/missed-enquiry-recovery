@@ -118,6 +118,7 @@ decision rather than restating the argument.
 | 74  | 2026-08-04 | `apps/api/src/leads/` (mapping, service, module)      | **Leads are real** — a reply now produces an owner record. 43/43                    |
 | 75  | 2026-08-04 | `notify-owner.processor.ts` + owner template          | **THE LOOP REACHES THE OWNER** — lead SMS delivered. 30/30 + 19/19 journey          |
 | 76  | 2026-08-04 | `inbound-message.processor.ts`                        | **Lost outbound reply** — customer silence on any Twilio blip. 36/36                |
+| 77  | 2026-08-04 | `apps/api/src/jobs/processors/followup.processor.ts`  | Nudge + expiry — conversations finally have an exit. 38/38                          |
 
 ---
 
@@ -4265,6 +4266,69 @@ resurrected, the concurrency claim, stale abandonment, `lastInboundAt` still gua
 late-arriving older messages, and the duplicate window. Regression: 164 unit and boot, plus
 37 / 25 / 42 / 11 / 14 / 13 / 43 / 30 / 19 / 17 across ten integration suites.
 
+#### `apps/api/src/jobs/processors/followup.processor.ts`
+
+**Step 77** · 2026-08-04 · _also `jobs.module.ts`, `worker.ts`, `app.boot.spec.ts`_
+
+**What it does.** Closes conversations that stopped. `AWAITING_FIRST_REPLY` and `COLLECTING` previously
+had no exit — the gap the step 76 audit found, with `QUEUE.FOLLOWUP` declared and unconsumed and
+`conversations.nudgedAt` sitting unused. Plan item A6.
+
+**Two actions, deliberately different in kind.** A **nudge** is one message, ever, and off unless the
+owner turns it on — a second nudge to someone who ignored the first is where a transactional reply
+starts to look like marketing, which rule 10 exists to avoid. An **expiry** sends nothing at all; it is
+state only.
+
+**Driven by a periodic sweep over Postgres, not delayed BullMQ jobs.** Postgres already knows when a
+conversation went quiet; a delayed job would have to be cancelled every time the customer replies, and a
+Redis flush would silently drop every pending nudge — depending on `appendonly=yes` for that is a poor
+trade when a plain indexed query answers the question. The `@@index([state, lastInboundAt])` added with
+the table was put there for exactly this.
+
+**Rule 12, properly.** The nudge window is 8am–8pm **in the business's timezone**, computed with `Intl`
+rather than date arithmetic so DST is the platform's problem. Verified against a real DST boundary:
+`2026-01-15T02:00Z` reads 13:00 in Melbourne and 02:00 in London, and the same instant in July reads
+12:00 — a hand-rolled offset would be wrong for half the year. An invalid timezone fails **closed**: no
+nudge, rather than one at the wrong hour. It is a blunt window rather than `businesses.hours` on
+purpose — that column is unstructured JSON with no writer, and inventing a shape here would pre-empt the
+settings screen. Whatever it eventually says will be narrower than 8am–8pm.
+
+**Rule 13, applied on the way in.** `nudgedAt` is written *after* the send, so a transient Twilio failure
+leaves the nudge re-sendable rather than permanently silent. Verified explicitly.
+
+**Two real bugs the tests caught before this shipped.** Both were the same mistake: re-checking the
+conversation *state* at action time but not the condition that made it eligible.
+
+1. **Expiry would have closed a conversation that had just come back to life.** A customer replying does
+   not change the state — it stays `COLLECTING` — it only moves `lastInboundAt`. Guarding on state alone
+   meant a reply landing between the sweep and the job still got the conversation marked dead.
+2. **The nudge could be sent twice.** `markNudged` was guarded against overwriting, but nothing stopped a
+   second job from *sending* first. The marker was protected; the side effect was not.
+
+Both fixed by re-deriving **every** eligibility condition in `process()` — silence window, nudge
+enabled, one-nudge-only, and the time-of-day window — rather than trusting the sweep. The same principle
+`RecoveryProcessor` already applies: every check the decision path made is made again at action time,
+because the state that matters is the state now.
+
+**A third finding, where the code was right and the test was wrong:** after adding the "is nudging still
+enabled?" re-check, the nudge sections went to zero sends — the test business had no `automationConfig`.
+That is correct behaviour (opt-in, and an owner disabling it while a job is queued should stop it), so
+the precondition was fixed rather than the guard removed.
+
+**On expiry, an unfinished lead becomes `LOST` with `lostReason: 'no_response'`** — but a `QUALIFIED`
+one does not. The owner already has that lead; the customer going quiet afterwards is the owner's
+business to judge, not ours to write off.
+
+**Verified 38/38**, including the two bugs above, DST, opt-in behaviour, suppression, the transient-retry
+path, and that a repeated sweep enqueues no duplicates. Regression: 165 unit and boot, plus
+37 / 25 / 42 / 11 / 14 / 13 / 43 / 30 / 19 / 36 / 17 across twelve integration suites.
+
+**Watch out for.** `businesses.automationConfig` has no writer — nudging can only be enabled by editing
+the database directly until a settings screen exists.
+
+Second: `EXPIRE_AFTER_HOURS` is fixed at 48 and not configurable, which is right for a pilot and wrong
+the first time a business asks for a different window.
+
 ### Audit — step 76 close-out
 
 A deliberate sweep for the same classes of defect, rather than only re-running the suites. Recorded here
@@ -4286,10 +4350,7 @@ so the *absence* of findings is evidence rather than an assumption.
 
 **Known gaps, none of them regressions:**
 
-- **`QUEUE.FOLLOWUP` has no processor and no worker.** It is declared with a typed payload, and
-  `conversations.nudgedAt` exists unused. The consequence is real: a conversation that gets no reply
-  stays open indefinitely — no nudge, no expiry to `LOST`, and "open conversations" is not a number
-  anyone can trust. This is plan item A6, never built rather than broken.
+- ~~**`QUEUE.FOLLOWUP` has no processor and no worker.**~~ **Closed by step 77.**
 - `SESSION_SECRET` and `SESSION_COOKIE_DOMAIN` are validated at boot and read by nothing, because
   `auth` does not exist. `TWILIO_VOICE_NUMBER` is likewise unread — the voice number is resolved from
   `phone_numbers`, so the variable may simply be redundant.
