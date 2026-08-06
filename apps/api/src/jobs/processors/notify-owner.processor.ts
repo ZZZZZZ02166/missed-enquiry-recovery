@@ -2,6 +2,7 @@ import { Inject, Injectable, Logger } from '@nestjs/common';
 import { SuppressionsService } from '../../calls/suppressions.service';
 import { env } from '../../config/env';
 import { toNationalDisplay } from '../../common/phone';
+import { AuthService } from '../../auth/auth.service';
 import { MAX_OWNER_SEGMENTS, ownerLeadMessage } from '../../notifications/templates';
 import { PrismaService } from '../../prisma/prisma.service';
 import { SendCapService } from '../../telephony/send-cap.service';
@@ -28,6 +29,7 @@ export class NotifyOwnerProcessor {
     private readonly prisma: PrismaService,
     private readonly suppressions: SuppressionsService,
     private readonly sendCap: SendCapService,
+    private readonly auth: AuthService,
     @Inject(SMS_PROVIDER) private readonly sms: SmsProvider,
   ) {}
 
@@ -108,9 +110,53 @@ export class NotifyOwnerProcessor {
       needsHuman: lead.needsHuman,
       needsHumanReason: lead.needsHumanReason,
       missingFields: lead.missingFields,
+      magicLink: await this.magicLinkFor(businessId, lead.id),
     });
 
     await this.send(lead.id, businessId, from, ownerPhone, body);
+  }
+
+  /**
+   * A one-time login that lands the owner on this lead.
+   *
+   * **Never throws.** A failure here must not cost the owner their lead: the name, the
+   * number and the job details are what win the work, and a text without a link is worth
+   * far more than no text at all. So a missing user, a database hiccup or a
+   * misconfiguration degrades the message rather than failing the job — which would
+   * otherwise retry, and keep failing, on a business that has no user row yet.
+   *
+   * Picks the oldest user of the business. Every pilot business has exactly one, and
+   * per-user routing is an additive change for when staff invitations land — the same
+   * reasoning that put `notifyPhoneE164` on `businesses` rather than on `users`.
+   *
+   * The link is minted fresh on every notification and overwrites any previous one. That
+   * is deliberate: the owner's most recent lead text always works, and older texts stop
+   * working, which is the right trade for a credential sitting in a message history.
+   */
+  private async magicLinkFor(businessId: string, leadId: string): Promise<string | null> {
+    try {
+      const user = await this.prisma.db.user.findFirst({
+        where: { businessId },
+        orderBy: { createdAt: 'asc' },
+        select: { id: true },
+      });
+
+      if (!user) {
+        this.logger.warn(
+          `Business ${businessId} has no user, so the lead SMS carries no link. ` +
+            'The lead still sends.',
+        );
+        return null;
+      }
+
+      return await this.auth.mintLinkForUser(user.id, `/leads/${leadId}`);
+    } catch (error) {
+      this.logger.error(
+        `Could not mint a magic link for lead ${leadId}: ` +
+          `${error instanceof Error ? error.message : String(error)}. Sending without one.`,
+      );
+      return null;
+    }
   }
 
   /**

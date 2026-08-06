@@ -9,6 +9,7 @@ import {
 } from '@nestjs/common';
 import { Queue } from 'bullmq';
 import type IORedis from 'ioredis';
+import { AuthModule } from '../auth/auth.module';
 import { CallsModule } from '../calls/calls.module';
 import { ConversationsModule } from '../conversations/conversations.module';
 import { LeadsModule } from '../leads/leads.module';
@@ -102,7 +103,7 @@ const queueProviders: Provider[] = Object.values(QUEUE).map((name) => ({
  */
 @Global()
 @Module({
-  imports: [CallsModule, TelephonyModule, ConversationsModule, LeadsModule],
+  imports: [AuthModule, CallsModule, TelephonyModule, ConversationsModule, LeadsModule],
   providers: [
     connectionProvider,
     ...queueProviders,

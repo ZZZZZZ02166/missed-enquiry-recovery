@@ -140,6 +140,7 @@ decision rather than restating the argument.
 | 95  | 2026-08-06 | `apps/api/src/auth/auth.service.ts`                   | The authentication boundary. Open redirect found and fixed. 45/45                   |
 | 96  | 2026-08-06 | `apps/api/src/auth/cookies.ts` + `session.guard.ts`   | **Rule 1 becomes enforceable on HTTP.** 13/13 in CI                                 |
 | 97  | 2026-08-06 | `auth.controller.ts` + `auth.module.ts` + `app.module.ts` | Auth is mounted. Login works end to end. 9/9 HTTP                              |
+| 98  | 2026-08-06 | `templates.ts` + `notify-owner.processor.ts` + `jobs.module.ts` | **The lead SMS link is a working login.** D6 delivered. 37/37           |
 
 ---
 
@@ -5399,3 +5400,53 @@ invalidates the cookie for subsequent requests; and — the important one — a 
 **Watch out for.** `POST /auth/request-link` still has no rate limit. It is not an enumeration oracle,
 but it is unauthenticated and writes to `users` on every call, so it needs a per-address throttle before
 it faces the internet.
+
+---
+
+#### The magic link reaches the owner
+
+**Step 98** · 2026-08-06 · `notifications/templates.ts`,
+`jobs/processors/notify-owner.processor.ts`, `jobs/jobs.module.ts`
+
+**What it does.** Puts a real, working, single-use login at the bottom of the lead SMS. This is D6
+delivered: the owner's primary surface is a text message with a link, and until now that text has been
+arriving with nothing to tap.
+
+```
+New lead: End of lease clean
+Sarah 0412 345 750
+Southbank, 2 bed 2 bath, 1 carpeted
+Wants: next Tuesday
+http://localhost:3000/auth/callback?token=im-DljO8...&next=%2Fleads%2Fcmshbztxi
+```
+
+**The link is last and on its own line.** An SMS client only auto-links a URL whose end it can find;
+anything following it on the same line risks being swallowed into the link. A lead text whose link does
+not tap is a lead text that does not work.
+
+**Minting never throws.** A missing user, a database hiccup or a misconfiguration degrades the message
+rather than failing the job. The name, the number and the job details are what win the work — a text
+without a link is worth far more than no text, and a job that retries forever on a business with no user
+row is worse than both. The suite shows the warning firing and the lead sending anyway.
+
+**Minted fresh every time, overwriting the last.** The owner's most recent lead text always works and
+older ones stop working. For a credential that lives in a message history indefinitely, that is the
+right trade.
+
+**The oldest user of the business gets the link.** Every pilot business has exactly one; per-user
+routing is an additive change for when staff invitations land — the same reasoning that put
+`notifyPhoneE164` on `businesses` rather than `users`.
+
+**The segment budget is now exactly full.** A worst-case lead with a link is **413 characters, 3 of 3
+segments** — the assertion in `templates.ts` was extended to include a realistic link, because leaving
+the single biggest contributor out of the worst case would have made the budget a fiction. A typical
+lead is 2 segments. The link alone is 138 characters, so it dominates: a short `/l/<token>` route would
+buy back roughly 90 characters and is the obvious optimisation if the message ever needs to grow.
+
+**What the suite proves.** The SMS carries a link; it is on its own line; it points at *this* lead; the
+token in it **logs the owner in**, resolves to the right user and the right business, and works exactly
+once.
+
+**Watch out for.** Because the budget is exactly full, any new field on the owner template pushes a
+worst-case lead to four segments. The module-load assertion will catch it — but the fix at that point is
+to shorten the link, not to raise `MAX_OWNER_SEGMENTS`.

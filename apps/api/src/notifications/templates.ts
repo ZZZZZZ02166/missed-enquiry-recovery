@@ -222,6 +222,11 @@ export function ownerLeadMessage(lead: OwnerLeadSummary): string {
     lines.push(`Still to confirm: ${lead.missingFields.join(', ')}`);
   }
 
+  // Last, and on its own line. An SMS client only auto-links a URL it can find the end
+  // of, so anything after it on the same line risks being swallowed into the link — and
+  // a lead text whose link does not tap is a lead text that does not work.
+  if (lead.magicLink) lines.push(lead.magicLink);
+
   return normaliseToGsm7(lines.join('\n'));
 }
 
@@ -239,6 +244,15 @@ export interface OwnerLeadSummary {
   needsHuman: boolean;
   needsHumanReason: string | null;
   missingFields: string[];
+  /**
+   * A one-time login that lands on this lead. Null when one could not be minted.
+   *
+   * Null is a degraded but valid message: the owner still gets the name, number and job
+   * details, which is the part that wins the work. A lead SMS with no link is worse than
+   * one with a link; a lead SMS that never arrives because link-minting failed is worse
+   * than both.
+   */
+  magicLink: string | null;
 }
 
 function rooms(bedrooms: number | null, bathrooms: number | null): string | null {
@@ -307,6 +321,13 @@ function assertAllTemplates(): void {
     needsHuman: true,
     needsHumanReason: 'asked about price matching',
     missingFields: ['bedrooms', 'bathrooms', 'preferredDate'],
+    // A realistic worst-case link: a long https origin, the 43-character token, and an
+    // encoded `next` carrying a cuid. This is the single biggest contributor to the
+    // message length, so leaving it out of the assertion would make the budget a
+    // fiction.
+    magicLink:
+      'https://app.missed-enquiry-recovery.com.au/auth/callback' +
+      `?token=${'T'.repeat(43)}&next=%2Fleads%2F${'c'.repeat(25)}`,
   });
 
   const info = segmentInfo(worstCaseLead);
