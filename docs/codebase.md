@@ -136,6 +136,7 @@ decision rather than restating the argument.
 | 91  | 2026-08-06 | `apps/api/src/leads/leads.service.ts`                 | The lead records what the customer was told, frozen. 68/68 e2e                      |
 | 92  | 2026-08-06 | `apps/api/src/services/currency-guard.spec.ts`        | **Rule 2 fails the build now.** Static scan + adversarial case. 3/3 jest            |
 | 93  | 2026-08-06 | `apps/api/prisma/schema.prisma`                       | Auth fields on `users`. Still 12 tables. 16th migration                             |
+| 94  | 2026-08-06 | `apps/api/src/auth/tokens.ts` (+ spec)                | Magic-link and session crypto. Pure, 14/14 in CI                                    |
 
 ---
 
@@ -5201,3 +5202,52 @@ everywhere" and "this account may be compromised" answerable at all.
 have one. It is small enough not to matter at pilot scale, but a partial index (`WHERE
 magic_link_token_hash IS NOT NULL`) is the right shape once there are real users — Prisma cannot express
 it, so it would be a hand-written migration.
+
+---
+
+#### `apps/api/src/auth/tokens.ts`
+
+**Step 94** · 2026-08-06
+
+**What it does.** The cryptography behind magic links and sessions. Pure — no Nest, no Prisma, no
+environment — so every security property is testable without standing anything up, which for this kind
+of code is the difference between "we believe this" and "this is checked". Its spec is a jest spec, not
+a scratchpad probe, so it runs on every commit.
+
+**Two different things live here and must not be confused.** A magic-link token is a random secret sent
+to a person: stored hashed, single-use, expires in minutes. A session cookie is a signed statement sent
+to a browser: not stored at all, carrying its own claims and signature. The first is a bearer credential,
+the second an assertion. Conflating them is how systems end up with sessions that cannot be revoked, or
+links that never expire.
+
+**Plain SHA-256 for the link token, deliberately.** This is the one place where "just hash it" is right
+rather than lazy. A password needs a slow KDF because it has perhaps 40 bits of entropy and gets reused;
+this token has 256 bits from the OS CSPRNG and a fifteen-minute life. There is no dictionary to run and
+no reuse to protect against, and a slow hash on an unauthenticated endpoint is a denial-of-service
+amplifier.
+
+**A hand-rolled session token rather than a JWT library.** JWT's flexibility is its weakness — `alg:
+none`, algorithm confusion, and a dozen claim conventions nobody validates. Here there is exactly one
+algorithm, the verifier never reads one from the token, and the claim set is four fields defined in this
+file. Nothing to confuse.
+
+**The signature is checked before the payload is parsed.** `JSON.parse` on attacker-controlled bytes is
+somewhere to be careful, and there is no reason to go there until the bytes are proven to be ours. The
+spec covers it directly with a payload that would throw if it were reached first.
+
+**Constant-time comparison, and what it does and does not hide.** `a === b` on a signature returns as
+soon as a byte differs, and that timing is an oracle an attacker walks one byte at a time.
+`timingSafeEqual` needs equal lengths, so a length mismatch answers first — leaking only the length,
+which is fixed for a SHA-256 HMAC and therefore reveals nothing.
+
+**What the spec proves.** 1000 generated tokens are unique and URL-safe; the hash is deterministic and
+does not contain the token; a cookie signed with a different secret is rejected; **claims cannot be
+edited** — the actual attack is minting a session for one tenant, swapping `businessId`, and reading
+another business's leads, and it is tested as such; expiry cannot be extended; the unsigned `alg: none`
+shape is refused; malformed input never throws; and a validly signed cookie with structurally wrong
+claims is still rejected, which is what protects against a cookie minted by an older version of this
+code.
+
+**Watch out for.** `SESSION_TTL_MS` is thirty days because the owner is a sole trader checking a lead on
+a phone between jobs, and re-authenticating weekly is how a product stops being opened. Expiry is *not*
+the revocation mechanism — `sessionEpoch` is, and it is carried in the claims for exactly that reason.
