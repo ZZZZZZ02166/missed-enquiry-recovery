@@ -139,6 +139,7 @@ decision rather than restating the argument.
 | 94  | 2026-08-06 | `apps/api/src/auth/tokens.ts` (+ spec)                | Magic-link and session crypto. Pure, 14/14 in CI                                    |
 | 95  | 2026-08-06 | `apps/api/src/auth/auth.service.ts`                   | The authentication boundary. Open redirect found and fixed. 45/45                   |
 | 96  | 2026-08-06 | `apps/api/src/auth/cookies.ts` + `session.guard.ts`   | **Rule 1 becomes enforceable on HTTP.** 13/13 in CI                                 |
+| 97  | 2026-08-06 | `auth.controller.ts` + `auth.module.ts` + `app.module.ts` | Auth is mounted. Login works end to end. 9/9 HTTP                              |
 
 ---
 
@@ -5350,3 +5351,51 @@ attributes are what matter, and no library would have chosen them for us.
 **Watch out for.** `readCookie` returns the *first* match when a name appears twice. That is what
 browsers do, but a proxy that folds duplicate `Cookie` headers could produce one — worth knowing if a
 session ever behaves as though it is a step behind.
+
+---
+
+#### `apps/api/src/auth/auth.controller.ts` and `auth.module.ts`
+
+**Step 97** · 2026-08-06
+
+**What it does.** Mounts authentication. Four routes — `POST /auth/request-link`,
+`GET /auth/callback`, `GET /auth/me`, `POST /auth/logout` — and the module wiring that puts them in the
+graph. Login now works end to end.
+
+**`/auth/callback` is a GET that mutates**, which is normally wrong and is right here. The request is a
+top-level navigation from an SMS app, and there is no way to make a phone issue a POST by tapping a
+link. It is safe because `consumeMagicLink` is a compare-and-set: the link-preview fetch that beats the
+human to the URL consumes the token, and the human's tap then fails closed rather than logging somebody
+in twice.
+
+**The guard is opt-in, not a global `APP_GUARD`.** A global guard would also cover the Twilio webhooks,
+which authenticate by signature rather than cookie, so they would need a `@Public()` opt-out — and
+opt-out security fails open. Forget the decorator on a webhook and it breaks loudly; forget it the other
+way and a route is silently unprotected. `@UseGuards(SessionGuard)` fails closed, and `@Session()`
+throws if the guard was left off.
+
+**`request-link` answers identically for a real and an unknown address**, asserted byte-for-byte in the
+HTTP spec. A 404 here would be an account-enumeration oracle, and this product's customers are listed
+on Google Maps with their business email.
+
+**A stub, stated rather than hidden.** `request-link` mints the link and logs it at debug; it does not
+send anything, because the address is an email and no email transport exists yet. Logged at debug and
+never at info — the string is a live credential.
+
+**One thing corrected mid-step.** The controller initially carried its own copy of the redirect
+validator, on a "defence in depth" argument. That argument is weak against the evidence: duplicating the
+GSM-7 label sanitiser in step 89 produced a copy missing a step the original had already been fixed for.
+`safeRedirect` is now exported from `auth.service.ts` and called from both places — the callback still
+re-validates `next` on the way out, because it round-tripped through a user-controlled URL, but it does
+so through the one implementation.
+
+**What the HTTP spec proves** (9 tests, real Nest + Express + Postgres): a protected route rejects with
+no cookie and with a junk cookie; the 401 body never says *why*; the full magic-link flow sets a
+`HttpOnly; SameSite=Lax` cookie that `GET /auth/me` and a protected route both accept; a replayed link
+lands on `/auth/expired` and sets **no** cookie; `next=//evil.example` cannot escape the site; logout
+invalidates the cookie for subsequent requests; and — the important one — a controller using
+`@Session()` **without** the guard returns 500 rather than a tenant-less 200.
+
+**Watch out for.** `POST /auth/request-link` still has no rate limit. It is not an enumeration oracle,
+but it is unauthenticated and writes to `users` on every call, so it needs a per-address throttle before
+it faces the internet.

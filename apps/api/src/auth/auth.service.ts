@@ -222,8 +222,14 @@ export class AuthService {
  * So: must start with a single slash, must not begin with two slash-ish characters, must
  * contain no backslash, and must not carry a scheme. Anything else falls back to the root
  * — a wrong landing page is a minor annoyance, an open redirect is a security incident.
+ *
+ * Exported because the callback re-validates on the way out. `next` round-trips through a
+ * URL the user controls, so it is checked again on return rather than trusted because we
+ * minted it — but by calling *this* function, not a copy of it. Writing the same
+ * validator twice is what produced the GSM-7 label bug in step 89, where the second copy
+ * silently omitted a step the first had already been fixed for.
  */
-function safeRedirect(path: string): string {
+export function safeRedirect(path: string): string {
   const candidate = (path ?? '').trim();
   if (!candidate.startsWith('/')) return '/';
   if (/^[/\\]{2}/.test(candidate)) return '/';
