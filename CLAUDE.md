@@ -146,10 +146,22 @@ Health: `curl http://localhost:3101/health` (liveness) · `/health/ready` (datab
 
 **Environment notes**
 
-- **Node.** `.nvmrc` pins **24**. This machine runs 25.8.0, which Prisma warns about (it supports
-  20.19+, 22.12+, 24.x). Everything works today, but 25 is a non-LTS odd release Prisma doesn't test
-  against — production should run 24.
+- **Node lives in the repo.** `.tools/node` holds **v24.19.0**, the version `.nvmrc` pins and the one
+  production should run. Claude Code sessions pick it up from `env.PATH` in `.claude/settings.json`;
+  for your own shell, `source .tools/env.sh`. Gitignored, checksum-verified against nodejs.org's
+  published `SHASUMS256.txt`.
+
+  It is there because Homebrew's Node 25.8.0 broke: a `brew upgrade` moved `llhttp` from 9.3 to 9.4.3
+  and the binary is linked against `libllhttp.9.3.dylib`, so every `node`, `npx` and `pnpm` invocation
+  now dies in dyld before running any JavaScript. Rather than repair Homebrew globally, the project
+  carries its own — which also moves local development onto the version Prisma actually supports
+  (25 is a non-LTS odd release it does not test against).
 - **Ports.** The API is on **3101**, not 3001: 3001 is taken by an unrelated project on this machine.
+  Postgres is on **5433**, not 5432: a Homebrew `postgresql@17` service binds `127.0.0.1:5432` and wins
+  over Docker's wildcard bind for anything connecting to localhost, so the app silently reached the
+  wrong server and failed with `role "mer" does not exist` while the right container sat there healthy.
+  Moving our own port keeps the fix inside the repo and survives Homebrew starting that service again.
+  `DATABASE_URL` must say `:5433`.
 - **ESLint.** The API is on ESLint 10; `apps/web` is pinned to **9** because `eslint-plugin-react`
   (transitive via `eslint-config-next`) is not yet ESLint 10 compatible.
 

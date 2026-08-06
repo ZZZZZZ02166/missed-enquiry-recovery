@@ -7,8 +7,8 @@ import { SendCapService } from '../../telephony/send-cap.service';
 import type { LlmTurn } from '../../conversations/llm.provider';
 import type { CollectedAnswers } from '../../conversations/question-flow';
 import { PrismaService } from '../../prisma/prisma.service';
-import { MAX_LIST_SEGMENTS } from '../../services/service-options';
-import type { MessagePurpose } from '../../generated/prisma/client';
+import { MAX_LIST_SEGMENTS, type CatalogueEntry } from '../../services/service-options';
+import { Prisma, type MessagePurpose } from '../../generated/prisma/client';
 import {
   PermanentSendError,
   SMS_PROVIDER,
@@ -74,6 +74,9 @@ const MAX_FLUSH_BATCH = 5;
  * owner notification unsendable, and it would have done exactly the same to the menu —
  * silently, on the first business with four services.
  */
+/** See `activeCatalogue` — a ceiling on a per-message query, not a business rule. */
+const CATALOGUE_QUERY_LIMIT = 100;
+
 function segmentAllowance(purpose: MessagePurpose | null): number {
   return purpose === 'QUALIFICATION' ? MAX_LIST_SEGMENTS : 1;
 }
@@ -195,9 +198,12 @@ export class InboundMessageProcessor {
         questionsAsked: conversation.questionsAsked,
         needsHuman: conversation.needsHuman,
         needsHumanReason: conversation.needsHumanReason,
+        pendingChoice: conversation.pendingChoice,
+        selectedServiceId: conversation.selectedServiceId,
       },
       inboundText: message.body,
       priorTurns: await this.priorTurns(businessId, message.customerId, message.createdAt),
+      catalogue: await this.activeCatalogue(businessId),
     });
 
     if (decision.awaitingField && conversation.awaitingField) {
@@ -228,6 +234,18 @@ export class InboundMessageProcessor {
         questionsAsked: decision.questionsAsked,
         needsHuman: decision.needsHuman,
         needsHumanReason: decision.needsHumanReason,
+        // Written on every advance, never left alone. An outstanding menu that is not
+        // explicitly cleared is one the *next* reply gets resolved against, long after
+        // the question stopped applying — so the decision always states which it is.
+        // `DbNull` sets SQL NULL; a plain `null` on a `Json?` column is ambiguous in
+        // Prisma and would not clear it. The cast is the interface-to-`InputJsonObject`
+        // boundary — a declared interface has no index signature, which is what Prisma's
+        // JSON input type requires.
+        pendingChoice:
+          decision.pendingChoice === null
+            ? Prisma.DbNull
+            : (decision.pendingChoice as unknown as Prisma.InputJsonObject),
+        selectedServiceId: decision.selectedServiceId,
         lastInboundAt: message.createdAt,
         completedAt: decision.state === 'COMPLETE' ? new Date() : null,
       },
@@ -340,7 +358,11 @@ export class InboundMessageProcessor {
       this.logger.log(`Reopening expired conversation ${existing.id}`);
       return this.prisma.db.conversation.update({
         where: { id: existing.id, businessId },
-        data: { state: 'COLLECTING' },
+        // The menu goes with the expiry. A conversation only expires after 48 hours of
+        // silence, so whatever they are saying now is not an answer to a list they were
+        // sent two days ago — and resolving "1" against it would attribute a service
+        // they never chose in this exchange. They get asked again.
+        data: { state: 'COLLECTING', pendingChoice: Prisma.DbNull },
       });
     }
     if (existing) return existing;
@@ -350,6 +372,28 @@ export class InboundMessageProcessor {
     this.logger.log(`Starting a conversation for customer ${customerId} from an inbound reply`);
     return this.prisma.db.conversation.create({
       data: { businessId, customerId, state: 'AWAITING_FIRST_REPLY', lastInboundAt: null },
+    });
+  }
+
+  /**
+   * The business's active services, for building a menu and for re-validating a choice.
+   *
+   * `ACTIVE` only. A disabled or deleted service is absent from this list, and
+   * `isStillSelectable` correctly refuses anything it cannot find — so the two cases
+   * collapse into one without a second query.
+   *
+   * Bounded by `take`. Valid data cannot exceed `MAX_ACTIVE_SERVICES`, but this runs on
+   * every inbound reply and a catalogue that bypassed validation is exactly the case
+   * where the number could be large. Anything over the limit trips `TOO_MANY_ACTIVE`
+   * either way, so the cap costs nothing except a slightly under-reported count in the
+   * alert detail.
+   */
+  private async activeCatalogue(businessId: string): Promise<CatalogueEntry[]> {
+    return this.prisma.db.service.findMany({
+      where: { businessId, availability: 'ACTIVE' },
+      select: { id: true, name: true, availability: true, sortOrder: true },
+      orderBy: { sortOrder: 'asc' },
+      take: CATALOGUE_QUERY_LIMIT,
     });
   }
 

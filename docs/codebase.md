@@ -130,6 +130,7 @@ decision rather than restating the argument.
 | 85  | 2026-08-05 | `service-catalogue.ts` + `service-options.ts`         | Block at save (`assertCatalogueValid`); alarm at send (`MISCONFIGURED`). 241/241    |
 | 86  | 2026-08-05 | `apps/api/prisma/schema.prisma`                       | `conversations.pendingChoice` + `selectedServiceId`. 15th migration. 18/18 live     |
 | 87  | 2026-08-05 | `apps/api/src/conversations/conversations.service.ts` | The selection state machine. Menu replies never reach the model. 87/87              |
+| 88  | 2026-08-06 | `apps/api/src/jobs/processors/inbound-message.processor.ts` | Catalogue loaded, columns persisted. The menu reaches a real caller. 51/51 e2e |
 
 ---
 
@@ -4889,3 +4890,60 @@ ceiling, not a licence — every fixed prompt is asserted to one segment at modu
 (`question-flow.ts`, `service-options.ts`), and the only variable-length qualification body is the menu,
 which `buildServiceList` budget-checks when it builds it. If a genuinely long qualification message is
 ever added, that assertion is the thing protecting the bill, so do not weaken it.
+
+---
+
+#### `apps/api/src/jobs/processors/inbound-message.processor.ts` — catalogue wiring
+
+**Step 88** · 2026-08-06
+
+**What it does.** Closes the loop. The state machine has been able to build a menu since step 87, but
+nobody passed it a catalogue and nobody saved what it decided — so the whole feature was inert. Four
+changes make it real:
+
+1. **`activeCatalogue(businessId)`** — `ACTIVE` services only, tenant-scoped, ordered by `sortOrder`.
+   A disabled or deleted service is simply absent from the list, and `isStillSelectable` refuses
+   anything it cannot find, so both cases collapse into one without a second query.
+2. **The snapshot passed to `advance()`** now carries `pendingChoice` and `selectedServiceId`.
+3. **Both columns persisted** on every advance.
+4. **Reopening an `EXPIRED` conversation clears `pendingChoice`.**
+
+**Why (4) matters, and why it was nearly missed.** The reopen path predates the column. A conversation
+only expires after 48 hours of silence, so a reply arriving now is not an answer to a list sent two days
+ago — but the old snapshot would still have been there to resolve it against, and `"1"` would have
+attributed a service the customer never chose in this exchange. The menu goes with the expiry.
+
+**`Prisma.DbNull`, not `null`.** On a `Json?` column a plain `null` is ambiguous in Prisma and does not
+clear the field. Clearing the menu is not optional bookkeeping: an outstanding choice left behind is one
+the *next* reply gets resolved against, long after the question stopped applying.
+
+**The query is capped at 100 rows.** Valid data cannot exceed `MAX_ACTIVE_SERVICES`, but this runs on
+every inbound reply, and a catalogue that bypassed validation is exactly the case where the number could
+be large. Anything over the limit trips `TOO_MANY_ACTIVE` either way, so the cap costs nothing but a
+slightly under-reported count in the alert detail.
+
+**Proven end to end against the real database** (51 checks, model and SMS faked, everything else real).
+The probe prints the actual SMS a caller receives, built from real `services` rows, and then asserts
+against Postgres:
+
+- `"2"` persists `selectedServiceId`, clears `pendingChoice` to SQL NULL, stores the label the customer
+  *read* — **with zero model calls**.
+- `"2 bedrooms"` increments `reprompts` and leaves `collected`, `questionsAsked`, `awaitingField` and
+  `selectedServiceId` untouched. Still zero model calls. Two more and it hands over with no service
+  invented.
+- `5` moves to `DESCRIPTION`; the description is stored verbatim even when the model tries to name a
+  catalogue service instead, and the lead is written with `serviceId: null`.
+- Disabling a service between the send and the reply refuses the selection, tells the caller, and
+  re-offers a three-option list without it.
+- Seven active services hands over with `needsHuman` — no menu, and demonstrably *not* the open service
+  question.
+
+**One finding, and it was in the test.** The D8 tenant guard rejected the probe's
+`service.update({ where: { id } })` for missing a top-level `businessId`. The test was wrong, not the
+code — and it is the first time that assertion has fired against `services`, which is exactly the job it
+was added for.
+
+**Watch out for.** The three pre-existing processor harnesses still pass, but they were written before
+the catalogue existed, so they exercise the `NO_CATALOGUE` path only. That is the correct behaviour for
+a business mid-onboarding and it is genuinely the common case today — but it means the menu path has
+exactly one harness covering it, and it is this step's.

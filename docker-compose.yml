@@ -10,8 +10,16 @@ services:
       POSTGRES_USER: mer
       POSTGRES_PASSWORD: mer_local_dev
       POSTGRES_DB: mer
+    # Host port 5433, not 5432. A Homebrew `postgresql@17` service on this machine binds
+    # 127.0.0.1:5432 and [::1]:5432, which win over Docker's wildcard bind for anything
+    # connecting to localhost — so the app silently reached the *wrong* Postgres and
+    # failed with `role "mer" does not exist` while this container sat there healthy.
+    #
+    # Moving our own port is the fix rather than stopping their service: it is contained
+    # to this repo, and it stays fixed if Homebrew starts that service again. Same
+    # reasoning as the API listening on 3101 instead of 3001 (CLAUDE.md).
     ports:
-      - '5432:5432'
+      - '5433:5432'
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:

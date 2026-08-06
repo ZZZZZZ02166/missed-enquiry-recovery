@@ -22,3 +22,6 @@ apps/api/src/generated/
 .turbo/
 playwright-report/
 test-results/
+
+# Project-local Node toolchain (see .tools/env.sh). Binaries, never committed.
+.tools/node/
