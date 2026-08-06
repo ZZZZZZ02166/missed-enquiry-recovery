@@ -118,7 +118,8 @@ missed-enquiry-recovery/
 | `docs/twilio-setup.md`            | Account, AU regulatory bundle, numbers, webhook URLs, error codes.                                                                                     |
 | `docs/carrier-forwarding-test.md` | Telstra/Optus/Vodafone results matrix. **Go/no-go gate — fill in before product code.**                                                                |
 | `docs/compliance.md`              | Spam Act, opt-out, GST/single-price, privacy, retention.                                                                                               |
-| `docs/build-report-92-98.md`      | Narrative report for the CI currency guard and the whole auth module — what was built, why, and what is still missing.                                                                                               |
+| `docs/build-report-92-98.md`      | Narrative report for the CI currency guard and the whole auth module — what was built, why, and what is still missing.                                  |
+| `docs/remaining-plan.md`          | **Everything left to build**, with dependencies, decisions, deferrals and the critical path. Start here when picking up work.                                                                                               |
 
 Full plan and review: `~/.claude/plans/i-m-building-a-missed-enquiry-soft-finch.md`.
 
