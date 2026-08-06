@@ -1,12 +1,14 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { SuppressionsService } from '../../calls/suppressions.service';
 import { env } from '../../config/env';
-import { ConversationsService } from '../../conversations/conversations.service';
+import { ConversationsService, type ReplyKind } from '../../conversations/conversations.service';
 import { LeadsService } from '../../leads/leads.service';
 import { SendCapService } from '../../telephony/send-cap.service';
 import type { LlmTurn } from '../../conversations/llm.provider';
 import type { CollectedAnswers } from '../../conversations/question-flow';
 import { PrismaService } from '../../prisma/prisma.service';
+import { MAX_LIST_SEGMENTS } from '../../services/service-options';
+import type { MessagePurpose } from '../../generated/prisma/client';
 import {
   PermanentSendError,
   SMS_PROVIDER,
@@ -55,6 +57,26 @@ const MAX_UNSENT_AGE_MS = 15 * 60 * 1000;
 
 /** At most one or two can realistically be outstanding; the cap is a safety rail. */
 const MAX_FLUSH_BATCH = 5;
+
+/**
+ * How many segments an outbound reply of this purpose may occupy.
+ *
+ * Derived from `purpose` rather than passed down from the decision, because the flush
+ * path re-sends a reserved row long after the decision that produced it is gone — and a
+ * row it cannot classify is a reply it can never deliver.
+ *
+ * `QUALIFICATION` gets the menu's budget. That is a ceiling, not a licence: every fixed
+ * prompt is asserted to a single segment at module load (`question-flow.ts`,
+ * `service-options.ts`), and the only variable-length qualification body is the numbered
+ * menu, which `buildServiceList` budget-checks when it builds it.
+ *
+ * Getting this wrong is not theoretical. The default of 1 is what made the two-segment
+ * owner notification unsendable, and it would have done exactly the same to the menu —
+ * silently, on the first business with four services.
+ */
+function segmentAllowance(purpose: MessagePurpose | null): number {
+  return purpose === 'QUALIFICATION' ? MAX_LIST_SEGMENTS : 1;
+}
 
 @Injectable()
 export class InboundMessageProcessor {
@@ -368,7 +390,7 @@ export class InboundMessageProcessor {
   private async reply(
     inbound: { customerId: string | null; fromE164: string; toE164: string },
     businessId: string,
-    kind: 'question' | 'handoff',
+    kind: ReplyKind,
     body: string,
   ): Promise<void> {
     // The number they texted is the number we reply from — swapping `to` and `from`
@@ -376,7 +398,9 @@ export class InboundMessageProcessor {
     // number change cannot move the thread to a different sender.
     const from = inbound.toE164;
     const to = inbound.fromE164;
-    const purpose = kind === 'question' ? 'QUALIFICATION' : 'HANDOFF';
+    // A menu and a re-prompt are both qualification traffic — they are asking the
+    // customer for the same field, in a different shape.
+    const purpose = kind === 'handoff' ? 'HANDOFF' : 'QUALIFICATION';
 
     // **Reserved before the provider is called.** A row with a null
     // `providerMessageSid` is a durable "we owe this customer these exact words" —
@@ -402,7 +426,7 @@ export class InboundMessageProcessor {
       },
     });
 
-    await this.deliver(reserved.id, businessId, { from, to, body });
+    await this.deliver(reserved.id, businessId, { from, to, body }, segmentAllowance(purpose));
   }
 
   /**
@@ -415,12 +439,14 @@ export class InboundMessageProcessor {
     messageId: string,
     businessId: string,
     sms: { from: string; to: string; body: string },
+    maxSegments: number,
   ): Promise<void> {
     try {
       const result = await this.sms.sendSms({
         to: sms.to,
         from: sms.from,
         body: sms.body,
+        maxSegments,
         statusCallbackUrl: `${env.PUBLIC_API_URL}/webhooks/twilio/messages/status`,
       });
 
@@ -553,11 +579,12 @@ export class InboundMessageProcessor {
       });
       if (claim.count === 0) continue;
 
-      await this.deliver(row.id, businessId, {
-        from: row.fromE164,
-        to: row.toE164,
-        body: row.body,
-      });
+      await this.deliver(
+        row.id,
+        businessId,
+        { from: row.fromE164, to: row.toE164, body: row.body },
+        segmentAllowance(row.purpose),
+      );
       sent += 1;
       this.logger.log(`Re-sent a reply to ${row.toE164} that a previous attempt never delivered`);
     }

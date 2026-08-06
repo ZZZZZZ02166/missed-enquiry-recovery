@@ -129,6 +129,7 @@ decision rather than restating the argument.
 | 84  | 2026-08-05 | `apps/api/src/services/service-options.ts`            | **No silent `.slice(0,6)`.** Over-sized catalogue is a named failure. 142/142       |
 | 85  | 2026-08-05 | `service-catalogue.ts` + `service-options.ts`         | Block at save (`assertCatalogueValid`); alarm at send (`MISCONFIGURED`). 241/241    |
 | 86  | 2026-08-05 | `apps/api/prisma/schema.prisma`                       | `conversations.pendingChoice` + `selectedServiceId`. 15th migration. 18/18 live     |
+| 87  | 2026-08-05 | `apps/api/src/conversations/conversations.service.ts` | The selection state machine. Menu replies never reach the model. 87/87              |
 
 ---
 
@@ -4813,3 +4814,78 @@ transition on `awaitingField` or `updatedAt` instead.
 
 **Watch out for.** No index on `selectedServiceId`. Nothing queries by it yet, and an index with no
 reader is cost without benefit — worth adding when the dashboard reports leads by service, not before.
+
+---
+
+#### `apps/api/src/conversations/conversations.service.ts` — service selection
+
+**Step 87** · 2026-08-05
+
+**What changed.** `advance()` gained the numbered-menu exchange. It now takes the live `catalogue`,
+returns `pendingChoice` and `selectedServiceId` alongside the existing decision, and grew two reply
+kinds — `menu` and `reprompt`.
+
+**The structural decision: the menu branch returns before extraction is reached.**
+
+```ts
+if (pending?.stage === 'LIST') return this.resolveMenuReply(input, pending);
+// ...only after that:
+const result = await this.llm.extractFields({ ... });
+```
+
+Not a condition inside the normal flow — an early return, placed above the model call. When a menu is
+outstanding the reply is a selection or it is nothing, so there is no free text to understand, and
+asking a model to interpret "2" would be spending money to introduce a way to be wrong. Written this way
+the property lives in the control flow rather than in a comment: an unusable reply *cannot* cost a model
+call, *cannot* become an answer, and *cannot* select a service by inference. The suite measures it with
+a counting provider rather than trusting it — `llm.calls === 0` across the whole re-prompt ladder.
+
+**What an invalid reply does, exactly.** Nothing moves except one integer. Not `collected`, not
+`selectedServiceId`, not `questionsAsked`, not the question flow. Only `pendingChoice.reprompts`, which
+is what makes the exchange terminate. After `MAX_SELECTION_REPROMPTS` the enquiry goes to the owner
+intact — a third identical message is annoying, billable, and no more likely to work than the second.
+
+**`MISCONFIGURED` hands over; it does not degrade.** `assertCatalogueValid` blocks an over-sized
+catalogue at save, so reaching it here means a write bypassed validation and the rows are not ones any
+owner agreed to. Serving a quietly degraded conversation would hide that until someone noticed by hand;
+handing to a person surfaces it on the first affected caller, with a `CATALOGUE_ALERT` line carrying the
+business and the reason. `NO_CATALOGUE` is the opposite — a business that has not finished onboarding —
+and still falls back to the open question, which is the common case rather than an error.
+
+**Other, and why the model cannot hijack it.** `5` moves the stage to `DESCRIPTION` and asks for a
+description. That reply *does* go through extraction, because it is genuinely free text and may carry a
+suburb or a date worth having — but `collected.serviceType` is then overwritten with the caller's raw
+words. The model is not asked to name a service there and must not be allowed to imply one: a
+description that does not match the catalogue is a manual-quote lead, and that is the right outcome, not
+a failure to recover from. Tested with a provider that deliberately returns a catalogue service name for
+a "Window cleaning" description; the customer's words win.
+
+**A withdrawn option is never substituted.** The snapshot says what the number meant;
+`isStillSelectable` against the live catalogue says whether it can still be chosen. If not, the caller
+is told plainly and re-asked with the current list — their re-prompt count reset, because they answered
+the previous list correctly and it changed underneath them. If no replacement menu can be built, hand
+over. Never a neighbouring service, never a price.
+
+**Two defects found while wiring it.**
+
+1. **The two-segment menu could never have been sent.** `deliver()` did not pass `maxSegments`, so
+   `assertSendable` applied its default of 1 and would have rejected every menu at send time — the
+   identical bug that made the owner notification unsendable, rediscovered in a new place. Fixed by
+   deriving the allowance from `MessagePurpose` rather than from the decision, because the flush path
+   re-sends a reserved row long after the decision that produced it is gone, and a row it cannot
+   classify is a reply it can never deliver.
+2. `offerFreshMenu` took a `pending` argument it never read, left over from an earlier shape where the
+   re-prompt count carried forward. Removed rather than left as a false signal that it mattered.
+
+**`parsePendingChoice` is deliberately strict and deliberately non-throwing.** The value is untrusted
+JSON that round-tripped through Postgres and may have been written by an older version of this code. One
+bad option invalidates the whole snapshot rather than being skipped — dropping an option would let "3"
+resolve against a list the customer never saw. A malformed snapshot returns null, so the reply is
+treated as ordinary free text: the conversation continues and nothing is mis-selected, which is the
+right way to fail. Throwing would kill a job for a customer whose only mistake was replying.
+
+**Watch out for.** `segmentAllowance` gives every `QUALIFICATION` message the menu's budget. That is a
+ceiling, not a licence — every fixed prompt is asserted to one segment at module load
+(`question-flow.ts`, `service-options.ts`), and the only variable-length qualification body is the menu,
+which `buildServiceList` budget-checks when it builds it. If a genuinely long qualification message is
+ever added, that assertion is the thing protecting the bill, so do not weaken it.
