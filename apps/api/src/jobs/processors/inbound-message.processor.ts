@@ -1,13 +1,17 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import { SuppressionsService } from '../../calls/suppressions.service';
 import { env } from '../../config/env';
-import { ConversationsService, type ReplyKind } from '../../conversations/conversations.service';
+import {
+  ConversationsService,
+  type PricedCatalogueEntry,
+  type ReplyKind,
+} from '../../conversations/conversations.service';
 import { LeadsService } from '../../leads/leads.service';
 import { SendCapService } from '../../telephony/send-cap.service';
 import type { LlmTurn } from '../../conversations/llm.provider';
 import type { CollectedAnswers } from '../../conversations/question-flow';
 import { PrismaService } from '../../prisma/prisma.service';
-import { MAX_LIST_SEGMENTS, type CatalogueEntry } from '../../services/service-options';
+import { MAX_LIST_SEGMENTS } from '../../services/service-options';
 import { Prisma, type MessagePurpose } from '../../generated/prisma/client';
 import {
   PermanentSendError,
@@ -78,7 +82,15 @@ const MAX_FLUSH_BATCH = 5;
 const CATALOGUE_QUERY_LIMIT = 100;
 
 function segmentAllowance(purpose: MessagePurpose | null): number {
-  return purpose === 'QUALIFICATION' ? MAX_LIST_SEGMENTS : 1;
+  // `HANDOFF` shares the allowance because a handoff may now carry a quote: the
+  // completion message is the price sentence plus the confirmation line, and a
+  // `STARTING_FROM` quote with a long business name does not fit in 160 characters. The
+  // qualifying clauses are what stop an estimate reading as a promise, so the budget
+  // moves rather than the wording. Every fixed template is still asserted to a single
+  // segment on its own at module load.
+  // Named explicitly rather than defaulting to the wider budget: a permissive default
+  // is how a purpose added later silently acquires an allowance nobody chose.
+  return purpose === 'QUALIFICATION' || purpose === 'HANDOFF' ? MAX_LIST_SEGMENTS : 1;
 }
 
 @Injectable()
@@ -101,7 +113,7 @@ export class InboundMessageProcessor {
 
     const message = await this.prisma.db.message.findFirst({
       where: { businessId, id: messageId },
-      include: { business: { select: { name: true } } },
+      include: { business: { select: { name: true, pricesIncludeGst: true } } },
     });
 
     if (!message) {
@@ -204,6 +216,7 @@ export class InboundMessageProcessor {
       inboundText: message.body,
       priorTurns: await this.priorTurns(businessId, message.customerId, message.createdAt),
       catalogue: await this.activeCatalogue(businessId),
+      pricesIncludeGst: message.business.pricesIncludeGst,
     });
 
     if (decision.awaitingField && conversation.awaitingField) {
@@ -388,10 +401,18 @@ export class InboundMessageProcessor {
    * either way, so the cap costs nothing except a slightly under-reported count in the
    * alert detail.
    */
-  private async activeCatalogue(businessId: string): Promise<CatalogueEntry[]> {
+  private async activeCatalogue(businessId: string): Promise<PricedCatalogueEntry[]> {
     return this.prisma.db.service.findMany({
       where: { businessId, availability: 'ACTIVE' },
-      select: { id: true, name: true, availability: true, sortOrder: true },
+      // Every column pricing reads, not just the four the menu needs. Selected
+      // explicitly rather than fetching the row wholesale, so adding a column to
+      // `services` cannot quietly widen what a conversation loads on every reply.
+      select: {
+        id: true, name: true, availability: true, sortOrder: true,
+        pricingType: true, priceCents: true, unitLabel: true, minUnits: true, maxUnits: true,
+        showPriceAutomatically: true, priceConfidence: true, requiresConfirmation: true,
+        requiredFields: true,
+      },
       orderBy: { sortOrder: 'asc' },
       take: CATALOGUE_QUERY_LIMIT,
     });

@@ -1,7 +1,7 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import type { ConversationState } from '../generated/prisma/client';
 import { segmentCount } from '../common/gsm7';
-import { recoveryHandoffMessage } from '../notifications/templates';
+import { quotedHandoffMessage, recoveryHandoffMessage } from '../notifications/templates';
 import {
   buildServiceList,
   isStillSelectable,
@@ -16,6 +16,8 @@ import {
   type CatalogueEntry,
   type PresentedOption,
 } from '../services/service-options';
+import { calculatePrice, type PriceResult, type PricingConfig } from '../services/price-calculator';
+import { quoteMessage } from '../services/quote-message';
 import { LLM_PROVIDER, type LlmProvider, type LlmTurn, type LlmUsage } from './llm.provider';
 import { mergeAnswers } from './extraction';
 import {
@@ -82,6 +84,16 @@ export interface ConversationSnapshot {
   selectedServiceId?: string | null;
 }
 
+/**
+ * A catalogue entry with everything pricing needs.
+ *
+ * The menu only reads `id`, `name`, `availability` and `sortOrder`; quoting needs the
+ * whole pricing config. Required rather than optional on purpose — an optional pricing
+ * block would mean a processor that forgot to select the columns produces conversations
+ * that silently never quote, which is the failure this system is least able to notice.
+ */
+export type PricedCatalogueEntry = CatalogueEntry & Omit<PricingConfig, 'id' | 'name' | 'availability'>;
+
 export interface AdvanceInput {
   /** As stored on `businesses`. Truncated and made sendable by the templates. */
   businessName: string;
@@ -99,7 +111,13 @@ export interface AdvanceInput {
    * Used for two different things that must not be confused: building a menu, and
    * re-validating a choice that was made against an older version of it.
    */
-  catalogue?: readonly CatalogueEntry[];
+  catalogue?: readonly PricedCatalogueEntry[];
+  /**
+   * From `businesses.pricesIncludeGst`. Decides nothing the caller sees directly — the
+   * figure is GST-inclusive either way (ACL single-price rule) — only how to get there
+   * from what the owner typed.
+   */
+  pricesIncludeGst?: boolean;
 }
 
 /**
@@ -167,6 +185,15 @@ export interface ConversationDecision {
   latencyMs: number;
   /** The model tried to quote. Never reaches the customer; surfaced for alerting. */
   attemptedToPrice: boolean;
+
+  /**
+   * The price computed for this conversation, when one was stated.
+   *
+   * Carried so the lead records exactly what the customer was told, including the
+   * config snapshot — when the owner raises prices next month, the lead must still show
+   * the old figure. Null whenever nothing was quoted, which is most conversations.
+   */
+  quote: PriceResult | null;
 }
 
 /**
@@ -259,6 +286,7 @@ export class ConversationsService {
       collected: conversation.collected,
       questionsAsked: conversation.questionsAsked,
       createLead: conversation.state === 'AWAITING_FIRST_REPLY',
+      quote: null,
       stillMissing: missingRequired(conversation.collected),
     };
 
@@ -462,13 +490,16 @@ export class ConversationsService {
         selectedServiceId,
         reply: { kind: 'handoff', body: recoveryHandoffMessage(input.businessName) },
         createLead,
+        quote: null,
         stillMissing: missingRequired(collected),
       };
     }
 
     // 2. Everything required is answered. Hand it over rather than chasing optional
-    //    fields the owner can ask about on the phone.
+    //    fields the owner can ask about on the phone — and this is where a price, if
+    //    there is one, reaches the caller.
     if (isComplete(collected)) {
+      const quoted = this.priceFor(input, selectedServiceId, collected);
       return {
         ...meta,
         state: 'COMPLETE',
@@ -479,8 +510,14 @@ export class ConversationsService {
         needsHumanReason: null,
         pendingChoice: clearedPending,
         selectedServiceId,
-        reply: { kind: 'handoff', body: recoveryHandoffMessage(input.businessName) },
+        reply: {
+          kind: 'handoff',
+          body: quoted.body
+            ? `${quoted.body} ${quotedHandoffMessage(input.businessName)}`
+            : recoveryHandoffMessage(input.businessName),
+        },
         createLead,
+        quote: quoted.price,
         stillMissing: [],
       };
     }
@@ -509,6 +546,7 @@ export class ConversationsService {
             selectedServiceId,
             reply: { kind: 'menu', body: menu.body },
             createLead,
+            quote: null,
             stillMissing: missingRequired(collected),
           };
         }
@@ -533,6 +571,7 @@ export class ConversationsService {
             selectedServiceId,
             reply: { kind: 'handoff', body: recoveryHandoffMessage(input.businessName) },
             createLead,
+            quote: null,
             stillMissing: missingRequired(collected),
           };
         }
@@ -554,6 +593,7 @@ export class ConversationsService {
         selectedServiceId,
         reply: { kind: 'question', body: question.prompt },
         createLead,
+        quote: null,
         stillMissing: missingRequired(collected),
       };
     }
@@ -589,8 +629,50 @@ export class ConversationsService {
       selectedServiceId,
       reply: { kind: 'handoff', body: recoveryHandoffMessage(input.businessName) },
       createLead,
+      quote: null,
       stillMissing: outstanding,
     };
+  }
+
+  /**
+   * The price for the selected service, and the words for it.
+   *
+   * **Quoted once, at completion, and never before.** Not because earlier would be
+   * unwelcome — a number in ninety seconds is the whole pitch — but because quoting at
+   * every turn needs a durable "already quoted" marker, and writing one before the send
+   * is exactly the shape rule 13 exists to forbid. Completion is terminal, so once is
+   * guaranteed by the state machine rather than by bookkeeping. Quoting earlier is a
+   * follow-up, and it needs `leads.quotedAt` consulted *before* the message is composed.
+   *
+   * Returns no words in every case where a figure would be indefensible: no service
+   * chosen, the service gone from the catalogue, a manual-quote service, an answer still
+   * missing, or an owner who does not want prices stated on their behalf. `price` is
+   * still returned in some of those cases, because the owner's lead may legitimately
+   * carry a figure the customer was never told (`showPriceAutomatically`).
+   */
+  private priceFor(
+    input: AdvanceInput,
+    selectedServiceId: string | null,
+    collected: CollectedAnswers,
+  ): { price: PriceResult | null; body: string | null } {
+    if (!selectedServiceId) return { price: null, body: null };
+
+    // Re-read from the live catalogue rather than trusting anything stored: a service
+    // disabled since the customer chose it must not be priced, which is the same rule
+    // `isStillSelectable` applies to the choice itself.
+    const service = input.catalogue?.find(
+      (s) => s.id === selectedServiceId && s.availability === 'ACTIVE',
+    );
+    if (!service) return { price: null, body: null };
+
+    const price = calculatePrice(service, collected, {
+      pricesIncludeGst: input.pricesIncludeGst ?? false,
+    });
+
+    // `quoteMessage` is the only thing that renders a figure, and it takes a
+    // `PriceResult` rather than a number — so there is no path from here to a currency
+    // amount this system did not compute (rule 2).
+    return { price, body: quoteMessage(service.name, price) };
   }
 
   /** Build the menu for this business, classifying the three outcomes that matter here. */

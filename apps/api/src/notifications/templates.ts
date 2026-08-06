@@ -148,6 +148,20 @@ export function recoveryHandoffMessage(businessName: string): string {
 }
 
 /**
+ * The same sign-off, for a conversation that ends with a price.
+ *
+ * Short because it follows one. The quote sentence has already said what the figure is
+ * and what is still to be confirmed, so repeating `has your details and will confirm
+ * availability` after it is both redundant to read and expensive to send — the pair came
+ * to 194 characters, which is two segments on the closing message of every quoted
+ * conversation. This keeps it to one.
+ */
+export function quotedHandoffMessage(businessName: string): string {
+  const name = prepareBusinessName(businessName);
+  return `Thanks. ${name} will be in touch to confirm.`;
+}
+
+/**
  * A single nudge after silence. Off by default, business-hours aware.
  *
  * One only. A second nudge to someone who has ignored the first is the point at which

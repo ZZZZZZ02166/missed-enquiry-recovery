@@ -132,6 +132,7 @@ decision rather than restating the argument.
 | 87  | 2026-08-05 | `apps/api/src/conversations/conversations.service.ts` | The selection state machine. Menu replies never reach the model. 87/87              |
 | 88  | 2026-08-06 | `apps/api/src/jobs/processors/inbound-message.processor.ts` | Catalogue loaded, columns persisted. The menu reaches a real caller. 51/51 e2e |
 | 89  | 2026-08-06 | `apps/api/src/services/quote-message.ts` (+ `common/gsm7.ts`) | Quote wording. Rule 2 as an API shape. 41/41                                |
+| 90  | 2026-08-06 | `conversations.service.ts` + processor + `templates.ts` | **A caller now gets a price.** The differentiator reaches a customer. 104/104 |
 
 ---
 
@@ -5017,3 +5018,67 @@ the module-load assertions. Not wired into the conversation yet — that is the 
 maximum-length name with a five-figure total and a two-digit quantity. Squeezing them into 160 characters
 would mean cutting the qualifying clauses, and those clauses are the part that stops an estimate reading
 as a promise. If the wording is ever shortened, shorten the name, not the hedge.
+
+---
+
+#### Quoting wired into the conversation
+
+**Step 90** · 2026-08-06 · `conversations/conversations.service.ts`,
+`jobs/processors/inbound-message.processor.ts`, `notifications/templates.ts`
+
+**What it does.** The thing the whole product is for. A caller who picks a priced service now gets a
+figure in the closing message:
+
+```
+Oven cleaning is $70 incl. GST. Thanks. Melbourne Sparkle will be in touch to confirm.
+End-of-lease cleaning starts from $280 incl. GST. The final quote is confirmed once we
+have your details. Thanks. Melbourne Sparkle will be in touch to confirm.
+```
+
+`selectedServiceId` → the live catalogue row → `calculatePrice` → `quoteMessage`. Every link is one
+already built and tested; this step is the wiring, plus the two decisions below.
+
+**Quoted once, at completion, and never before.** Not because earlier would be unwelcome — a number in
+ninety seconds is the pitch — but because quoting at every turn needs a durable "already quoted" marker,
+and writing one before the send is precisely the shape rule 13 forbids. `COMPLETE` is terminal, so
+"exactly once" is guaranteed by the state machine rather than by bookkeeping. Quoting earlier is a
+fast-follow, and it needs `leads.quotedAt` consulted *before* the message is composed.
+
+**Never quoted when `needsHuman`.** That branch exists because someone complained, asked to negotiate,
+or said something the system should not answer. Undercutting a person with an automatic price at that
+moment is the worst thing this system could do, and the guard ordering already puts `needsHuman` first —
+this simply does not add a quote to it.
+
+**`PricedCatalogueEntry` is required, not optional.** The menu reads four fields; pricing needs the whole
+config. Making the pricing block optional would mean a processor that forgot to select the columns
+produces conversations that silently never quote — the failure this system is least able to notice. So
+the type demands them and the processor's `select` lists every one explicitly, which also means adding a
+column to `services` cannot quietly widen what a conversation loads on every reply.
+
+**Two copy and cost decisions.**
+
+- `quotedHandoffMessage` is a second, shorter sign-off. Composing the quote with the existing handoff
+  gave *"...confirmed once we have your details. Thanks. X has your details and will confirm
+  availability..."* — redundant to read and 194 characters, which is **two segments on the closing
+  message of every quoted conversation**. The short form brings the longest possible quote back to one,
+  and the suite asserts it rather than trusting it.
+- `segmentAllowance` now covers `HANDOFF` as well as `QUALIFICATION`, because a handoff can carry a
+  quote. Named explicitly rather than defaulting to the wider budget — a permissive default is how a
+  purpose added later silently acquires an allowance nobody chose.
+
+**What is proven** (104 checks in the state-machine suite, 41 in the wording suite): a fixed price is
+stated; a starting-from price is worded as one; a GST-exclusive `$280` reaches the caller as `$308`; a
+`MANUAL_QUOTE` service, a `showPriceAutomatically: false` service, a service withdrawn after selection,
+and a conversation with no service all produce **no currency figure at all** — while the owner's lead
+still carries the figure in the `showPriceAutomatically` case, which is the point of that flag. The
+`PriceResult` travels on the decision with its config snapshot, so the lead records what the customer
+was told even after the owner raises prices.
+
+**One finding, and it was in the test.** The payoff fixture omitted `serviceType` from `collected`, so
+the flow correctly re-asked the service question instead of completing. A real selection always writes
+the chosen label there. The code was right.
+
+**Watch out for.** Nothing writes `leads.quotedAmountCents`, `quotedAt` or `quoteSnapshot` yet — the
+`PriceResult` reaches the decision and stops there. Until `LeadsService` persists it, the owner's lead
+does not show what the customer was quoted, which is the gap that makes the "log every owner override"
+pilot metric uncomputable.
