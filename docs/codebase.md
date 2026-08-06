@@ -133,6 +133,7 @@ decision rather than restating the argument.
 | 88  | 2026-08-06 | `apps/api/src/jobs/processors/inbound-message.processor.ts` | Catalogue loaded, columns persisted. The menu reaches a real caller. 51/51 e2e |
 | 89  | 2026-08-06 | `apps/api/src/services/quote-message.ts` (+ `common/gsm7.ts`) | Quote wording. Rule 2 as an API shape. 41/41                                |
 | 90  | 2026-08-06 | `conversations.service.ts` + processor + `templates.ts` | **A caller now gets a price.** The differentiator reaches a customer. 104/104 |
+| 91  | 2026-08-06 | `apps/api/src/leads/leads.service.ts`                 | The lead records what the customer was told, frozen. 68/68 e2e                      |
 
 ---
 
@@ -5082,3 +5083,49 @@ the chosen label there. The code was right.
 `PriceResult` reaches the decision and stops there. Until `LeadsService` persists it, the owner's lead
 does not show what the customer was quoted, which is the gap that makes the "log every owner override"
 pilot metric uncomputable.
+
+---
+
+#### `apps/api/src/leads/leads.service.ts` — the quote on the lead
+
+**Step 91** · 2026-08-06
+
+**What it does.** Writes `serviceId`, `quotedAmountCents`, `quoteType`, `quoteShownToCustomer`,
+`quotedAt` and `quoteSnapshot` — six columns that had existed since the `leads` table landed with
+nothing writing them. The owner's lead now says what their customer was actually told.
+
+**Written once, never rewritten.** `quoteColumns` returns an empty object the moment `quotedAt` is set,
+so a later reply cannot move the figure. That matters in two directions: the conversation carries on
+and the calculator may produce a different number as more answers arrive, and the owner may raise
+prices next week. Neither may change what the customer was quoted. `quoteSnapshot` freezes the service
+config alongside the figure for the same reason — proven by raising a price mid-conversation and
+asserting the lead does not follow.
+
+This is the one exception to the rule stated in the upsert's comment, that a conversation update must
+not reach into owner-written fields. It is safe because the write is conditional on the field being
+empty, not because quote fields are ordinary.
+
+**The amount recorded is what the caller heard, not what the owner typed.** A business storing prices
+ex-GST configures `$280` and the customer is told `$308`; the lead records `30800`, and the snapshot
+records `28000`. That split is deliberate — the lead is evidence of the representation made to a
+consumer, and the snapshot is what makes the conversion auditable after the fact.
+
+**`quotedAt` is a record, not a gate — and that distinction is load-bearing.** It is written *before*
+the reply is sent, which is the exact shape rule 13 forbids for a marker that suppresses work. It is
+safe today only because nothing reads it to decide whether to send: the send is driven by the reserved
+`messages` row, so a retry re-sends from there regardless of what this column says. The docstring says
+so explicitly, because the documented fast-follow — quoting earlier in the conversation, guarded by
+"have we already quoted?" — turns this into precisely the silent-loss bug unless the read happens
+before the message is composed and this write moves after the send.
+
+**`serviceId` is updated on every advance, unlike the quote fields.** A customer can be re-asked and
+choose differently; the lead must say what they settled on, not what they first said.
+
+**One finding, and it was in the test.** The e2e expected `$280` on the lead. The business defaults to
+`pricesIncludeGst: false`, so `$308` was correct and the assertion was wrong — the same GST rule the
+calculator suite already pins, rediscovered from the other end.
+
+**Watch out for.** `quoteShownToCustomer: false` with a non-null amount is a real and meaningful state,
+not a bug: the owner wanted the figure on their lead without it being promised on their behalf. Any
+dashboard or notification rendering leads must respect it, or `showPriceAutomatically` becomes a setting
+that leaks through a different surface.

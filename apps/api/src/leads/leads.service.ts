@@ -1,7 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
 import type { CollectedAnswers, FieldKey } from '../conversations/question-flow';
-import type { Lead } from '../generated/prisma/client';
+import { Prisma, type Lead } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import type { PriceResult } from '../services/price-calculator';
 import { hasAnyAnswer, nextLeadStatus, toLeadColumns } from './lead-mapping';
 
 /**
@@ -39,6 +40,51 @@ export interface LeadSyncInput {
    * rather than clearing it.
    */
   urgency?: 'low' | 'normal' | 'high';
+  /** The catalogue service the customer chose, or null for a manual-quote enquiry. */
+  selectedServiceId?: string | null;
+  /**
+   * The price computed on this turn, if any.
+   *
+   * Recorded on the lead the first time a figure exists and never rewritten — see
+   * `quoteColumns`.
+   */
+  quote?: PriceResult | null;
+}
+
+/**
+ * The quote columns to write, or nothing.
+ *
+ * Written **once**, the first time a real figure exists, and never rewritten. The lead is
+ * the record of what the customer was told; if the owner raises prices next month, or the
+ * conversation carries on and the calculator produces a different number, the recorded
+ * quote must not follow. `quoteSnapshot` freezes the config alongside it for the same
+ * reason.
+ *
+ * `quotedAt` is a **record, not a gate.** Nothing may use it to decide whether to send —
+ * it is written before the reply goes out, and a marker written before the side effect it
+ * marks is the exact shape rule 13 forbids. It is safe today only because the send is
+ * driven by the reserved `messages` row, so a retry re-sends from there regardless of
+ * what this column says. The moment something reads `quotedAt` to decide whether to
+ * quote, that read has to happen before the message is composed, and this write has to
+ * move after the send.
+ */
+function quoteColumns(
+  quote: PriceResult | null | undefined,
+  alreadyQuotedAt: Date | null,
+): Record<string, unknown> {
+  if (alreadyQuotedAt !== null) return {};
+  if (!quote || quote.amountCents === null) return {};
+
+  return {
+    quotedAmountCents: quote.amountCents,
+    quoteType: quote.quoteType,
+    // Whether the caller was actually told. False with a non-null amount is a real,
+    // meaningful state: the owner wanted the figure on the lead without it being
+    // promised on their behalf.
+    quoteShownToCustomer: quote.showToCustomer,
+    quotedAt: new Date(),
+    quoteSnapshot: quote.snapshot as unknown as Prisma.InputJsonObject,
+  };
 }
 
 @Injectable()
@@ -66,7 +112,7 @@ export class LeadsService {
     // a unique lookup cannot carry a tenant constraint (tenant-guard).
     const existing = await this.prisma.db.lead.findFirst({
       where: { businessId, conversationId },
-      select: { id: true, status: true },
+      select: { id: true, status: true, quotedAt: true },
     });
 
     const columns = toLeadColumns(input.collected, input.urgency);
@@ -88,11 +134,17 @@ export class LeadsService {
       needsHumanReason: input.needsHumanReason,
       optedOut: input.optedOut ?? false,
       missingFields: input.stillMissing,
+      // Which catalogue service this is for. Updated on every advance rather than
+      // written once, because a customer can be re-asked and choose differently — the
+      // lead must say what they settled on, not what they first said.
+      serviceId: input.selectedServiceId ?? null,
       // The long tail, including fields with no column. The columns above are a
       // promoted subset, not a replacement — a question set the owner adds tomorrow
       // lands here without a migration.
       answers: input.collected as object,
     };
+
+    const quote = quoteColumns(input.quote, existing?.quotedAt ?? null);
 
     const lead = await this.prisma.db.lead.upsert({
       where: { conversationId, businessId },
@@ -101,12 +153,17 @@ export class LeadsService {
         customerId: input.customerId,
         conversationId,
         ...shared,
+        ...quote,
       },
-      // Deliberately does not touch `ownerNotifiedAt`, the quote fields, `wonValueCents`
-      // or `closedAt`. Those are written by the notification job and by the owner; a
-      // conversation update must not reach into them, or a late reply would silently
-      // re-notify and discard a recorded outcome.
-      update: shared,
+      // Deliberately does not touch `ownerNotifiedAt`, `wonValueCents` or `closedAt`.
+      // Those are written by the notification job and by the owner; a conversation
+      // update must not reach into them, or a late reply would silently re-notify and
+      // discard a recorded outcome.
+      //
+      // The quote fields are the exception, and `quoteColumns` is what makes it a safe
+      // one: it returns nothing at all once a quote has been recorded, so a later reply
+      // cannot rewrite the figure the customer was actually told.
+      update: { ...shared, ...quote },
     });
 
     // Promote a learned name onto the customer, so the next call from this number is

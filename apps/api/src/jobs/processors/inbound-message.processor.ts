@@ -282,6 +282,8 @@ export class InboundMessageProcessor {
       needsHumanReason: decision.needsHumanReason,
       stillMissing: decision.stillMissing,
       urgency: decision.urgency,
+      selectedServiceId: decision.selectedServiceId,
+      quote: decision.quote,
     });
 
     // Tell the owner as soon as the lead is worth telling them about — not on every
