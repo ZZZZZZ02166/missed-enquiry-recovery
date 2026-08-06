@@ -138,6 +138,7 @@ decision rather than restating the argument.
 | 93  | 2026-08-06 | `apps/api/prisma/schema.prisma`                       | Auth fields on `users`. Still 12 tables. 16th migration                             |
 | 94  | 2026-08-06 | `apps/api/src/auth/tokens.ts` (+ spec)                | Magic-link and session crypto. Pure, 14/14 in CI                                    |
 | 95  | 2026-08-06 | `apps/api/src/auth/auth.service.ts`                   | The authentication boundary. Open redirect found and fixed. 45/45                   |
+| 96  | 2026-08-06 | `apps/api/src/auth/cookies.ts` + `session.guard.ts`   | **Rule 1 becomes enforceable on HTTP.** 13/13 in CI                                 |
 
 ---
 
@@ -5296,3 +5297,56 @@ browser strips the leading slash. The suite covers all eight shapes.
 **Watch out for.** `requestLinkByEmail` has **no rate limit**. Minting is cheap and the response is
 identical either way, so it is not an enumeration oracle — but it is an unauthenticated endpoint that
 writes to `users` on every call, and it needs a per-address throttle before it is exposed publicly.
+
+---
+
+#### `apps/api/src/auth/cookies.ts` and `session.guard.ts`
+
+**Step 96** · 2026-08-06
+
+**What they do.** Turn a `Cookie` header into a tenant, and make that the *only* way a controller can
+obtain one.
+
+**Rule 1 has had no mechanism until now.** "Every query is scoped by a `businessId` taken from the
+authenticated session" has been a rule with nothing enforcing it on the HTTP side — `AuthService` could
+resolve a tenant, but nothing obliged a controller to ask. `SessionGuard` resolves it once and attaches
+it; `@Session()` is the only sanctioned way to read it, and it can only produce what the guard put
+there. Reading `businessId` from a body or query param is now something you have to write code that
+visibly bypasses this file to do. **The wrong thing has to look wrong.**
+
+**`@Session()` throws when the guard has not run, and that is the important line in the file.** A route
+decorated with `@Session()` but missing `@UseGuards(SessionGuard)` would otherwise hand the controller
+`undefined` — and `businessId: undefined` in a Prisma `where` clause does not error and does not filter.
+Prisma treats an undefined filter as absent, so that route returns **every tenant's rows**. Failing at
+the decorator is the difference between a 500 in development and a cross-tenant leak in production.
+
+**One rejection message for every failure mode.** No cookie, bad signature, expired, revoked, deleted
+user — all `Not authenticated`. Distinguishing them tells an attacker which of those they achieved.
+
+**A design decision reversed mid-step.** The first version used the `__Host-` cookie prefix, which is
+strictly safer: browsers enforce `Secure`, `Path=/`, and **no `Domain` attribute**, so no sibling
+subdomain can mint a session. But forbidding `Domain` contradicts D9, which settled on
+`app.example.com` plus `api.example.com` sharing a cookie on the registrable domain, and it would have
+orphaned the existing `SESSION_COOKIE_DOMAIN` config. Following the recorded decision rather than
+silently deviating from it; the trade-off is written into the file so the next person sees the choice
+rather than the outcome.
+
+**`Secure` is derived from `PUBLIC_API_URL`, not `NODE_ENV`.** A staging environment on HTTPS gets the
+right behaviour without anyone remembering a flag, and a production deployment misconfigured onto HTTP
+loses the attribute loudly rather than silently failing to log anyone in.
+
+**`SameSite=Lax`, not `Strict`.** Lax is CSRF protection for every mutating route without a token dance.
+`Strict` would drop the cookie on the top-level navigation *from the SMS app* — the owner taps the magic
+link and lands logged out, which is the one flow that must work.
+
+**Set and clear are built from one attribute function.** They have to be byte-identical apart from the
+value and `Max-Age`, or the browser treats the clear as a different cookie, keeps the original, and
+logout becomes a button that appears to work. The spec asserts the attribute sets match.
+
+**Hand-rolled rather than `cookie-parser`.** One cookie, fifteen lines, and a dependency that would run
+on every request including every unauthenticated Twilio webhook. The parsing is the boring part; the
+attributes are what matter, and no library would have chosen them for us.
+
+**Watch out for.** `readCookie` returns the *first* match when a name appears twice. That is what
+browsers do, but a proxy that folds duplicate `Cookie` headers could produce one — worth knowing if a
+session ever behaves as though it is a step behind.
