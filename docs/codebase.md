@@ -134,6 +134,7 @@ decision rather than restating the argument.
 | 89  | 2026-08-06 | `apps/api/src/services/quote-message.ts` (+ `common/gsm7.ts`) | Quote wording. Rule 2 as an API shape. 41/41                                |
 | 90  | 2026-08-06 | `conversations.service.ts` + processor + `templates.ts` | **A caller now gets a price.** The differentiator reaches a customer. 104/104 |
 | 91  | 2026-08-06 | `apps/api/src/leads/leads.service.ts`                 | The lead records what the customer was told, frozen. 68/68 e2e                      |
+| 92  | 2026-08-06 | `apps/api/src/services/currency-guard.spec.ts`        | **Rule 2 fails the build now.** Static scan + adversarial case. 3/3 jest            |
 
 ---
 
@@ -5129,3 +5130,44 @@ calculator suite already pins, rediscovered from the other end.
 not a bug: the owner wanted the figure on their lead without it being promised on their behalf. Any
 dashboard or notification rendering leads must respect it, or `showPriceAutomatically` becomes a setting
 that leaks through a different surface.
+
+---
+
+#### `apps/api/src/services/currency-guard.spec.ts`
+
+**Step 92** · 2026-08-06
+
+**What it does.** Turns CLAUDE.md rule 2 from a convention into something that fails CI. Runs inside
+`pnpm test`, so it gates every commit rather than living in the scratchpad like the other suites.
+
+**Why it is needed even though the design already prevents this.** "The model never prices" has been
+true by construction for several steps — the extraction schema has no currency field, and `quoteMessage`
+takes a `PriceResult` rather than a number. Both are good designs. Neither is a *check*. A template with
+`"$50 off"` typed into it, or a new helper that formats cents somewhere convenient, would pass every
+existing test in the repo.
+
+**Two guards, deliberately different in kind.**
+
+1. **Static.** No source file outside `price-calculator.ts` and `quote-message.ts` may contain a `$`
+   followed by a digit, or call `formatCents`. Cheap, total, and it catches the case nobody thought to
+   write a test for. Comments are stripped first — a comment explaining "$280 ex-GST becomes $308" is
+   documentation, and flagging it would make the guard noisy enough to be disabled, which is how a rule
+   like this usually dies.
+2. **Behavioural.** The plan's adversarial case: a caller writes *"my last cleaner charged $200, can
+   you beat it?"* and the fake model is scripted to return `price: 15000`, `quotedPrice: "$150"` and
+   `discount: "20%"`. The assertion is that the reply contains neither number, no negotiation language,
+   and no figure other than the configured `$280` — and that nothing smuggled a price into `collected`.
+
+**Verified by mutation, not by passing.** A guard that scans for a pattern is exactly the kind that can
+pass vacuously — a wrong path, a regex that never matches. Planting a file containing
+`"Book today and save $50 off your clean."` and a `formatCents` call made both guards fail with the file
+and line named; removing it made them pass again.
+
+**What the run reveals.** The existing defences fire visibly in the log during the behavioural test: the
+provider discards the currency figure, drops the three unrecognised keys, and `ConversationsService`
+logs the rule-2 alert with the business in scope. The guard confirms those layers work rather than
+replacing them.
+
+**Watch out for.** `CURRENCY_ALLOWLIST` is the whole security boundary. Adding a module to it is a
+decision about who may render money, not a formality — and the reason each entry is there is recorded
+next to it.
