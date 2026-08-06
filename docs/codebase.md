@@ -131,6 +131,7 @@ decision rather than restating the argument.
 | 86  | 2026-08-05 | `apps/api/prisma/schema.prisma`                       | `conversations.pendingChoice` + `selectedServiceId`. 15th migration. 18/18 live     |
 | 87  | 2026-08-05 | `apps/api/src/conversations/conversations.service.ts` | The selection state machine. Menu replies never reach the model. 87/87              |
 | 88  | 2026-08-06 | `apps/api/src/jobs/processors/inbound-message.processor.ts` | Catalogue loaded, columns persisted. The menu reaches a real caller. 51/51 e2e |
+| 89  | 2026-08-06 | `apps/api/src/services/quote-message.ts` (+ `common/gsm7.ts`) | Quote wording. Rule 2 as an API shape. 41/41                                |
 
 ---
 
@@ -4947,3 +4948,72 @@ was added for.
 the catalogue existed, so they exercise the `NO_CATALOGUE` path only. That is the correct behaviour for
 a business mid-onboarding and it is genuinely the common case today — but it means the menu path has
 exactly one harness covering it, and it is this step's.
+
+---
+
+#### `apps/api/src/services/quote-message.ts`
+
+**Step 89** · 2026-08-06
+
+**What it does.** Turns a `PriceResult` into the sentence a caller reads. The other half of
+`price-calculator.ts`: that file decides *whether* there is a figure and *what* it is, this one decides
+how it is said. Separated so the arithmetic can be tested without arguing about wording, and the wording
+changed without touching money.
+
+**Rule 2 as an API shape, not a warning.** `quoteMessage(serviceName, price)` takes no number. There is
+no parameter that accepts cents, no arithmetic beyond re-deriving a unit rate that is then checked
+against the calculator's own total, and no way for a caller to inject a figure. To put a price in an
+outbound message you must first have obtained one from `calculatePrice`. A caller writing "my last
+cleaner charged $200, can you beat it?" has nowhere for that number to become a quote — the model never
+reaches this function, only a `PriceResult` does.
+
+**One template per pricing type**, and the qualifying words are load-bearing:
+
+| Quote type | Wording |
+| --- | --- |
+| `FIXED` | `Oven cleaning is $70 incl. GST.` |
+| `FIXED`, per-unit | `Carpet steam cleaning: 3 rooms at $40 = $120 incl. GST.` |
+| `FROM` | `... starts from $280 incl. GST. The final quote is confirmed once we have your details.` |
+| `ESTIMATE` | `... is around $70 incl. GST. The business will confirm the final price.` |
+
+A "from" price never reads as a quote — that is the figure most likely to be held against an owner
+later. Silence is the fourth outcome and the common one: `MANUAL_QUOTE`, a missing required answer, an
+out-of-range quantity, or `showPriceAutomatically: false` all return null, and the owner quotes in
+person.
+
+**The GST trap, and why the working is sometimes withheld.** Showing the arithmetic is worth money — a
+caller who can see how a number was reached argues with it less — but only if it adds up on screen. The
+stored rate is what the owner typed and may be GST-exclusive; ACL's single-price rule means every figure
+shown to a consumer must be GST-inclusive. Converting the rate and converting the total are two separate
+roundings to the cent, so for some rates `units x incRate` lands a cent from the calculator's total. A
+$33.33/hour rate is the case in the suite: 3 hours reconciles to $109.99 by one path and $109.98 by the
+other. Rather than print an equation a customer can disprove, or nudge a figure to make it look right,
+`unitWorking` returns null and the message states the total alone.
+
+**Three defects the suite found, and the third is the interesting one.**
+
+1. **A per-unit price with `quoteType: 'FIXED'` never showed its working.** Pricing type and quote type
+   are orthogonal — an owner can charge a firm, non-negotiable $40 a room — and "3 rooms at $40 = $120"
+   is exactly the message that stops that number being argued with. Only the estimate branch used it.
+2. The GST-exclusive per-unit case produced no working at all, for the same reason.
+3. **The service-name sanitiser was written twice, and the second copy had the bug the first one had
+   already been fixed for.** `serviceLabel` here used `normaliseToGsm7` alone, which maps lookalikes but
+   does not strip what has no GSM-7 equivalent — so a service named `Sarah's premium clean ✨` would have
+   turned every quote into a UCS-2 message, where the segment limit falls from 160 characters to 70
+   (rule 5). `service-options.toLabel` had been fixed for precisely this in step 81.
+
+   The duplication is what caused it, so the fix was to remove the duplication rather than patch the
+   copy: `gsm7Label(text, maxChars)` now lives in `common/gsm7.ts` and both callers use it. Its
+   docstring records the distinction that makes it a *separate* function from `normaliseToGsm7` —
+   developer-written text should fail loudly on an unmappable character, because a template containing
+   `Café` ought to break the build; owner-entered text must not, because failing loudly there means
+   refusing to answer a customer.
+
+**Connects to.** `price-calculator.ts` for every figure; `common/gsm7.ts` for the shared sanitiser and
+the module-load assertions. Not wired into the conversation yet — that is the next step, and it is where
+`selectedServiceId` finally turns into a number in front of a caller.
+
+**Watch out for.** The templates are asserted at two segments, not one, at a synthetic worst case: a
+maximum-length name with a five-figure total and a two-digit quantity. Squeezing them into 160 characters
+would mean cutting the qualifying clauses, and those clauses are the part that stops an estimate reading
+as a promise. If the wording is ever shortened, shorten the name, not the hedge.

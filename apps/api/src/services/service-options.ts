@@ -1,6 +1,6 @@
 import { MAX_ACTIVE_SERVICES, MAX_SERVICE_NAME_CHARS } from 'shared-types';
 import type { ServiceAvailability } from '../generated/prisma/client';
-import { assertSendable, isGsm7, normaliseToGsm7, segmentCount } from '../common/gsm7';
+import { assertSendable, gsm7Label, segmentCount } from '../common/gsm7';
 
 /**
  * The numbered service list a caller picks from, and its **strictly numeric** reply
@@ -193,7 +193,7 @@ export function buildServiceList(catalogue: readonly CatalogueEntry[]): ServiceL
     // than it looks: the snapshot makes a swap harmless for an in-flight reply, but an
     // unstable order makes the *list itself* different every time it is sent.
     .sort((a, b) => a.sortOrder - b.sortOrder || a.name.localeCompare(b.name) || a.id.localeCompare(b.id))
-    .map((service) => ({ serviceId: service.id, name: toLabel(service.name) }))
+    .map((service) => ({ serviceId: service.id, name: gsm7Label(service.name, MAX_OPTION_NAME_CHARS) }))
     .filter((o) => o.name.length > 0);
 
   if (usable.length < MIN_SERVICES_TO_LIST) {
@@ -232,26 +232,6 @@ function render(options: readonly PresentedOption[]): string {
   // The blank line separates the instruction from the choices. One character, and it is
   // the difference between a menu and a wall of text on a phone.
   return [HEADER, '', ...lines, `${options.length + 1}. ${OTHER_LABEL}`].join('\n');
-}
-
-/**
- * An owner-entered service name, made safe to put in an SMS.
- *
- * `normaliseToGsm7` maps the lookalikes — curly quotes, en dashes, ellipsis — which is
- * the right behaviour for message text a developer wrote. It does not, and should not,
- * remove characters with no GSM-7 equivalent. Service names are not developer text: an
- * owner who types "Sarah's premium clean ✨" into the dashboard would otherwise turn
- * every caller's list into a UCS-2 message, where the segment limit drops from 160
- * characters to 70. So anything still outside the charset after mapping is dropped.
- */
-function toLabel(name: string): string {
-  const mapped = normaliseToGsm7(name);
-  const stripped = [...mapped].filter((char) => isGsm7(char)).join('');
-  const clean = stripped.trim().replace(/\s+/g, ' ');
-  if (clean.length <= MAX_OPTION_NAME_CHARS) return clean;
-  // Trailing dots and spaces are stripped before the ellipsis dot is added, so a name
-  // cut mid-abbreviation reads as "Deep clean." rather than "Deep clean..".
-  return `${clean.slice(0, MAX_OPTION_NAME_CHARS - 1).replace(/[.\s]+$/, '')}.`;
 }
 
 /** What a reply to the list turned out to be. */

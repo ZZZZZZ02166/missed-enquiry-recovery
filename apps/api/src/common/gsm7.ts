@@ -189,3 +189,32 @@ export function normaliseToGsm7(text: string): string {
       .replace(/\u00a0/g, ' ')
   );
 }
+
+/**
+ * Owner-entered text, made safe to put inside a message.
+ *
+ * The distinction from `normaliseToGsm7` is deliberate and load-bearing.
+ * `normaliseToGsm7` maps lookalikes and leaves anything else to fail loudly, which is
+ * right for text a **developer** wrote: a template containing `Café` should break the
+ * build, not silently become `Caf`. This is for text an **owner** typed into the
+ * dashboard, where failing loudly means refusing to answer a customer. So here the
+ * unmappable characters are dropped.
+ *
+ * Why it lives in one place: this exact sanitiser was written twice — once for the
+ * service menu and once for quote wording — and the second copy silently omitted the
+ * strip, so a service named "Sarah's premium clean ✨" would have turned every quote
+ * into a UCS-2 message where the segment limit falls from 160 characters to 70 (rule 5).
+ * The first copy had already been fixed for the same bug. One implementation, two
+ * callers.
+ *
+ * Truncation ends in a period rather than an ellipsis so the result stays one segment's
+ * worth of characters and reads as an abbreviation. Trailing dots and spaces are removed
+ * first, so a cut name reads "Deep clean." and never "Deep clean..".
+ */
+export function gsm7Label(text: string, maxChars: number): string {
+  const mapped = normaliseToGsm7(text ?? '');
+  const stripped = [...mapped].filter((char) => isGsm7(char)).join('');
+  const clean = stripped.trim().replace(/\s+/g, ' ');
+  if (clean.length <= maxChars) return clean;
+  return `${clean.slice(0, maxChars - 1).replace(/[.\s]+$/, '')}.`;
+}
