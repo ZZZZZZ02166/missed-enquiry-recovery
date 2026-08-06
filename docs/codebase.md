@@ -135,6 +135,7 @@ decision rather than restating the argument.
 | 90  | 2026-08-06 | `conversations.service.ts` + processor + `templates.ts` | **A caller now gets a price.** The differentiator reaches a customer. 104/104 |
 | 91  | 2026-08-06 | `apps/api/src/leads/leads.service.ts`                 | The lead records what the customer was told, frozen. 68/68 e2e                      |
 | 92  | 2026-08-06 | `apps/api/src/services/currency-guard.spec.ts`        | **Rule 2 fails the build now.** Static scan + adversarial case. 3/3 jest            |
+| 93  | 2026-08-06 | `apps/api/prisma/schema.prisma`                       | Auth fields on `users`. Still 12 tables. 16th migration                             |
 
 ---
 
@@ -5171,3 +5172,32 @@ replacing them.
 **Watch out for.** `CURRENCY_ALLOWLIST` is the whole security boundary. Adding a module to it is a
 decision about who may render money, not a formality — and the reason each entry is there is recorded
 next to it.
+
+---
+
+#### `apps/api/prisma/schema.prisma` — magic-link and session fields
+
+**Step 93** · 2026-08-06 · migration `20260806085634_add_user_auth_fields`
+
+**What it does.** Five nullable/defaulted columns on `users`, plus one index. No new table — the
+locked count of twelve holds.
+
+**Why no `magic_links` table.** One column makes "one active link per user" an invariant of the schema
+rather than a rule some query has to remember. Requesting a new link overwrites the old, which is the
+behaviour you want anyway: an owner who taps "send me a link" twice should not leave a spare key in
+their inbox.
+
+**`magicLinkTokenHash`, never the token.** The link arrives by SMS and will sit in a phone's message
+history indefinitely, so it must be single-use and short-lived. Hashed for the same reason a password
+would be — a database read must not yield a working login. Indexed because the callback's only lookup is
+"find the user holding this hash", and without it every click is a sequential scan.
+
+**`sessionEpoch` is the revocation mechanism.** Sessions are stateless signed cookies, so there is no
+table to delete rows from. The epoch is embedded in the cookie and compared on every request;
+incrementing it invalidates every outstanding session for that user at once. That is what makes "log out
+everywhere" and "this account may be compromised" answerable at all.
+
+**Watch out for.** Adding an index on a nullable column indexes the nulls too, and almost every row will
+have one. It is small enough not to matter at pilot scale, but a partial index (`WHERE
+magic_link_token_hash IS NOT NULL`) is the right shape once there are real users — Prisma cannot express
+it, so it would be a hand-written migration.

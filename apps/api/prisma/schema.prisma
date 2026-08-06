@@ -98,12 +98,45 @@ model User {
   email String  @unique
   name  String?
 
+  /// SHA-256 of the outstanding magic-link token, never the token itself.
+  ///
+  /// The link is delivered by SMS and will sit in a phone's message history
+  /// indefinitely, so it has to be single-use and short-lived. Hashed for the same
+  /// reason a password would be: a database read must not yield a working login.
+  ///
+  /// One column rather than a `magic_links` table, and that is a real design choice —
+  /// it makes "one active link per user" an invariant of the schema instead of a rule
+  /// some query has to remember. Requesting a new link overwrites the old, which is the
+  /// behaviour you want anyway: an owner who taps "send me a link" twice should not
+  /// leave a spare key lying in their inbox.
+  magicLinkTokenHash String? @map("magic_link_token_hash")
+
+  /// When the outstanding link stops working. Short — minutes, not days.
+  magicLinkExpiresAt DateTime? @map("magic_link_expires_at")
+
+  /// Cleared to null on use. A non-null hash with a past expiry is a link that was never
+  /// clicked; both are wiped on consumption so a replay finds nothing.
+  magicLinkSentAt DateTime? @map("magic_link_sent_at")
+
+  /// Bumped to invalidate every session this user holds.
+  ///
+  /// Sessions are stateless signed cookies — there is no table to delete from — so this
+  /// integer is the revocation mechanism: it is embedded in the cookie and compared on
+  /// every request. Logging out, or a suspected compromise, increments it and every
+  /// outstanding cookie stops verifying at once.
+  sessionEpoch Int @default(0) @map("session_epoch")
+
+  lastLoginAt DateTime? @map("last_login_at")
+
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
 
   business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
 
   @@index([businessId])
+  /// The callback's only lookup: find the user holding this token hash. Without it every
+  /// magic-link click is a sequential scan of `users`.
+  @@index([magicLinkTokenHash])
   @@map("users")
 }
 
