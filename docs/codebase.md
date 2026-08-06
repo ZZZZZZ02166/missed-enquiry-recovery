@@ -137,6 +137,7 @@ decision rather than restating the argument.
 | 92  | 2026-08-06 | `apps/api/src/services/currency-guard.spec.ts`        | **Rule 2 fails the build now.** Static scan + adversarial case. 3/3 jest            |
 | 93  | 2026-08-06 | `apps/api/prisma/schema.prisma`                       | Auth fields on `users`. Still 12 tables. 16th migration                             |
 | 94  | 2026-08-06 | `apps/api/src/auth/tokens.ts` (+ spec)                | Magic-link and session crypto. Pure, 14/14 in CI                                    |
+| 95  | 2026-08-06 | `apps/api/src/auth/auth.service.ts`                   | The authentication boundary. Open redirect found and fixed. 45/45                   |
 
 ---
 
@@ -5251,3 +5252,47 @@ code.
 **Watch out for.** `SESSION_TTL_MS` is thirty days because the owner is a sole trader checking a lead on
 a phone between jobs, and re-authenticating weekly is how a product stops being opened. Expiry is *not*
 the revocation mechanism — `sessionEpoch` is, and it is carried in the claims for exactly that reason.
+
+---
+
+#### `apps/api/src/auth/auth.service.ts`
+
+**Step 95** · 2026-08-06
+
+**What it does.** Magic links in, sessions out. The owner's primary surface is an SMS with a link in it
+(D6) — a cleaner on a roof will not type a password into a phone, and any flow that asks them to is a
+flow they abandon. So the link *is* the login, which makes this file the entire authentication boundary:
+every tenant-scoped query in the product depends on `resolveSession` returning the right `businessId`
+or nothing at all.
+
+**Single-use is a compare-and-set, not a read-then-write.** `updateMany` carries the token hash it
+expects to find, so if two requests race — a link preview fetching the URL a millisecond before the
+human taps it is the common case, not a hypothetical — exactly one gets `count === 1`. Proven with ten
+simultaneous consumptions of one token: one wins.
+
+**`businessId` comes from the database, not from the cookie**, even though the cookie's copy is signed
+and would be safe to trust. If a user is ever moved between businesses, a signed-but-stale cookie would
+otherwise keep reading the old tenant's data for thirty days. Rule 1 says the tenant comes from the
+session; this makes "the session" mean the current state of the world. Tested by minting a validly
+signed cookie carrying the *wrong* tenant and asserting the resolved business is the real one.
+
+**Email lookup never discloses whether an account exists.** `requestLinkByEmail` returns null for both
+an unknown address and a link it did mint. An endpoint that says "no such user" is an
+account-enumeration oracle, and for a product whose customers are listed on Google Maps that is a real
+disclosure.
+
+**One security bug found, and it is the interesting one.** `next` exists so a lead SMS drops the owner
+on the lead rather than the inbox — which makes it a redirect target inside an unauthenticated URL, the
+classic open-redirect surface. The first implementation validated it with `startsWith('/')`, which is
+**not enough**: `//evil.example` starts with a slash and is a *protocol-relative* URL that browsers
+resolve to `https://evil.example`. A link on our own domain landing on somebody else's login page
+borrows all of our credibility, which is exactly the phishing lever.
+
+`safeRedirect` now requires a single leading slash, rejects two slash-ish characters, rejects any
+backslash (browsers normalise them to slashes, so `/\evil.example` reaches the same place), and rejects
+anything carrying a scheme — `/javascript:alert(1)` is a path by the naive rule and a scheme once a
+browser strips the leading slash. The suite covers all eight shapes.
+
+**Watch out for.** `requestLinkByEmail` has **no rate limit**. Minting is cheap and the response is
+identical either way, so it is not an enumeration oracle — but it is an unauthenticated endpoint that
+writes to `users` on every call, and it needs a per-address throttle before it is exposed publicly.
