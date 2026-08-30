@@ -5,6 +5,7 @@ import { HealthController } from './health/health.controller';
 import { JobsModule } from './jobs/jobs.module';
 import { LeadsModule } from './leads/leads.module';
 import { PrismaModule } from './prisma/prisma.module';
+import { ServicesModule } from './services/services.module';
 import { TelephonyModule } from './telephony/telephony.module';
 
 /**
@@ -24,7 +25,7 @@ import { TelephonyModule } from './telephony/telephony.module';
  *   auth, businesses, services, calls, conversations, leads, notifications, jobs
  */
 @Module({
-  imports: [PrismaModule, AuthModule, JobsModule, TelephonyModule, ConversationsModule, LeadsModule],
+  imports: [PrismaModule, AuthModule, JobsModule, TelephonyModule, ConversationsModule, LeadsModule, ServicesModule],
   controllers: [HealthController],
 })
 export class AppModule {}
