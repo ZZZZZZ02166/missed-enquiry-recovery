@@ -25,3 +25,11 @@ test-results/
 
 # Project-local Node toolchain (see .tools/env.sh). Binaries, never committed.
 .tools/node/
+
+# Playwright MCP scratch output — accessibility snapshots and screenshots written during
+# browser testing. Session artefacts, never source.
+.playwright-mcp/
+
+# Screenshots dropped at the repo root by browser tooling. Deliberately narrow rather than
+# a blanket *.png, so a real image can still be committed into docs/.
+/*.png
