@@ -60,8 +60,19 @@ export class AuthService {
       },
     });
 
-    // The token goes in the query string, which is why it is base64url.
-    return `${env.PUBLIC_WEB_URL}/auth/callback?token=${token}&next=${encodeURIComponent(safeRedirect(redirectPath))}`;
+    // **Points at the API, not the dashboard.** `/auth/callback` is a route on this
+    // server: it consumes the token, sets the session cookie, and *then* redirects to
+    // `PUBLIC_WEB_URL`. Building the link from the web origin instead produces a URL the
+    // dashboard has no page for, and the owner taps it and gets a 404.
+    //
+    // That was the original bug here, and it survived every test because the test
+    // scripts rewrote the port before using the link — which is a good reason never to
+    // "fix up" a value on the way into a test.
+    //
+    // The cookie still reaches the dashboard: it is set with `SESSION_COOKIE_DOMAIN`,
+    // the registrable domain both hosts share (D9), so a cookie set by a response from
+    // `api.example.com` is sent by `app.example.com`.
+    return `${env.PUBLIC_API_URL}/auth/callback?token=${token}&next=${encodeURIComponent(safeRedirect(redirectPath))}`;
   }
 
   /**

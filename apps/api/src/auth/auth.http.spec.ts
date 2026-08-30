@@ -1,6 +1,7 @@
 import { Controller, Get, INestApplication, UseGuards } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
+import { env } from '../config/env';
 import { PrismaService } from '../prisma/prisma.service';
 import { AuthModule } from './auth.module';
 import { AuthService, type AuthenticatedSession } from './auth.service';
@@ -74,6 +75,26 @@ describe('auth over HTTP', () => {
     const url = await auth.mintLinkForUser(userId);
     return new URL(url).searchParams.get('token') ?? '';
   };
+
+  it('THE 404 BUG — the minted link points at the API, not the dashboard', async () => {
+    // `/auth/callback` is a route on the API. A link built from PUBLIC_WEB_URL points at
+    // the dashboard, which has no such page, and the owner taps their lead text and gets
+    // a Next.js 404. It survived every earlier test because the test scripts rewrote the
+    // port before using the link.
+    const url = new URL(await auth.mintLinkForUser(userId, '/leads'));
+    const api = new URL(env.PUBLIC_API_URL);
+    const web = new URL(env.PUBLIC_WEB_URL);
+
+    expect(url.origin).toBe(api.origin);
+    expect(url.pathname).toBe('/auth/callback');
+    // Only meaningful when the two actually differ, which locally they do (3101 vs 3000).
+    if (api.origin !== web.origin) expect(url.origin).not.toBe(web.origin);
+
+    // And the link must actually be answerable by this server.
+    await request(app.getHttpServer())
+      .get(`${url.pathname}${url.search}`)
+      .expect(302);
+  });
 
   it('rejects a protected route with no cookie', async () => {
     await request(app.getHttpServer()).get('/test/protected').expect(401);

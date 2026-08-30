@@ -61,13 +61,38 @@ export class AuthController {
   async requestLink(@Body() body: RequestLinkDto): Promise<{ status: string }> {
     const link = await this.auth.requestLinkByEmail(body.email);
 
-    if (link) {
-      // TODO(email): hand to a transport. Logged at debug so a developer can complete a
-      // login locally without one, and never at info — this string is a live credential.
-      this.logger.debug(`Magic link minted: ${link}`);
+    if (link) this.deliver(link);
+    return { status: 'accepted' };
+  }
+
+  /**
+   * Where a minted link is supposed to go, and currently does not.
+   *
+   * **There is no email transport yet.** The owner's real path is the magic link inside
+   * every lead SMS (D6), so this form is a fallback — but a fallback that shows "check
+   * your messages" and then sends nothing is worse than no form at all, because the
+   * person waits.
+   *
+   * Until a transport exists, the two environments behave differently on purpose:
+   *
+   * - **Development** prints the link at `warn`, where it is actually visible, so a
+   *   developer can complete a login locally. It is prefixed loudly because it *is* a
+   *   live credential sitting in a terminal.
+   * - **Production** logs that a link was requested and could not be delivered, and
+   *   deliberately does **not** include it. A credential in a production log is a
+   *   credential in whatever aggregates that log. The alert is greppable so this shows up
+   *   as an operational gap rather than as silence.
+   */
+  private deliver(link: string): void {
+    if (env.NODE_ENV === 'production') {
+      this.logger.error(
+        `${EMAIL_TRANSPORT_MISSING} A sign-in link was minted but not delivered: no email ` +
+          'transport is configured. The requester is waiting and will receive nothing.',
+      );
+      return;
     }
 
-    return { status: 'accepted' };
+    this.logger.warn(`[dev only] No email transport — sign-in link: ${link}`);
   }
 
   /**
@@ -135,6 +160,14 @@ export class AuthController {
     return { status: 'signed_out' };
   }
 }
+
+/**
+ * Greppable marker for the one thing this controller cannot do.
+ *
+ * Same convention as `CATALOGUE_ALERT` and `BACKLOG_ALERT`: a constant string with no
+ * interpolation, so an alert rule matches it exactly.
+ */
+export const EMAIL_TRANSPORT_MISSING = 'EMAIL_TRANSPORT_MISSING';
 
 /** The dashboard's origin, without a trailing slash. */
 function webBase(): string {
