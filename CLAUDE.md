@@ -119,6 +119,7 @@ missed-enquiry-recovery/
 | `docs/carrier-forwarding-test.md` | Telstra/Optus/Vodafone results matrix. **Go/no-go gate — fill in before product code.**                                                                |
 | `docs/compliance.md`              | Spam Act, opt-out, GST/single-price, privacy, retention.                                                                                               |
 | `docs/build-report-92-98.md`      | Narrative report for the CI currency guard and the whole auth module — what was built, why, and what is still missing.                                  |
+| `docs/build-report-99-104.md`     | The services module, leads API and dashboard — what was built, the five bugs found, and the file and line to open for each explanation.                    |
 | `docs/remaining-plan.md`          | **Everything left to build**, with dependencies, decisions, deferrals and the critical path. Start here when picking up work.                                                                                               |
 
 Full plan and review: `~/.claude/plans/i-m-building-a-missed-enquiry-soft-finch.md`.
