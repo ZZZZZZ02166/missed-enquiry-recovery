@@ -171,17 +171,30 @@ Health: `curl http://localhost:3101/health` (liveness) · `/health/ready` (datab
 
 ## Current stage
 
-**Week 0 — scaffolding complete.** The skeleton runs end to end: both apps build, 26 tests pass,
-Prisma is migrated against a live Postgres, and API and worker both boot from the same module graph.
+**The pilot loop is complete, end to end.** A missed call becomes an SMS, the caller picks a service
+from a numbered menu, gets a GST-inclusive price where the owner configured one, and the owner receives
+a structured lead by text with a working single-use login. They open it, read the transcript, ring the
+customer back and mark it won with a value.
 
-**No product code yet.** Two things gate what comes next:
+Verified in a real browser against a running API and Postgres, not only in tests: 240 jest tests,
+typecheck, lint and build clean across four packages.
 
-1. **The carrier forwarding test** (`docs/carrier-forwarding-test.md`) is unresolved and is a go/no-go
-   on the entire design. If AU carriers don't preserve the original caller's number on a forwarded leg,
-   there is nobody to text and the architecture changes.
-2. **The D8 tenancy assertion extension is not applied yet.** It lands with `phone_numbers`, the first
-   genuinely tenant-scoped model. `businesses` and `users` are the tenant root and are legitimately
-   queried unscoped.
+**Modules built:** `auth`, `services`, `leads`, `telephony`, `calls`, `conversations`, `notifications`,
+`jobs`, `common`, `prisma`. **Dashboard:** sign-in, expired-link, inbox, lead detail, services settings.
 
-Next module order: `auth` → `businesses` → `telephony` → `calls` → `conversations` → `services` →
-`leads` → `notifications`.
+**Still open — see `docs/remaining-plan.md` for the full list:**
+
+- `businesses` settings API and UI (three pilots can be configured with SQL)
+- Conversation thread view and manual reply
+- `attachments` — the 12th table, photo upload by tokenised link
+- Deploy, CI, Sentry
+- No rate limit on `POST /auth/request-link`; no email transport (the SMS path is the real one)
+
+**Two things gate everything and neither is code:**
+
+1. **The carrier forwarding test** (`docs/carrier-forwarding-test.md`) is still unresolved and is still a
+   go/no-go on the whole design. If AU carriers do not preserve the original caller's number on a
+   forwarded leg, there is nobody to text.
+2. **Extraction has never run against a real model.** Every conversation test uses `FakeLlmProvider`.
+
+

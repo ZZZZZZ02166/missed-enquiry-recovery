@@ -1,5 +1,9 @@
 # Remaining plan
 
+> **Updated after the services module, leads API and dashboard landed.** Sections 3.1, 3.2 and 4 are
+> now largely done — what remains is listed in §10 at the bottom. The rest of this document is kept as
+> written because the reasoning behind each deferral still holds.
+
 Everything left to build, as of step 98. Written to be actionable: each task names its files, its
 dependencies, the decisions it needs, and how you would know it is done.
 
@@ -290,3 +294,34 @@ build a settings screen for three rows.
 
 **Do G1 first.** A failed carrier test invalidates the architecture, and it costs an afternoon against
 25 steps of work built on top of it.
+
+---
+
+## 10. Status update — what has since been built
+
+Done since this plan was written:
+
+| Was | Now |
+| --- | --- |
+| §3.1 Services module (3 steps) | **Done.** Service, controller, exception filter, module, 21 HTTP tests. Plus pricing validation added to `shared-types`, which this plan did not anticipate |
+| §3.2 Leads API (3 steps) | **Done.** `list` with cursor pagination, `get` with transcript, `setOutcome`, 18 HTTP tests |
+| §4 items 1–6 (dashboard) | **Done.** API client, sign-in, expired-link, shell, inbox, lead detail with Won/Lost, services settings |
+
+**Verified in a real browser**, against a running API and Postgres: magic link → session cookie → inbox →
+lead detail → mark won → services settings → seed defaults. Two bugs were found this way that no test
+had caught — see `docs/codebase.md`.
+
+### Still outstanding
+
+| Area | Steps | Why it was deferred |
+| --- | ---: | --- |
+| `businesses` settings API + UI | 4 | Three pilot businesses can be configured with direct SQL |
+| Conversation thread + manual reply | 4 | The lead detail already shows the transcript; only *replying* is missing |
+| `attachments` — 12th table, tokenised upload | 4 | Photos are valuable but not required to win a job |
+| Deploy, CI, Sentry, prod env | 4–6 | Nothing to deploy until the carrier test passes |
+| Rate limit on `POST /auth/request-link` | 1 | Unauthenticated and writes on every call |
+| Email transport for `request-link` | 1 | The SMS path is the real one; this is the fallback |
+| Polish | 2 | |
+
+**~20 steps left**, none of which block a pilot except deployment — and deployment is blocked by the
+carrier test, not by code.

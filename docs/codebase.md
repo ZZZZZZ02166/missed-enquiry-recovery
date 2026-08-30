@@ -5450,3 +5450,87 @@ once.
 **Watch out for.** Because the budget is exactly full, any new field on the owner template pushes a
 worst-case lead to four segments. The module-load assertion will catch it — but the fix at that point is
 to shorten the link, not to raise `MAX_OWNER_SEGMENTS`.
+
+---
+
+## Steps 99–103 · The pilot loop closes
+
+**2026-08-29** · `packages/shared-types`, `apps/api/src/services/*`, `apps/api/src/leads/*`,
+`apps/web/src/*`
+
+Grouped rather than one entry per file: this is one change — an owner can now configure a catalogue and
+act on the leads it produces — and splitting it across nine files would hide that.
+
+### What landed
+
+| Area | Files |
+| --- | --- |
+| Pricing validation | `shared-types/src/service-catalogue.ts` — `validateServicePricing` |
+| Catalogue CRUD | `services.service.ts`, `services.controller.ts`, `catalogue-validation.filter.ts`, `services.module.ts` |
+| Leads API | `leads.service.ts` (+`list`, `get`, `setOutcome`), `leads.controller.ts` |
+| Dashboard | `lib/api.ts`, `lib/format.ts`, `components/AppShell.tsx`, `app/globals.css`, and five routes |
+| Tests | `services.http.spec.ts` (21), `leads.http.spec.ts` (18) |
+
+### The decisions worth recording
+
+**Every catalogue mutation validates the catalogue as it will be *after* the change.** A duplicate name,
+a colliding sort position and a seventh active service are all properties of the whole list — none of
+them is visible by looking at one service. So each method projects the change onto the current
+catalogue, validates the projection, and only then writes.
+
+**Pricing coherence is a save-time rule, not a runtime one.** `PriceCalculator` already refuses to quote
+a half-configured service and falls through to a manual quote. That is correct at runtime and completely
+invisible to the owner: they set a service to `FIXED`, forget the price, and never find out why no
+customer was quoted. The failure is silent, permanent, and costs them the exact thing they bought. So a
+`FIXED` service with no price now cannot be saved.
+
+**Disable, do not delete.** A service with leads against it is disabled; one nothing references is
+genuinely deleted. `leads.serviceId` is `SetNull`, so a hard delete would not orphan a lead — but it
+would erase which service every past lead was about, and a quote the owner has to explain six months
+later is worth more than a tidy table.
+
+**Reorder takes the whole list.** The only shape that validates atomically — a per-service move has an
+intermediate state where two positions collide — and a drag-and-drop UI has the whole list anyway.
+
+**422 with the issue array intact.** `validateCatalogue` deliberately returns *every* issue rather than
+the first; flattening them to a string at the HTTP boundary would throw that away and put the owner back
+to one problem per save. The dashboard renders them directly.
+
+**One validation module, two apps.** `shared-types` is imported by the form and by the server, so the
+browser cannot accept something the API will reject. The browser copy is for speed of feedback; the
+server's is the one that counts.
+
+### Three bugs, and how each was found
+
+1. **A partial update wiped the name.** `toDraft` defaulted a missing name to `''`, so any PATCH that did
+   not resend the name — toggling availability, changing a price — projected an empty name and was
+   rejected with "Give this service a name". Caught by the services HTTP spec.
+
+2. **`PATCH /leads/:id` answered with a different shape from `GET`.** The update returned the bare row —
+   no customer, no transcript — and the lead screen crashed reaching for `customer.name`. **Found by
+   clicking, not by any test**: every existing test asserted on fields the bare row happened to have.
+   `setOutcome` now re-reads through `get`, and a test pins the shape.
+
+3. **A test that hid a working rule.** The services spec accumulated services across cases and
+   legitimately tripped the six-active ceiling — the rule working, reported as four unrelated failures.
+   Fixed with per-test cleanup, not by weakening the rule.
+
+### Verified in a browser, not only in tests
+
+Against a running API and Postgres: a real magic link set a session cookie, the inbox listed the lead,
+the detail screen showed the transcript and the `$308+ incl. GST` quote with "the customer has been told
+this figure", marking it won persisted, and the services screen seeded four defaults and enforced the
+ceiling.
+
+The CORS failure encountered along the way was informative: the dashboard showed *"could not reach the
+server"* rather than redirecting to sign-in, which is the designed behaviour — **a network failure is not
+a logout**, and sending someone to sign in again would be both a lie and useless.
+
+### Watch out for
+
+- The dashboard never derives a currency figure. `money()` formats what the API computed; the CI currency
+  guard forbids anything outside the pricing modules from rendering money, and that includes this app.
+- `quoteShownToCustomer: false` with a real amount is rendered as "not shown to the customer", never as a
+  quote. Showing it as one would undo the owner's explicit choice not to promise it.
+- The lead detail's Won/Lost is reversible. An owner tapping the wrong one on a phone in sunlight should
+  not have to live with it.

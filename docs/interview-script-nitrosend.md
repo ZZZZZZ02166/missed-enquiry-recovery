@@ -6,6 +6,11 @@ platform in this repo, mapped onto Nitrosend's stack.
 **How to use this:** read sections 1, 2 and 8 the morning of. Sections 3–5 are the stories — know two
 of them cold rather than all six loosely. Section 7 is what they said they scrutinise most.
 
+**Every story carries the files to open.** If you get a screen share, have the repo up and go to the
+code as you talk — "let me show you" lands far harder than "let me tell you". Line numbers are accurate
+as of this commit; if the code has moved, search for the function name instead. Section 12 is the whole
+file map on one page, for when you need to find something fast under pressure.
+
 ---
 
 ## 0. Three things to get right before you say anything technical
@@ -75,6 +80,18 @@ If you get a whiteboard or a screen share, draw this. Talk left to right.
                                       └──► lead + owner SMS w/ magic link
 ```
 
+**Files to have open while you draw this:**
+
+| Part of the diagram | File |
+| --- | --- |
+| Twilio calls in | `apps/api/src/telephony/voice.controller.ts` · `messages.controller.ts` |
+| Signature validation | `apps/api/src/telephony/twilio-signature.guard.ts:29` |
+| Idempotency record | `apps/api/src/telephony/webhook-events.service.ts` |
+| Queue + bounded enqueue | `apps/api/src/jobs/queues.ts:198` |
+| The worker's brain | `apps/api/src/jobs/processors/inbound-message.processor.ts` |
+| The conversation decision | `apps/api/src/conversations/conversations.service.ts:228` |
+| Two entrypoints, one codebase | `apps/api/src/main.ts` and `apps/api/src/worker.ts` |
+
 **Four things to say while you draw it:**
 
 1. **"Validate, persist, enqueue, return."** Twilio times out webhooks at about 15 seconds. You never
@@ -122,6 +139,8 @@ It's silent *and* self-concealing. The retry — the thing that's supposed to sa
 success. You only find it when a business owner asks why a customer never heard back, and by then you've
 lost the job.
 
+**Show them:** `apps/api/src/jobs/processors/inbound-message.processor.ts`
+
 ### The fix: reserve, send, confirm
 
 Instead of writing state and then sending, we write a **reservation** first:
@@ -130,6 +149,13 @@ Instead of writing state and then sending, we write a **reservation** first:
 1. INSERT a message row: body, to, from, provider_message_id = NULL
 2. Send via Twilio
 3. UPDATE that row with the provider's message id
+```
+
+```
+inbound-message.processor.ts:480   the reservation — a row with no provider id yet
+inbound-message.processor.ts:505   deliver() — send, then confirm with the sid
+inbound-message.processor.ts:576   flushUnsentReplies() — runs before anything new
+inbound-message.processor.ts:148   ...called first thing in process()
 ```
 
 A row with a null `provider_message_id` is a durable statement: *"we owe this person exactly these
@@ -144,6 +170,9 @@ We wrote it into the project's hard rules:
 > **Never write an idempotency marker before the side effect it marks.** Send, then record. Enqueue, then
 > mark processed. If the marker genuinely must come first, it has to be a *reservation* the retry can
 > find and complete — never a claim that the work is finished.
+
+**Show them:** `CLAUDE.md:80` — rule 13, written into the project's invariants. And the sweep that
+catches anything the flush misses: `apps/api/src/jobs/processors/inbound-reconciler.processor.ts:99`.
 
 We'd hit the same shape four separate times: marking a job processed before enqueueing, a status write
 clobbering a later one, re-adding a completed job id, and this one.
@@ -177,6 +206,16 @@ configuration.
 
 ### Three layers enforcing it, and why one wasn't enough
 
+**Show them, in this order** — the three layers are three files, which makes the point visually:
+
+```
+apps/api/src/conversations/extraction.ts:78      the schema — no currency field exists
+apps/api/src/services/quote-message.ts:29        takes a PriceResult, never a number
+apps/api/src/services/price-calculator.ts:83     the only thing that computes money
+apps/api/src/services/currency-guard.spec.ts:26  the CI guard + its allowlist
+CLAUDE.md:58                                     rule 2, stated as an invariant
+```
+
 **Layer 1 — the schema has nowhere to put a price.** The extraction JSON schema has no currency field.
 A model that tries to quote has nowhere for the number to go, and validation drops it. *An instruction
 can be talked around; a schema cannot.*
@@ -191,9 +230,9 @@ existing test would pass. So:
 
 - A static scan of every source file: no module outside the two pricing modules may contain a `$`
   followed by a digit, or call the money formatter.
-- An adversarial test: a caller writes *"my last cleaner charged $200, can you beat it?"* and the fake
-  model is scripted to return a discount. The assertion is that the reply contains neither number and no
-  negotiation language.
+- An adversarial test (`currency-guard.spec.ts:97`): a caller writes *"my last cleaner charged $200, can
+  you beat it?"* and the fake model is scripted to return a discount. The assertion is that the reply
+  contains neither number and no negotiation language.
 
 **And I mutation-tested the guard** — planted a file with `"save $50"` in it to confirm the guard
 actually fails, because a scanner that never matches passes vacuously.
@@ -218,6 +257,16 @@ about their problem, not just yours.
 SMS has a trap: a message is 160 characters if it's pure GSM-7, but **70 characters** if a single
 character falls outside that set. One curly apostrophe pasted from a Word document turns a one-segment
 message into three and triples the bill on every send.
+
+**Show them:**
+
+```
+apps/api/src/common/gsm7.ts:91          segmentInfo — the charset and segment maths
+apps/api/src/common/gsm7.ts:214         gsm7Label — the shared sanitiser (see the bug below)
+apps/api/src/notifications/templates.ts:304   assertAllTemplates() — runs at import
+apps/api/src/notifications/templates.ts:312   the deliberately worst-case lead it asserts against
+CLAUDE.md:63                            rule 5
+```
 
 What we did:
 
@@ -256,6 +305,19 @@ What service do you need? Reply with one number only.
 And the reply parser became **strict**: the entire trimmed message must be one integer in range.
 `two`, `2 please`, `option 2`, `1,3`, `2 bedrooms` are all rejected with a re-prompt.
 
+**Show them:**
+
+```
+apps/api/src/services/service-options.ts:265   resolveSelection — the strict parser
+apps/api/src/services/service-options.ts:166   buildServiceList — the menu, from the owner's catalogue
+apps/api/src/services/service-matcher.ts       the fuzzy version it replaced, kept for the no-menu case
+apps/api/src/conversations/conversations.service.ts:236   the early return — a menu reply never reaches the model
+```
+
+That last line is worth showing on screen. It's an early return placed *above* the LLM call, so an
+unusable reply to a menu cannot cost a model call at all — the property is visible in the control flow
+rather than asserted in a comment.
+
 **The thing to say:** *"strictness deleted code rather than adding it."* The loose parser needed a table
 of unit words so `"2 bedrooms"` couldn't select option 2, and a comma-splitting rule for `"1,3"`. Both
 heuristics disappeared. **A rule with no exceptions needs no exceptions handled.**
@@ -267,6 +329,17 @@ misread digit is quoting the wrong job at the wrong price.
 
 Every query is scoped by `business_id` taken from the authenticated session, never from anything the
 client sends. Two mechanisms:
+
+**Show them:**
+
+```
+apps/api/src/prisma/tenant-guard.ts:26     TENANT_MODELS — which models must be scoped
+apps/api/src/prisma/tenant-guard.ts:67     TenantScopeError
+apps/api/src/prisma/prisma.service.ts:49   db = base.$extends(tenantGuard) — guarded by default
+apps/api/src/prisma/prisma.service.ts:60   unscoped — the named, deliberate hole
+apps/api/src/auth/session.guard.ts:79      @Session() — throws if the guard did not run
+CLAUDE.md:56                               rule 1
+```
 
 **A database-layer assertion.** The ORM client is extended so that a query against a tenant-scoped model
 without a top-level `business_id` **throws**. It caught a bug in my own test last week.
@@ -299,6 +372,10 @@ credibility. That's the phishing lever exactly.
 Now it rejects protocol-relative forms, backslash variants (browsers normalise `\` to `/`), and embedded
 schemes like `/javascript:alert(1)`.
 
+**Show them:** `apps/api/src/auth/auth.service.ts:232` — `safeRedirect`, four lines and a comment
+explaining each one. The test that caught it is `apps/api/src/auth/auth.http.spec.ts`, and the eight
+hostile shapes are in the scratchpad suite.
+
 **The point to make:** *my own adversarial test caught it, not a review.* That's the argument for writing
 the hostile cases before you believe your own code.
 
@@ -325,6 +402,9 @@ problem.
 
 They use **GoodJob, which is Postgres-backed, not Redis-backed.** This is a genuine technical difference
 you can speak to intelligently:
+
+**Show them:** `apps/api/src/jobs/queues.ts:198` (`addJobBounded`), `:225` (`waitForRedisReady`) and
+`:142` (`PRODUCER_REDIS_OPTIONS`, where `enableOfflineQueue: false` is set and explained).
 
 > One of the nastiest problems I hit was that with a Redis-backed queue, the enqueue is a **separate
 > system from the database**. I had a case where Redis was unreachable and `queue.add()` never resolved
@@ -477,6 +557,90 @@ fixed.
 - [ ] Have you got the GoodJob-vs-Redis point ready? It's your best "I understand your stack" moment
 - [ ] Repo open in an editor in case they want to look
 - [ ] Two questions from section 9 written on paper
+- [ ] Repo open, terminal already in `apps/api`, section 12 map to hand
+
+---
+
+## 12. One-page file map
+
+For when they ask something and you need to find it in ten seconds.
+
+### The stories
+
+| Story | Open this |
+| --- | --- |
+| Reserve-send-confirm | `apps/api/src/jobs/processors/inbound-message.processor.ts:480` |
+| Rule 13 itself | `CLAUDE.md:80` |
+| Reconciliation sweeps | `apps/api/src/jobs/processors/inbound-reconciler.processor.ts:99` |
+| AI can't price — schema | `apps/api/src/conversations/extraction.ts:78` |
+| AI can't price — signature | `apps/api/src/services/quote-message.ts:29` |
+| AI can't price — CI guard | `apps/api/src/services/currency-guard.spec.ts:26` |
+| The adversarial "$200" test | `apps/api/src/services/currency-guard.spec.ts:97` |
+| GSM-7 maths | `apps/api/src/common/gsm7.ts:91` |
+| Templates asserted at import | `apps/api/src/notifications/templates.ts:304` |
+| Strict numeric parser | `apps/api/src/services/service-options.ts:265` |
+| Model skipped for menu replies | `apps/api/src/conversations/conversations.service.ts:236` |
+| Tenant guard | `apps/api/src/prisma/tenant-guard.ts:26` |
+| `@Session()` throws | `apps/api/src/auth/session.guard.ts:79` |
+| Open redirect fix | `apps/api/src/auth/auth.service.ts:232` |
+| Bounded enqueue (the Redis problem) | `apps/api/src/jobs/queues.ts:198` |
+
+### The system
+
+| Thing | Where |
+| --- | --- |
+| Entrypoints | `apps/api/src/main.ts` · `apps/api/src/worker.ts` |
+| Twilio webhooks in | `apps/api/src/telephony/voice.controller.ts` · `messages.controller.ts` |
+| Signature validation | `apps/api/src/telephony/twilio-signature.guard.ts:29` |
+| Webhook idempotency | `apps/api/src/telephony/webhook-events.service.ts` |
+| Conversation state machine | `apps/api/src/conversations/conversations.service.ts:228` |
+| Pricing | `apps/api/src/services/price-calculator.ts:83` |
+| Lead writing | `apps/api/src/leads/leads.service.ts` |
+| Owner notification | `apps/api/src/jobs/processors/notify-owner.processor.ts` |
+| Auth | `apps/api/src/auth/` (7 files) |
+| Schema | `apps/api/prisma/schema.prisma` (11 tables, 16 migrations) |
+| Shared validation, both apps | `packages/shared-types/src/service-catalogue.ts` |
+
+### The documentation
+
+| Doc | What it is |
+| --- | --- |
+| `CLAUDE.md` | The 13 hard rules. **Show them this if they ask how you kept quality up** |
+| `docs/codebase.md` | Every file, what it does and *why it's built that way* |
+| `docs/decisions.md` | Cross-file decisions, dated, with the rejected alternatives |
+| `docs/remaining-plan.md` | What's left, with the debt list |
+
+`docs/codebase.md` is worth a mention on its own: every file got an entry written *at the same time as
+the file*, including the bugs found and why the design changed. If they ask "how do you keep a codebase
+understandable", that's your answer and it's ~5,000 lines of evidence.
+
+---
+
+## 13. If you get a screen share — a two-minute demo
+
+Don't try to run it live; the database, Redis and Twilio all have to be up. Show **code and tests**
+instead — it's more impressive anyway, because it shows the failure modes.
+
+**Option A — the one to default to.** Open `inbound-message.processor.ts`, scroll to the reservation at
+line 480, and read the comment above it out loud. It explains the ordering and why the opposite ordering
+in `RecoveryProcessor` is also correct. That comment *is* the story.
+
+**Option B — if they like tests.** Run the currency guard:
+
+```bash
+cd apps/api && NODE_OPTIONS=--experimental-vm-modules npx jest src/services/currency-guard.spec.ts
+```
+
+Then say: *"and I mutation-tested it — I planted a file with `$50 off` in it to prove the guard actually
+fails, because a scanner that never matches passes vacuously."*
+
+**Option C — if they ask about the AI.** Open `extraction.ts:78` and point out that the schema has no
+currency field. One sentence: *"the model has nowhere to put a price, so it can't."*
+
+**Have the terminal in `apps/api` and the repo open before the call starts.** Fumbling for a file kills
+the momentum of a good answer.
+
+---
 
 **Last thing.** They're hiring their first junior to work directly with the CTO. They're not buying
 finished skill — they're buying judgement, curiosity, and whether they'll enjoy the next two years of
