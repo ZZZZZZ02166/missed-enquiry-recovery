@@ -78,7 +78,12 @@ export type CatalogueIssueCode =
   | 'SORT_ORDER_NOT_AN_INTEGER'
   | 'SORT_ORDER_NEGATIVE'
   | 'SORT_ORDER_DUPLICATE'
-  | 'TOO_MANY_ACTIVE';
+  | 'TOO_MANY_ACTIVE'
+  | 'PRICE_REQUIRED'
+  | 'PRICE_NEGATIVE'
+  | 'PRICE_ON_MANUAL_QUOTE'
+  | 'UNIT_LABEL_REQUIRED'
+  | 'UNIT_RANGE_INVALID';
 
 export interface CatalogueIssue {
   code: CatalogueIssueCode;
@@ -93,12 +98,93 @@ export interface CatalogueIssue {
   index?: number;
 }
 
+/** The four ways a service can be priced. Mirrors Prisma's `PricingType`. */
+export type PricingType = 'FIXED' | 'STARTING_FROM' | 'PER_UNIT' | 'MANUAL_QUOTE';
+
+/** The pricing fields, as the dashboard submits them. */
+export interface ServicePricingDraft {
+  pricingType: PricingType;
+  priceCents?: number | null;
+  unitLabel?: string | null;
+  minUnits?: number | null;
+  maxUnits?: number | null;
+}
+
 /** A service as the dashboard submits it — before it necessarily has an id. */
-export interface CatalogueDraftEntry {
+export interface CatalogueDraftEntry extends Partial<ServicePricingDraft> {
   id?: string;
   name: string;
   availability: ServiceAvailability;
   sortOrder: number;
+}
+
+/**
+ * Validate the pricing configuration of one service.
+ *
+ * **Why this is a save-time rule and not left to the calculator.** `PriceCalculator`
+ * already refuses to quote a half-configured service — it returns `NOT_CONFIGURED` and
+ * the conversation falls through to a manual quote. That is the correct runtime
+ * behaviour and it is completely invisible to the owner: they set a service to `FIXED`,
+ * forget the price, and then simply never find out why no customer was ever quoted. The
+ * failure is silent, permanent, and costs them the exact thing they bought the product
+ * for.
+ *
+ * So the rule lives where they can see it. A `FIXED` service without a price cannot be
+ * saved.
+ */
+export function validateServicePricing(entry: Partial<ServicePricingDraft>): CatalogueIssue[] {
+  const issues: CatalogueIssue[] = [];
+  const { pricingType, priceCents, unitLabel, minUnits, maxUnits } = entry;
+  if (!pricingType) return issues;
+
+  const needsPrice = pricingType === 'FIXED' || pricingType === 'STARTING_FROM' || pricingType === 'PER_UNIT';
+
+  if (needsPrice && (priceCents === null || priceCents === undefined)) {
+    issues.push({
+      code: 'PRICE_REQUIRED',
+      message:
+        pricingType === 'PER_UNIT'
+          ? 'Set the rate per unit, or change this to "quote manually".'
+          : 'Set a price, or change this to "quote manually".',
+    });
+  }
+
+  if (typeof priceCents === 'number' && priceCents < 0) {
+    issues.push({ code: 'PRICE_NEGATIVE', message: 'A price cannot be negative.' });
+  }
+
+  // Zero is deliberately allowed — a free callout is a real offer an owner may make.
+
+  if (pricingType === 'MANUAL_QUOTE' && typeof priceCents === 'number') {
+    issues.push({
+      code: 'PRICE_ON_MANUAL_QUOTE',
+      message:
+        'This service is set to quote manually, so the price is never used. Remove it, or ' +
+        'choose a pricing type that shows it.',
+    });
+  }
+
+  if (pricingType === 'PER_UNIT') {
+    if (!unitLabel || unitLabel.trim().length === 0) {
+      issues.push({
+        code: 'UNIT_LABEL_REQUIRED',
+        message: 'Say what is being counted — "room", "hour", "window".',
+      });
+    }
+    const lo = minUnits ?? null;
+    const hi = maxUnits ?? null;
+    const badBound = (v: number | null) => v !== null && (!Number.isInteger(v) || v < 0);
+    if (badBound(lo) || badBound(hi) || (lo !== null && hi !== null && lo > hi)) {
+      issues.push({
+        code: 'UNIT_RANGE_INVALID',
+        // The bounds are what stop "12 bedrooms" from a two-bedroom flat being priced as
+        // a real job rather than treated as a misread.
+        message: 'The smallest and largest quantities must be whole numbers, with the smallest first.',
+      });
+    }
+  }
+
+  return issues;
 }
 
 /**
@@ -181,6 +267,9 @@ export function validateCatalogue(entries: readonly CatalogueDraftEntry[]): Cata
 
   entries.forEach((entry, index) => {
     for (const issue of validateServiceName(entry.name)) {
+      issues.push({ ...issue, serviceId: entry.id, index });
+    }
+    for (const issue of validateServicePricing(entry)) {
       issues.push({ ...issue, serviceId: entry.id, index });
     }
 
