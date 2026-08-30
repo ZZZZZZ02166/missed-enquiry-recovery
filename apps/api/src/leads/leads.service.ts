@@ -1,5 +1,6 @@
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import type { CollectedAnswers, FieldKey } from '../conversations/question-flow';
+import type { LeadStatus } from '../generated/prisma/client';
 import { Prisma, type Lead } from '../generated/prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import type { PriceResult } from '../services/price-calculator';
@@ -87,11 +88,219 @@ function quoteColumns(
   };
 }
 
+/** How the owner filters their inbox. Every field optional; absent means "all". */
+export interface LeadListFilters {
+  status?: LeadStatus;
+  needsHuman?: boolean;
+  /** Opaque cursor — the id of the last lead on the previous page. */
+  cursor?: string;
+  limit?: number;
+}
+
+/** Statuses an owner may set by hand. `NEW` and `QUALIFYING` are the machine's to set. */
+export const OWNER_SETTABLE_STATUSES: readonly LeadStatus[] = ['QUOTED', 'WON', 'LOST'];
+
+/** What the hub renders. Counts, not rows — see `summary`. */
+export interface LeadSummaryCounts {
+  /** Open leads the conversation flagged for a person. The only urgent number here. */
+  needsAttention: number;
+  /** Everything not yet won or lost. */
+  openLeads: number;
+  /** Quoted and waiting on the customer. */
+  quoted: number;
+  /** Arrived in the last 24 hours. */
+  newToday: number;
+  wonThisWeek: { count: number; valueCents: number | null };
+}
+
+/** A page of leads plus the cursor for the next one. */
+export interface LeadPage {
+  leads: unknown[];
+  nextCursor: string | null;
+}
+
+/** Sensible page size for a phone. Bounded so a client cannot ask for everything. */
+const DEFAULT_PAGE = 25;
+const MAX_PAGE = 100;
+
 @Injectable()
 export class LeadsService {
   private readonly logger = new Logger(LeadsService.name);
 
   constructor(private readonly prisma: PrismaService) {}
+
+  /**
+   * The owner's inbox.
+   *
+   * **Cursor pagination, not offset.** An inbox grows and `OFFSET 500` makes the database
+   * walk five hundred rows to throw them away. A cursor is also stable while new leads
+   * arrive — with an offset, a lead landing mid-scroll shifts every subsequent page and
+   * the owner sees the same record twice.
+   *
+   * Ordered newest first, because a lead from four minutes ago is worth more than one
+   * from yesterday: this whole product exists to beat whoever calls back first.
+   */
+  async list(businessId: string, filters: LeadListFilters = {}): Promise<LeadPage> {
+    const take = Math.min(Math.max(filters.limit ?? DEFAULT_PAGE, 1), MAX_PAGE);
+
+    const leads = await this.prisma.db.lead.findMany({
+      where: {
+        businessId,
+        ...(filters.status ? { status: filters.status } : {}),
+        ...(filters.needsHuman === undefined ? {} : { needsHuman: filters.needsHuman }),
+      },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      // One extra row, purely to answer "is there another page?" without a second query.
+      take: take + 1,
+      ...(filters.cursor ? { cursor: { id: filters.cursor }, skip: 1 } : {}),
+      include: {
+        customer: { select: { name: true, phoneE164: true } },
+        service: { select: { name: true } },
+      },
+    });
+
+    const page = leads.slice(0, take);
+    return {
+      leads: page,
+      nextCursor: leads.length > take ? (page[page.length - 1]?.id ?? null) : null,
+    };
+  }
+
+  /**
+   * The hub's summary — what happened while the owner was on a roof.
+   *
+   * Counts rather than rows, because the landing page answers one question: *do I need
+   * to do anything right now?* A list cannot answer that at a glance; a number can.
+   *
+   * "This week" is a rolling 7×24h window rather than a calendar week, deliberately.
+   * Calendar boundaries need `businesses.timezone` and break twice a year on DST
+   * (rule 12); a rolling window is timezone-independent and means the same thing to
+   * everyone.
+   *
+   * One query per bucket rather than a `groupBy`, because the buckets are not disjoint —
+   * a lead can be both new and needing attention — and a grouped count would force the
+   * caller to reassemble them and get that overlap wrong.
+   */
+  async summary(businessId: string): Promise<LeadSummaryCounts> {
+    const weekAgo = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const dayAgo = new Date(Date.now() - 24 * 60 * 60 * 1000);
+    const open = { in: ['NEW', 'QUALIFYING', 'QUALIFIED', 'QUOTED'] as LeadStatus[] };
+
+    const [needsAttention, openLeads, quoted, newToday, wonThisWeek] = await Promise.all([
+      this.prisma.db.lead.count({ where: { businessId, needsHuman: true, status: open } }),
+      this.prisma.db.lead.count({ where: { businessId, status: open } }),
+      this.prisma.db.lead.count({ where: { businessId, status: 'QUOTED' } }),
+      this.prisma.db.lead.count({ where: { businessId, createdAt: { gte: dayAgo } } }),
+      this.prisma.db.lead.aggregate({
+        where: { businessId, status: 'WON', closedAt: { gte: weekAgo } },
+        _count: true,
+        _sum: { wonValueCents: true },
+      }),
+    ]);
+
+    return {
+      needsAttention,
+      openLeads,
+      quoted,
+      newToday,
+      wonThisWeek: {
+        count: wonThisWeek._count,
+        // Null when every won lead was recorded without a value — which is common, since
+        // the value is optional. Null and zero mean different things to the owner: "no
+        // jobs" versus "jobs, but you didn't tell us what they were worth".
+        valueCents: wonThisWeek._sum.wonValueCents,
+      },
+    };
+  }
+
+  /**
+   * One lead, with the conversation that produced it.
+   *
+   * The transcript is included because the owner's first question about any lead is
+   * "what did they actually say" — and the answer is the difference between calling back
+   * prepared and calling back cold.
+   */
+  async get(businessId: string, id: string) {
+    const lead = await this.prisma.db.lead.findFirst({
+      where: { id, businessId },
+      include: {
+        customer: { select: { name: true, phoneE164: true, lineType: true } },
+        service: { select: { name: true, pricingType: true } },
+        conversation: {
+          select: { id: true, state: true, collected: true, questionsAsked: true, lastInboundAt: true },
+        },
+      },
+    });
+
+    // 404, never 403: a 403 confirms the id exists, which lets one business enumerate
+    // another's leads by probing ids.
+    if (!lead) throw new NotFoundException('Lead not found');
+
+    const messages = await this.prisma.db.message.findMany({
+      where: { businessId, customerId: lead.customerId },
+      orderBy: { createdAt: 'asc' },
+      select: {
+        id: true, direction: true, body: true, status: true,
+        purpose: true, createdAt: true, sentAt: true,
+      },
+    });
+
+    return { ...lead, messages };
+  }
+
+  /**
+   * The owner marks an outcome.
+   *
+   * **This is the only writer of `wonValueCents` and `closedAt`**, and it is the metric
+   * the entire renewal conversation rests on — "we recovered $2,400 of work you would
+   * have lost" is the sentence that keeps a subscription. `nextLeadStatus` already
+   * refuses to regress past an owner-set outcome, so a late customer reply cannot undo
+   * this.
+   *
+   * `wonValueCents` is accepted only alongside `WON`. A value attached to a lost lead is
+   * either a mistake or a misunderstanding of the field, and silently storing it would
+   * corrupt the one number that matters.
+   */
+  async setOutcome(
+    businessId: string,
+    id: string,
+    input: { status?: LeadStatus; wonValueCents?: number | null; lostReason?: string | null; needsHuman?: boolean },
+  ) {
+    const existing = await this.prisma.db.lead.findFirst({
+      where: { id, businessId },
+      select: { id: true, status: true },
+    });
+    if (!existing) throw new NotFoundException('Lead not found');
+
+    const status = input.status ?? existing.status;
+    const closing = status === 'WON' || status === 'LOST';
+
+    await this.prisma.db.lead.update({
+      where: { id, businessId },
+      data: {
+        ...(input.status ? { status: input.status } : {}),
+        ...(input.needsHuman === undefined ? {} : { needsHuman: input.needsHuman }),
+        ...(status === 'WON' && input.wonValueCents !== undefined
+          ? { wonValueCents: input.wonValueCents }
+          : {}),
+        ...(status === 'LOST' && input.lostReason !== undefined
+          ? { lostReason: input.lostReason }
+          : {}),
+        // Set on the transition, and left alone afterwards — re-marking a won lead as
+        // won should not move the date it closed.
+        ...(closing ? { closedAt: new Date() } : {}),
+      },
+    });
+
+    this.logger.log(`Lead ${id} marked ${status} by the owner`);
+
+    // Re-read through `get` so a PATCH answers with exactly the shape a GET does —
+    // customer, service, conversation and transcript included. Returning the bare
+    // updated row instead is a trap: the caller has a `LeadDetail` before the request
+    // and something narrower after it, and every consumer has to know that. The
+    // dashboard crashed on precisely this reaching for `customer.name`.
+    return this.get(businessId, id);
+  }
 
   /**
    * Create or update the lead for a conversation.
