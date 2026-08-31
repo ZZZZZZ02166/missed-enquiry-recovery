@@ -2,14 +2,20 @@ import Anthropic from '@anthropic-ai/sdk';
 import { Logger } from '@nestjs/common';
 import {
   buildUserMessage,
+  CATALOGUE_JSON_SCHEMA,
+  CATALOGUE_MAX_TOKENS,
+  CATALOGUE_SYSTEM_PROMPT,
   EXTRACTION_EFFORT,
   EXTRACTION_JSON_SCHEMA,
   EXTRACTION_MAX_TOKENS,
   EXTRACTION_MODEL,
   EXTRACTION_SYSTEM_PROMPT,
+  finaliseCatalogue,
   finaliseExtraction,
   LlmUnavailableError,
+  type CatalogueExtractionRequest,
   type ExtractionRequest,
+  type LlmCatalogueResult,
   type LlmExtractionResult,
   type LlmProvider,
 } from './llm.provider';
@@ -153,6 +159,71 @@ export class AnthropicLlmProvider implements LlmProvider {
     }
 
     return finaliseExtraction(this.readJson(response.content), meta);
+  }
+
+  /**
+   * Read a price list or handbook once, at import.
+   *
+   * Structurally the same call as `extractFields` with three deliberate differences: a
+   * much larger token ceiling because the answer is a whole catalogue rather than eight
+   * fields, no prompt caching because every document is different so a cache would only
+   * add latency, and no swallowing of failure. A conversation that cannot extract still
+   * asks its next question; an import that fails has nothing to show the owner, so it
+   * throws and the screen says so.
+   */
+  async extractCatalogue(request: CatalogueExtractionRequest): Promise<LlmCatalogueResult> {
+    const startedAt = Date.now();
+
+    let response;
+    try {
+      response = await this.client.messages.create({
+        model: EXTRACTION_MODEL,
+        max_tokens: CATALOGUE_MAX_TOKENS,
+        system: CATALOGUE_SYSTEM_PROMPT,
+        messages: [{ role: 'user', content: request.text }],
+        thinking: { type: 'adaptive' },
+        output_config: {
+          // Higher than the conversation's `low`. Reading a price list is a
+          // once-per-business job with the owner watching, and a misread price is
+          // expensive in a way a slower import is not.
+          effort: 'medium',
+          format: {
+            type: 'json_schema',
+            schema: CATALOGUE_JSON_SCHEMA as unknown as Record<string, unknown>,
+          },
+        },
+      });
+    } catch (cause) {
+      throw this.classify(cause);
+    }
+
+    const meta = {
+      model: response.model,
+      usage: {
+        inputTokens: response.usage.input_tokens,
+        outputTokens: response.usage.output_tokens,
+        cachedInputTokens: response.usage.cache_read_input_tokens ?? 0,
+      },
+      latencyMs: Date.now() - startedAt,
+    };
+
+    if (response.stop_reason === 'refusal') {
+      throw new LlmUnavailableError(
+        'The model declined to read this document. Try pasting the relevant text instead.',
+        false,
+      );
+    }
+    if (response.stop_reason === 'max_tokens') {
+      // Unlike the conversation path this cannot be shrugged off: the JSON is truncated,
+      // so the owner would see a catalogue that silently stops halfway and approve it.
+      throw new LlmUnavailableError(
+        `The document produced more than ${CATALOGUE_MAX_TOKENS} tokens of output. ` +
+          'Import a shorter section.',
+        false,
+      );
+    }
+
+    return finaliseCatalogue(this.readJson(response.content), meta);
   }
 
   /**

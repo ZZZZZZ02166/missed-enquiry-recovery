@@ -5,10 +5,16 @@ import {
   EXTRACTION_EFFORT,
   EXTRACTION_JSON_SCHEMA,
   EXTRACTION_MAX_TOKENS,
+  CATALOGUE_JSON_SCHEMA,
+  CATALOGUE_MAX_TOKENS,
+  CATALOGUE_SYSTEM_PROMPT,
   EXTRACTION_SYSTEM_PROMPT,
+  finaliseCatalogue,
   finaliseExtraction,
   LlmUnavailableError,
+  type CatalogueExtractionRequest,
   type ExtractionRequest,
+  type LlmCatalogueResult,
   type LlmExtractionResult,
   type LlmProvider,
 } from './llm.provider';
@@ -82,6 +88,15 @@ export function toOpenAiSchema(schema: unknown): Record<string, unknown> {
 }
 
 const OPENAI_JSON_SCHEMA = toOpenAiSchema(EXTRACTION_JSON_SCHEMA);
+
+/**
+ * The import schema in this provider's dialect.
+ *
+ * Runs through the same `toOpenAiSchema` bridge for the same reason: strict mode rejects
+ * a `null` member inside an enum, which the Anthropic dialect keeps. Converting here
+ * rather than maintaining two schemas is what stops the two providers drifting apart.
+ */
+const OPENAI_CATALOGUE_SCHEMA = toOpenAiSchema(CATALOGUE_JSON_SCHEMA);
 
 export class OpenAiLlmProvider implements LlmProvider {
   private readonly logger = new Logger(OpenAiLlmProvider.name);
@@ -170,6 +185,64 @@ export class OpenAiLlmProvider implements LlmProvider {
     }
 
     return finaliseExtraction(this.readJson(response.output_text), meta);
+  }
+
+  /**
+   * Read a price list or handbook once, at import.
+   *
+   * The mirror of the Anthropic adapter's version, and it fails the same way: unlike the
+   * conversation path, a refusal or a truncation throws rather than returning nothing,
+   * because an import with nothing to show is a screen the owner cannot act on.
+   */
+  async extractCatalogue(request: CatalogueExtractionRequest): Promise<LlmCatalogueResult> {
+    const startedAt = Date.now();
+
+    let response;
+    try {
+      response = await this.client.responses.create({
+        model: OPENAI_EXTRACTION_MODEL,
+        instructions: CATALOGUE_SYSTEM_PROMPT,
+        input: [{ role: 'user', content: request.text }],
+        reasoning: { effort: 'medium' },
+        max_output_tokens: CATALOGUE_MAX_TOKENS,
+        text: {
+          format: {
+            type: 'json_schema',
+            name: 'business_catalogue',
+            strict: true,
+            schema: OPENAI_CATALOGUE_SCHEMA,
+          },
+        },
+      });
+    } catch (cause) {
+      throw this.classify(cause);
+    }
+
+    const meta = {
+      model: response.model,
+      usage: {
+        inputTokens: response.usage?.input_tokens ?? 0,
+        outputTokens: response.usage?.output_tokens ?? 0,
+        cachedInputTokens: response.usage?.input_tokens_details?.cached_tokens ?? 0,
+      },
+      latencyMs: Date.now() - startedAt,
+    };
+
+    const refusal = this.findRefusal(response.output);
+    if (refusal !== undefined) {
+      throw new LlmUnavailableError(
+        `The model declined to read this document (${refusal}). Try pasting the relevant text instead.`,
+        false,
+      );
+    }
+    if (response.status === 'incomplete') {
+      throw new LlmUnavailableError(
+        `The document produced more than ${CATALOGUE_MAX_TOKENS} tokens of output. Import a shorter section.`,
+        false,
+      );
+    }
+
+    return finaliseCatalogue(this.readJson(response.output_text), meta);
   }
 
   /** A refusal arrives as a content part inside an output message, not a status. */

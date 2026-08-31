@@ -73,6 +73,25 @@ model Business {
   /// genuinely different (docs/decisions.md, Part 3 cuts).
   automationConfig Json?
 
+  /// Approved business facts the SMS flow answers from, without calling a model.
+  ///
+  /// Shape: `[{ id, question, aliases[], answer, sourceExcerpt? }]` — see
+  /// `KnowledgeEntry` in `packages/shared-types`. `answer` is the owner's own words and
+  /// is sent to a customer **verbatim**; the model only ever picks which entry applies,
+  /// exactly as it picks a service rather than composing a price.
+  ///
+  /// JSON rather than a thirteenth table, and the same reasoning that put
+  /// `automationConfig` here (docs/decisions.md, Part 3 cuts): it is per-business,
+  /// bounded at a few dozen entries, read on a request that already loads the business,
+  /// and never queried independently. Promote it to a table the moment something needs
+  /// to search across businesses — reporting on "what are callers asking that nobody has
+  /// answered" would be that moment.
+  ///
+  /// Null for a business that has not imported or written any. That is not an error
+  /// state: the conversation simply falls through to the model, which is what it does
+  /// today for everyone.
+  knowledge Json?
+
   createdAt DateTime @default(now()) @map("created_at")
   updatedAt DateTime @updatedAt @map("updated_at")
 

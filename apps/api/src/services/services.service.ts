@@ -309,7 +309,15 @@ type ServiceRow = Partial<
 >;
 
 /** A stored row, as the shared validator sees it. */
-function toDraft(service: Service): CatalogueDraftEntry {
+/**
+ * Project a stored service into the shape the validators take.
+ *
+ * Exported because `ImportService` validates a whole batch of proposed services against
+ * the existing catalogue before writing any of them, and it needs the same projection.
+ * Duplicating these ten lines would mean a column added to the catalogue rules gets
+ * enforced on the form and silently skipped on import.
+ */
+export function toDraft(service: Service): CatalogueDraftEntry {
   return {
     id: service.id,
     name: service.name,

@@ -1,6 +1,7 @@
 import { Module } from '@nestjs/common';
 import { AuthModule } from './auth/auth.module';
 import { ConversationsModule } from './conversations/conversations.module';
+import { ImportModule } from './imports/import.module';
 import { HealthController } from './health/health.controller';
 import { JobsModule } from './jobs/jobs.module';
 import { LeadsModule } from './leads/leads.module';
@@ -25,7 +26,7 @@ import { TelephonyModule } from './telephony/telephony.module';
  *   auth, businesses, services, calls, conversations, leads, notifications, jobs
  */
 @Module({
-  imports: [PrismaModule, AuthModule, JobsModule, TelephonyModule, ConversationsModule, LeadsModule, ServicesModule],
+  imports: [PrismaModule, AuthModule, JobsModule, TelephonyModule, ConversationsModule, LeadsModule, ServicesModule, ImportModule],
   controllers: [HealthController],
 })
 export class AppModule {}

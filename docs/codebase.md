@@ -5534,3 +5534,214 @@ a logout**, and sending someone to sign in again would be both a lie and useless
   quote. Showing it as one would undo the owner's explicit choice not to promise it.
 - The lead detail's Won/Lost is reversible. An owner tapping the wrong one on a phone in sunlight should
   not have to live with it.
+
+---
+
+## Steps 104–107 · Document import — reading a catalogue out of what the owner already has
+
+**The problem this solves.** Nothing in the product works until somebody hand-types a service
+catalogue. Until then every caller gets the open-text question, nothing is ever priced automatically,
+and the entire differentiator — a real number in ninety seconds — is built and unreachable. Most of
+these businesses already have the list: a price sheet, a handbook, a quote template. This reads it once.
+
+**The shape of the whole feature**, because no single file shows it:
+
+```
+PDF or pasted text  →  ImportService.readPdf / assertImportable   (in memory, never stored)
+                    →  LlmProvider.extractCatalogue              (one model call per document)
+                    →  proposals, each with its source excerpt   (nothing saved)
+                    →  owner reviews, edits, ticks prices        (step 108, the web screen)
+                    →  ImportService.apply                       (existing validation, existing create)
+```
+
+#### `apps/api/prisma/schema.prisma` — `businesses.knowledge`
+
+**Step 104** · 2026-08-30
+
+**What it does.** Adds `knowledge Json?` to `businesses`. Migration
+`20260830181108_add_business_knowledge`.
+
+**Why it is written this way.**
+
+- **A column, not the 13th table.** Follows the precedent already set for `automationConfig`
+  (`docs/decisions.md`, Part 3 cuts). It is per-business, bounded at 40 entries, read on requests that
+  already load the business row, and never queried independently. The moment something needs to query
+  across it — "which questions do callers ask most" — it becomes a table. Not before.
+
+#### `packages/shared-types/src/service-catalogue.ts` — knowledge validation
+
+**Step 105** · 2026-08-30
+
+**What it does.** `KnowledgeEntry`, `validateKnowledgeEntry`, `validateKnowledge`,
+`assertKnowledgeValid`, `readKnowledge`, and the three limits (40 entries, 120-character questions,
+300-character answers).
+
+**Why it is written this way.**
+
+- **Currency in an answer is refused, and this is the rule that matters.** An owner typing "minimum
+  callout is $80" into an answer would put a figure in front of a customer that never passed through
+  `PriceCalculator` — not GST-adjusted, not snapshotted onto the lead, not covered by the CI guard that
+  makes rule 2 fail the build. A minimum callout is a service with a price, not a sentence. Refusing
+  here is what stops the knowledge base becoming a hole in the pricing rules.
+- **A duplicate question is an error, not a preference.** The matcher would see a tie between two
+  entries, refuse, and the caller would get nothing — so a duplicate silently disables *both* answers.
+  It is only visible across the set, which is why `validateKnowledge` exists separately from
+  `validateKnowledgeEntry`, exactly as `validateCatalogue` does for services.
+- **300 characters is two SMS segments**, the same budget the service menu gets. Enough for "yes, we
+  bring everything including vacuum and products"; not enough to paste three paragraphs of terms that
+  cost five segments to every caller who asks.
+- **`readKnowledge` never throws.** Its main caller is the SMS path deciding whether it can answer
+  without a model call. A JSON column has no schema, so the blob can be any shape a past bug or a
+  hand-run SQL statement left behind — and if a malformed blob threw there, one bad row would take down
+  every conversation for that business. It drops what it cannot read and returns the rest, which
+  degrades to "we had no answer for that", a state the flow already handles. Entries are dropped only
+  for being *unreadable*, never for being *invalid*: a bad answer that reached the column still comes
+  back so the settings screen can show it and the owner can fix it.
+
+#### `apps/api/src/conversations/llm.provider.ts` (+ both adapters, + the fake)
+
+**Step 106** · 2026-08-30
+
+**What it does.** Adds `extractCatalogue` to `LlmProvider`, with `CATALOGUE_SYSTEM_PROMPT`,
+`CATALOGUE_JSON_SCHEMA`, `finaliseCatalogue`, and `MAX_IMPORT_CHARS`. Implemented in the Anthropic and
+OpenAI adapters and in `FakeLlmProvider`.
+
+**Why it is written this way.**
+
+- **Two jobs with opposite constraints, one interface.** Conversation extraction is latency-critical,
+  runs on every reply, and is cached; import runs once per document, tolerates seconds, and must read
+  carefully. Hence `effort: 'medium'` and 16k output tokens here against `'low'` and 2k there, and no
+  prompt caching on a prefix that will never be hit twice.
+- **Import throws where conversation degrades.** A refusal or a truncated response raises
+  `LlmUnavailableError` rather than returning partial proposals. The conversation path is right to
+  degrade — a missed field gets asked again next turn — but a half-read price list that looks complete
+  is a catalogue the owner approves without knowing what is missing.
+- **`finaliseCatalogue` drops, never throws.** A document yielding nine good services and one broken
+  row should import nine. Dropped values are collected in `rejected` and logged, the same way
+  `extraction.ts` drops unrecognised keys.
+- **A negative or fractional `priceCents` drops the figure, not the service.** It is a misread, not a
+  bargain, and leaving the row unpriced gives the owner something to fix rather than something to
+  notice is missing.
+- **The cents examples in the prompt are spelled in words**, and that is not stylistic.
+  `currency-guard.spec.ts` fails the build on a currency figure in any module outside the two pricing
+  files, and **it caught this prompt** when the examples were written as literals. The right fix was to
+  reword, not to allowlist the file: `llm.provider.ts` also holds the conversation prompt and the whole
+  provider contract, so exempting it would blind the guard to the file most likely to grow a price
+  string by accident. The guard's allowlist is the security boundary; adding to it is a decision about
+  who may render money, and a prompt is not a good reason to make one.
+- **The fake records catalogue calls in a separate array.** `requests[]` stays conversation-only, so
+  the many existing `expect(llm.requests).toHaveLength(n)` assertions keep meaning what they meant.
+
+#### `apps/api/src/imports/import.service.ts`
+
+**Step 107** · 2026-08-30
+
+**What it does.** PDF text extraction in memory, the single model call, per-row validation of the
+proposals, and `apply` — which creates the approved services through `ServicesService.create` and
+merges the approved answers into `businesses.knowledge`.
+
+**Why it is written this way.**
+
+- **The document is never stored.** It arrives as a buffer, becomes text, becomes proposals, and is
+  gone. No bucket, no `documents` table, no cleanup job, no retention question to answer. An owner's
+  handbook may carry their staff's names and their clients' addresses, and the cheapest way to protect
+  it is to never hold it. (This is also why there is no S3/R2 dependency here — none is configured and
+  none is needed.)
+- **Import is stateless.** `propose` returns rows; `apply` takes rows back. Nothing is kept between the
+  two requests, so what gets written is exactly what the owner read and edited — not a server-side
+  draft that could have drifted from what they were shown. It also means there is no import state to
+  expire, resume or reconcile.
+- **Every proposal comes back with `showPriceAutomatically: false`, and `apply` re-derives it from an
+  explicit `=== true`.** This is the property that makes the feature safe to ship. A misparsed figure
+  still reaches the owner's lead, where they see it, but it is never said to a customer until they tick
+  the box. The worst case of a misread price is a wrong number in front of the one person who knows it
+  is wrong.
+- **A scanned PDF fails loudly.** It is the most likely bad upload and the one failure that would
+  otherwise be invisible: `getText` succeeds, returns nothing, the model extracts nothing from an empty
+  string, and the owner sees "we found 0 services in your document" and concludes the feature is
+  broken. Under `MIN_USEFUL_CHARS` of non-whitespace text is an error that names the cause and says to
+  paste the text instead.
+- **Too long is refused, not truncated.** A silently truncated import looks exactly like a document
+  that had fewer services in it — the owner approves eleven rows, never learns pages nine to eighty
+  were dropped, and finds out when a caller asks for something that is not in the menu.
+- **The whole batch is validated before anything is written.** `ServicesService.create` validates each
+  row against the catalogue as it will be after that row, which is right for a form where rows arrive
+  one at a time — but here it would let five services be created and the sixth be refused for tipping
+  the catalogue over the six-active ceiling, leaving the owner with a half-imported catalogue and no
+  way to tell which rows landed. Every catalogue rule is monotone (fewer rows cannot break a rule the
+  whole set satisfies), so pre-validating the full projection guarantees no individual `create` can
+  then fail on catalogue grounds.
+- **Proposals carry their problems.** Each row is validated at `propose` time through the same
+  `validateServiceName` / `validateServicePricing` / `validateKnowledgeEntry` the form uses, so the
+  owner sees "that name is too long" beside the row while they are already editing it — rather than one
+  rejection for the whole batch after pressing save. An import cannot create something the form would
+  have refused.
+- **Knowledge appends rather than replaces.** An owner importing a policy sheet after a price list
+  should not silently lose the first import's answers. Entries whose question already exists are
+  skipped, because a duplicate breaks both copies rather than shadowing one.
+- **pdfjs failures are matched on `error.name`**, not `instanceof`. They are thrown from inside the
+  worker, where identity across the module boundary is not reliable.
+
+**Connects to.** `conversations/llm.provider.ts` (the model call), `services/services.service.ts`
+(`create` and the now-exported `toDraft`), `shared-types` (all validation), `prisma` (the knowledge
+column). Needs `imports/import.controller.ts` before anything can reach it.
+
+**Watch out for.**
+
+- `apply` writes services before knowledge and reports only after both. A database failure partway
+  leaves some services created — visible and editable in the catalogue, so recoverable by hand, and
+  never reported as done. Atomicity would mean threading a transaction through `ServicesService`, which
+  buys little for a case that is already recoverable.
+- `toDraft` is now exported from `services.service.ts` so the batch pre-check uses the same projection
+  as the form. Duplicating it would mean a column added to the catalogue rules gets enforced on the
+  form and silently skipped on import.
+
+#### `apps/api/src/imports/import.controller.ts` and `import.module.ts`
+
+**Step 108** · 2026-08-30
+
+**What it does.** Three routes — `POST /import/document` (multipart PDF), `POST /import/text` (paste),
+`POST /import/apply` — all session-guarded, plus the module that wires them and the two sibling edits
+that make them reachable.
+
+**Why it is written this way.**
+
+- **The route split *is* the design.** `propose` reads and returns; `apply` writes. Nothing is stored
+  between them, so what gets saved is what the owner read and edited rather than a server-side draft
+  that could have drifted from what the review screen showed.
+- **`memoryStorage()` is explicit, not multer's default.** "The document never touches disk" is a
+  property of this feature, not an implementation detail. Relying on an upstream default would mean an
+  upstream change quietly writing every customer's handbook to a temp directory with nothing to clean
+  it up.
+- **A per-business in-flight lock.** These are the only two routes in the application that spend money
+  per request, and the likeliest way to spend it twice is an owner clicking "Import" again because the
+  first attempt is taking eight seconds. Released in `finally` — a failed import that kept the lock
+  would leave the owner unable to retry, which is worse than the double spend. It is per-process and
+  therefore not a real ceiling; the real one is a per-business daily spend cap, which belongs with the
+  rest of the circuit breakers (R5).
+- **`ApprovedServiceDto` is narrower than `ServiceBodyDto`.** Import offers name, description, pricing
+  and the show-price tick — not aliases, required fields or unit bounds. Accepting fields the review
+  screen never shows would mean maintaining a contract nothing produces.
+- **`showPriceAutomatically` is optional in the DTO and re-derived as `=== true` in the service.** An
+  absent, null or truthy-string value can then only ever mean off. It is the one field where a client
+  mistake would put an unreviewed figure in front of a caller.
+- **A model call inside an HTTP request, deliberately.** Rule 8 exists because Twilio times out
+  webhooks around fifteen seconds with a caller waiting. Here the waiting party is the owner who just
+  pressed the button, there is no provider timeout to beat, and a queue would need exactly the import
+  state the design does without. Recorded here because a rule broken on purpose looks identical to a
+  rule forgotten.
+
+**The two sibling edits.**
+
+- `services/catalogue-validation.filter.ts` now catches `KnowledgeValidationError` as well.
+  Both carry the same `issues` shape for the same reason and reach the owner through the same kind of
+  form; a second near-identical filter would be two places to keep one response contract in step. The
+  response now emits both `serviceId` and `entryId` so a client binds whichever its rows have.
+- `app.module.ts` gains one line. A module nobody imports is inert.
+
+**Connects to.** `import.service.ts`, `services/services.module.ts` (for `create`),
+`conversations/conversations.module.ts` (for `LLM_PROVIDER`), `auth` (for `SessionGuard`).
+
+**Watch out for.** `POST /import/document` has no `@Body()` DTO, so the global `ValidationPipe` does not
+run on it — multipart fields arrive unvalidated. That is fine while the only thing read is
+`file.buffer`; the moment a field is added to that route it needs validating by hand or by a DTO.

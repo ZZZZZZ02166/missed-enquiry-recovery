@@ -432,3 +432,216 @@ if (defaultIssues.length > 0) {
       .join('; ')}`,
   );
 }
+
+// ---------------------------------------------------------------------------
+// Business knowledge — the facts the SMS flow answers from without a model call.
+// ---------------------------------------------------------------------------
+
+/**
+ * One thing the business knows, and the words it says about it.
+ *
+ * `answer` is sent to a customer **verbatim**. Nothing rewrites it, summarises it or
+ * generates around it — the model's only job is to decide which entry a question is
+ * about, exactly as it decides which service a caller means rather than composing a
+ * price. That keeps the property the whole architecture rests on: every word a customer
+ * receives is either owner-authored or produced by deterministic code.
+ */
+export interface KnowledgeEntry {
+  id: string;
+  /** The canonical phrasing, shown to the owner. "Do you bring your own supplies?" */
+  question: string;
+  /** Other ways a caller might ask it. Matching is over these plus the question. */
+  aliases: string[];
+  /** The owner's words. Sent as-is. */
+  answer: string;
+  /** What the imported document said, kept so a wrong entry can be traced. */
+  sourceExcerpt?: string;
+}
+
+export const MAX_KNOWLEDGE_ENTRIES = 40;
+export const MAX_KNOWLEDGE_QUESTION_CHARS = 120;
+
+/**
+ * An answer must fit two SMS segments.
+ *
+ * The same budget the service menu gets. An answer is sent on its own, so this is its
+ * whole allowance — and at 306 GSM-7 characters it is more than enough for "yes, we
+ * bring everything including vacuum and products", while stopping an owner from pasting
+ * three paragraphs of terms and conditions that costs five segments to every caller who
+ * asks.
+ */
+export const MAX_KNOWLEDGE_ANSWER_CHARS = 300;
+
+export type KnowledgeIssueCode =
+  | 'QUESTION_EMPTY'
+  | 'QUESTION_TOO_LONG'
+  | 'ANSWER_EMPTY'
+  | 'ANSWER_TOO_LONG'
+  | 'ANSWER_HAS_CURRENCY'
+  | 'UNSUPPORTED_CHARACTERS'
+  | 'DUPLICATE_QUESTION'
+  | 'TOO_MANY_ENTRIES';
+
+export interface KnowledgeIssue {
+  code: KnowledgeIssueCode;
+  message: string;
+  entryId?: string;
+  index?: number;
+}
+
+/**
+ * Validate one entry.
+ *
+ * **The currency rule is the important one.** An owner typing "minimum callout is $80"
+ * into an answer would put a figure in front of a customer that never passed through
+ * `PriceCalculator` — so it is not GST-adjusted, not snapshotted onto the lead, and not
+ * covered by the guard that makes rule 2 fail CI. A minimum callout is a service with a
+ * price, not a sentence. Refusing here is what stops the knowledge base becoming a hole
+ * in the pricing rules.
+ */
+export function validateKnowledgeEntry(entry: Partial<KnowledgeEntry>): KnowledgeIssue[] {
+  const issues: KnowledgeIssue[] = [];
+  const question = cleanName(entry.question);
+  const answer = cleanName(entry.answer);
+
+  if (question.length === 0) {
+    issues.push({ code: 'QUESTION_EMPTY', message: 'Write the question a caller would ask.' });
+  } else if (question.length > MAX_KNOWLEDGE_QUESTION_CHARS) {
+    issues.push({
+      code: 'QUESTION_TOO_LONG',
+      message: `Keep the question under ${MAX_KNOWLEDGE_QUESTION_CHARS} characters.`,
+    });
+  }
+
+  if (answer.length === 0) {
+    issues.push({ code: 'ANSWER_EMPTY', message: 'Write the answer you want texted back.' });
+    return issues;
+  }
+
+  if (answer.length > MAX_KNOWLEDGE_ANSWER_CHARS) {
+    issues.push({
+      code: 'ANSWER_TOO_LONG',
+      message:
+        `This is sent as a text message, so keep it under ${MAX_KNOWLEDGE_ANSWER_CHARS} characters. ` +
+        `That one is ${answer.length}.`,
+    });
+  }
+
+  if (CURRENCY_CHARACTERS.test(answer) || CURRENCY_CHARACTERS.test(question)) {
+    issues.push({
+      code: 'ANSWER_HAS_CURRENCY',
+      message:
+        'Answers cannot contain prices. Add it as a service with a price instead, so the figure ' +
+        'is worked out correctly and includes GST.',
+    });
+  } else if (!ALLOWED_ANSWER_CHARACTERS.test(answer) || !ALLOWED_ANSWER_CHARACTERS.test(question)) {
+    issues.push({
+      code: 'UNSUPPORTED_CHARACTERS',
+      message:
+        'Use letters, numbers, spaces and basic punctuation only. Emoji and special characters ' +
+        'make every text message cost more to send.',
+    });
+  }
+
+  return issues;
+}
+
+/**
+ * Slightly wider than a service name: an answer is a sentence, so it needs terminal
+ * punctuation a name never does. Still no currency, and still nothing outside GSM-7.
+ */
+const ALLOWED_ANSWER_CHARACTERS = /^[A-Za-z0-9 '"()\-./&,+:;!?%\n]+$/;
+
+/** Validate the whole set, including the rules that only exist across entries. */
+export function validateKnowledge(entries: readonly Partial<KnowledgeEntry>[]): KnowledgeIssue[] {
+  const issues: KnowledgeIssue[] = [];
+
+  entries.forEach((entry, index) => {
+    for (const issue of validateKnowledgeEntry(entry)) {
+      issues.push({ ...issue, entryId: entry.id, index });
+    }
+  });
+
+  // Two entries asking the same thing is not a validation nicety: the matcher would see
+  // a tie, refuse, and the caller would get nothing — so a duplicate silently disables
+  // both answers.
+  const seen = new Map<string, number>();
+  entries.forEach((entry, index) => {
+    const key = cleanName(entry.question).toLowerCase().replace(/\s+/g, ' ');
+    if (key.length === 0) return;
+    const first = seen.get(key);
+    if (first === undefined) {
+      seen.set(key, index);
+      return;
+    }
+    issues.push({
+      code: 'DUPLICATE_QUESTION',
+      message: `You already have an answer for "${cleanName(entries[first]!.question)}". Edit that one instead.`,
+      entryId: entry.id,
+      index,
+    });
+  });
+
+  if (entries.length > MAX_KNOWLEDGE_ENTRIES) {
+    issues.push({
+      code: 'TOO_MANY_ENTRIES',
+      message:
+        `Keep it to ${MAX_KNOWLEDGE_ENTRIES} answers. Past that, matching gets less certain and more ` +
+        'questions end up going to a person instead.',
+    });
+  }
+
+  return issues;
+}
+
+/**
+ * Read the `businesses.knowledge` JSON column into entries, dropping anything malformed.
+ *
+ * **This never throws, and that is the point.** A JSON column has no schema, so the blob
+ * can be any shape a past bug or a hand-run SQL statement left behind. The main reader is
+ * the SMS path deciding whether it can answer a caller's question without a model call —
+ * if a malformed blob threw there, one bad row would take down every conversation for
+ * that business. Returning the entries it can read degrades to "we did not have an answer
+ * for that", which is a state the flow already handles.
+ *
+ * Entries are only dropped for being *unreadable* (missing question or answer), not for
+ * being invalid. A too-long or currency-carrying answer that somehow reached the column
+ * still comes back, so the settings screen can show it and the owner can fix it. Blocking
+ * bad answers is `validateKnowledge`'s job, at the point of writing.
+ */
+export function readKnowledge(value: unknown): KnowledgeEntry[] {
+  if (!Array.isArray(value)) return [];
+  const entries: KnowledgeEntry[] = [];
+  for (const item of value) {
+    if (item === null || typeof item !== 'object') continue;
+    const row = item as Record<string, unknown>;
+    const question = typeof row.question === 'string' ? row.question.trim() : '';
+    const answer = typeof row.answer === 'string' ? row.answer.trim() : '';
+    if (question.length === 0 || answer.length === 0) continue;
+    entries.push({
+      // An entry without an id is still usable — the id only identifies it for editing.
+      id: typeof row.id === 'string' && row.id.length > 0 ? row.id : `k${entries.length}`,
+      question,
+      aliases: Array.isArray(row.aliases)
+        ? row.aliases.filter((a): a is string => typeof a === 'string' && a.trim().length > 0)
+        : [],
+      answer,
+      sourceExcerpt: typeof row.sourceExcerpt === 'string' ? row.sourceExcerpt : undefined,
+    });
+  }
+  return entries;
+}
+
+/** Thrown by the save path. Same shape as `CatalogueValidationError`, same reasoning. */
+export class KnowledgeValidationError extends Error {
+  constructor(readonly issues: readonly KnowledgeIssue[]) {
+    super(`Business knowledge is invalid: ${issues.map((i) => i.code).join(', ')}`);
+    this.name = 'KnowledgeValidationError';
+  }
+}
+
+/** Block an invalid set at the point of writing it. */
+export function assertKnowledgeValid(entries: readonly Partial<KnowledgeEntry>[]): void {
+  const issues = validateKnowledge(entries);
+  if (issues.length > 0) throw new KnowledgeValidationError(issues);
+}

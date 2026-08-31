@@ -89,7 +89,116 @@ export class LlmUnavailableError extends Error {
 
 export interface LlmProvider {
   extractFields(request: ExtractionRequest): Promise<LlmExtractionResult>;
+
+  /**
+   * Read an owner's price list or handbook once, at import.
+   *
+   * Deliberately a second method rather than a second use of `extractFields`. The two
+   * calls have nothing in common but the provider: this one runs **once per upload**
+   * with the owner watching, not once per customer reply with a caller waiting, so it
+   * can afford a far larger input and a slower answer. Sharing a method would mean one
+   * set of limits serving two jobs with opposite constraints.
+   *
+   * What it returns is a **proposal**. Nothing here is saved, shown to a customer, or
+   * treated as true until the owner approves it — see `ImportService`.
+   */
+  extractCatalogue(request: CatalogueExtractionRequest): Promise<LlmCatalogueResult>;
 }
+
+export interface CatalogueExtractionRequest {
+  /** Plain text, already pulled out of whatever the owner uploaded. */
+  text: string;
+}
+
+/**
+ * A service the model believes it found, plus where it found it.
+ *
+ * Shaped as the fields `ServicesService.create` already takes, so an approved proposal
+ * goes through exactly the validation a hand-typed one does — `validateServicePricing`,
+ * `assertCatalogueValid`, the six-active ceiling, all of it. An import cannot create
+ * something the form would have refused.
+ */
+export interface ProposedService {
+  name: string;
+  description?: string;
+  pricingType: 'FIXED' | 'STARTING_FROM' | 'PER_UNIT' | 'MANUAL_QUOTE';
+  priceCents?: number;
+  unitLabel?: string;
+  /**
+   * The sentence this came from, verbatim.
+   *
+   * Shown beside the figure on the review screen, and it is the whole safety story for
+   * a misread price: "$280" parsed from "from $28.00 per room" is obvious next to its
+   * source and invisible without it.
+   */
+  sourceExcerpt: string;
+}
+
+export interface ProposedKnowledge {
+  question: string;
+  aliases: string[];
+  answer: string;
+  sourceExcerpt: string;
+}
+
+export interface LlmCatalogueResult {
+  services: ProposedService[];
+  knowledge: ProposedKnowledge[];
+  usage: LlmUsage;
+  model: string;
+  latencyMs: number;
+  /** Keys the model returned that the schema does not accept. Logged, never stored. */
+  rejected: string[];
+}
+
+/**
+ * The most text one import will send to a model.
+ *
+ * A price list is a page or two; a handbook can be eighty. Beyond this the useful
+ * content is buried in policy prose the extraction does not want anyway, and the owner
+ * is better served pasting the relevant pages. Refused with a message that says so,
+ * rather than silently truncating — a truncated import looks like a document that
+ * simply had fewer services in it.
+ */
+export const MAX_IMPORT_CHARS = 60_000;
+
+/**
+ * What the model is told at import.
+ *
+ * The prohibitions mirror `EXTRACTION_SYSTEM_PROMPT` and exist for the same reason: the
+ * schema already makes a violation impossible, but a model straining against a rule it
+ * was never told wastes tokens and extracts worse.
+ *
+ * The one genuinely different instruction is about prices. Here the model **may** read a
+ * figure, because reading a price list is the job — but it is transcribing a number the
+ * owner wrote, into a field the owner then confirms, and it must never convert, round,
+ * add GST to, or infer one. `PriceCalculator` still owns every figure a customer sees.
+ *
+ * The cents examples below are written in words ("two hundred and eighty dollars")
+ * rather than as figures, and that is not stylistic. `currency-guard.spec.ts` fails the
+ * build on a currency figure in any module outside the two pricing files, and it caught
+ * this prompt when the examples were written as literals. The right fix was to reword,
+ * not to allowlist this file: it also holds the conversation prompt and the whole
+ * provider contract, so exempting it would blind the guard to the file most likely to
+ * grow a price string by accident.
+ */
+export const CATALOGUE_SYSTEM_PROMPT = `You read a document belonging to an Australian home-services business and return the services it sells and the facts it states, as JSON.
+
+Everything you return is a proposal that the business owner reviews and edits before anything is saved. Accuracy matters more than completeness: a service you invent wastes their time, and a price you misread reaches their customers.
+
+Rules:
+
+1. Transcribe prices exactly as written. Do not convert, round, add or remove GST, or calculate anything. If a figure is unclear, omit the price and use MANUAL_QUOTE.
+2. priceCents is the amount in cents, never dollars. Two hundred and eighty dollars is 28000. Forty dollars per room is 4000 with unitLabel "room".
+3. Choose the pricing type from what the document says. A figure introduced by "from" or "starting at" is STARTING_FROM. A rate per room, hour or window is PER_UNIT. A single firm figure is FIXED. No figure, or "call for a quote", is MANUAL_QUOTE.
+4. Never put a price, a currency symbol or a figure in a name, a description, a question or an answer. Prices belong only in priceCents.
+5. sourceExcerpt must be copied from the document word for word, and must be the text the entry came from. Do not paraphrase it.
+6. Put inclusions and exclusions in the service description, not in a separate entry.
+7. Knowledge entries are questions a customer might ask by text and the answer this business would give: what is included, service areas, minimum bookings, access and parking, cancellation, what to expect. Write the answer in the business's own words from the document. If the document does not answer something, do not invent it.
+8. aliases are other words a customer might use for the same question. Three or four is plenty.
+9. Return only what the document actually states. An empty list is a correct answer for a document that contains no services.
+
+Return the JSON object and nothing else.`;
 
 /** Injection token. The factory binds the real or fake implementation. */
 export const LLM_PROVIDER = 'LLM_PROVIDER';
@@ -314,7 +423,18 @@ export function finaliseExtraction(
 export class FakeLlmProvider implements LlmProvider {
   readonly requests: ExtractionRequest[] = [];
 
+  /**
+   * Import calls, counted separately from conversation calls.
+   *
+   * Kept apart on purpose: the tests that matter most assert **`requests.length` did not
+   * change** across a customer reply, and folding imports into the same counter would
+   * quietly break that the first time a test imported a document mid-journey.
+   */
+  readonly catalogueRequests: CatalogueExtractionRequest[] = [];
+
   private readonly queued: unknown[] = [];
+
+  private readonly queuedCatalogues: unknown[] = [];
 
   private nextFailure: Error | null = null;
 
@@ -323,13 +443,44 @@ export class FakeLlmProvider implements LlmProvider {
     this.queued.push(raw);
   }
 
+  /** Queue one raw import response, in the shape the real model would return. */
+  respondToImportWith(raw: unknown): void {
+    this.queuedCatalogues.push(raw);
+  }
+
+  /**
+   * Stand in for reading a document.
+   *
+   * Runs the queued payload through the **real** `finaliseCatalogue`, not a shortcut, so
+   * a test that feeds malformed model output exercises the same discarding the product
+   * does. A fake that returned its input unchanged would let a broken row reach the
+   * review screen in tests and nowhere else.
+   */
+  async extractCatalogue(request: CatalogueExtractionRequest): Promise<LlmCatalogueResult> {
+    this.catalogueRequests.push(request);
+
+    if (this.nextFailure) {
+      const failure = this.nextFailure;
+      this.nextFailure = null;
+      throw failure;
+    }
+
+    return finaliseCatalogue(this.queuedCatalogues.shift() ?? {}, {
+      usage: { inputTokens: 0, outputTokens: 0, cachedInputTokens: 0 },
+      model: 'fake-import',
+      latencyMs: 0,
+    });
+  }
+
   failNextWith(error: Error): void {
     this.nextFailure = error;
   }
 
   reset(): void {
     this.requests.length = 0;
+    this.catalogueRequests.length = 0;
     this.queued.length = 0;
+    this.queuedCatalogues.length = 0;
     this.nextFailure = null;
   }
 
@@ -362,4 +513,146 @@ export class FakeLlmProvider implements LlmProvider {
       latencyMs: 0,
     });
   }
+}
+
+/**
+ * The import output contract, as JSON Schema for structured outputs.
+ *
+ * Same "required and nullable" shape as `EXTRACTION_JSON_SCHEMA`, for the same reason:
+ * it forces an explicit decision per field rather than letting the model quietly omit
+ * one. Note what is absent — no `showPriceAutomatically`, no `availability`, no
+ * `sortOrder`. Those are the owner's decisions, made on the review screen, and a model
+ * that cannot express them cannot pre-empt them.
+ */
+export const CATALOGUE_JSON_SCHEMA = {
+  type: 'object',
+  additionalProperties: false,
+  required: ['services', 'knowledge'],
+  properties: {
+    services: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['name', 'description', 'pricingType', 'priceCents', 'unitLabel', 'sourceExcerpt'],
+        properties: {
+          name: { type: 'string' },
+          description: { type: ['string', 'null'] },
+          pricingType: { enum: ['FIXED', 'STARTING_FROM', 'PER_UNIT', 'MANUAL_QUOTE'] },
+          priceCents: { type: ['integer', 'null'] },
+          unitLabel: { type: ['string', 'null'] },
+          sourceExcerpt: { type: 'string' },
+        },
+      },
+    },
+    knowledge: {
+      type: 'array',
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        required: ['question', 'aliases', 'answer', 'sourceExcerpt'],
+        properties: {
+          question: { type: 'string' },
+          aliases: { type: 'array', items: { type: 'string' } },
+          answer: { type: 'string' },
+          sourceExcerpt: { type: 'string' },
+        },
+      },
+    },
+  },
+} as const;
+
+/**
+ * Output ceiling for one import.
+ *
+ * Far higher than the conversation's, because the answer is a whole catalogue rather
+ * than eight fields, and thinking shares this budget. Hitting it is treated as a failure
+ * rather than a partial result — truncated JSON means a catalogue that silently stops
+ * halfway, and the owner would approve it without knowing.
+ */
+export const CATALOGUE_MAX_TOKENS = 16_000;
+
+/** Ceilings on one import. A document proposing 200 services is a parse failure. */
+const MAX_PROPOSED_SERVICES = 30;
+const MAX_PROPOSED_KNOWLEDGE = 40;
+
+/**
+ * Turn whatever the model returned into proposals, discarding anything unusable.
+ *
+ * The choke point for import, exactly as `finaliseExtraction` is for conversation. Model
+ * output never reaches the review screen unshaped, because the review screen is where an
+ * owner clicks "approve" — and a malformed row that renders as blank is a row somebody
+ * approves without reading.
+ *
+ * Everything here **drops** rather than throws. A document that yields nine good services
+ * and one broken one should import nine, not fail; the owner can add the tenth by hand.
+ */
+export function finaliseCatalogue(
+  raw: unknown,
+  meta: { usage: LlmUsage; model: string; latencyMs: number },
+): LlmCatalogueResult {
+  const empty: LlmCatalogueResult = { services: [], knowledge: [], rejected: [], ...meta };
+  if (raw === null || typeof raw !== 'object') return empty;
+
+  const body = raw as Record<string, unknown>;
+  const rejected: string[] = [];
+
+  const text = (value: unknown, max: number): string | undefined => {
+    if (typeof value !== 'string') return undefined;
+    const trimmed = value.trim();
+    return trimmed.length > 0 && trimmed.length <= max ? trimmed : undefined;
+  };
+
+  const services: ProposedService[] = [];
+  for (const item of Array.isArray(body.services) ? body.services.slice(0, MAX_PROPOSED_SERVICES) : []) {
+    if (item === null || typeof item !== 'object') continue;
+    const row = item as Record<string, unknown>;
+
+    const name = text(row.name, 200);
+    const pricingType = row.pricingType;
+    if (!name || typeof pricingType !== 'string') continue;
+    if (!['FIXED', 'STARTING_FROM', 'PER_UNIT', 'MANUAL_QUOTE'].includes(pricingType)) continue;
+
+    // A negative or fractional price is a misread, not a bargain. Dropping the figure
+    // rather than the service leaves the owner a row to price by hand.
+    const priceCents =
+      typeof row.priceCents === 'number' && Number.isInteger(row.priceCents) && row.priceCents >= 0
+        ? row.priceCents
+        : undefined;
+    if (row.priceCents !== null && row.priceCents !== undefined && priceCents === undefined) {
+      rejected.push(`priceCents=${String(row.priceCents)} on "${name}"`);
+    }
+
+    services.push({
+      name,
+      description: text(row.description, 500),
+      pricingType: pricingType as ProposedService['pricingType'],
+      priceCents,
+      unitLabel: text(row.unitLabel, 24),
+      // Kept even when empty — the review screen says "no source" rather than pretending
+      // the model had one.
+      sourceExcerpt: text(row.sourceExcerpt, 400) ?? '',
+    });
+  }
+
+  const knowledge: ProposedKnowledge[] = [];
+  for (const item of Array.isArray(body.knowledge) ? body.knowledge.slice(0, MAX_PROPOSED_KNOWLEDGE) : []) {
+    if (item === null || typeof item !== 'object') continue;
+    const row = item as Record<string, unknown>;
+
+    const question = text(row.question, 200);
+    const answer = text(row.answer, 500);
+    if (!question || !answer) continue;
+
+    knowledge.push({
+      question,
+      aliases: Array.isArray(row.aliases)
+        ? row.aliases.filter((a): a is string => typeof a === 'string' && a.trim().length > 0).slice(0, 8)
+        : [],
+      answer,
+      sourceExcerpt: text(row.sourceExcerpt, 400) ?? '',
+    });
+  }
+
+  return { services, knowledge, rejected, ...meta };
 }
