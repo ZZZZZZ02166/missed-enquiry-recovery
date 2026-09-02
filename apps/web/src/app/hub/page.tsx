@@ -185,6 +185,22 @@ function Hub() {
           count={active}
         />
         <Tile
+          href="/settings/import"
+          icon="⇪"
+          title="Import"
+          note={
+            active === 0
+              ? 'Read your services out of a price list.'
+              : 'Add more from a document.'
+          }
+        />
+        <Tile
+          href="/settings/knowledge"
+          icon="?"
+          title="Answers"
+          note="Common questions, answered instantly."
+        />
+        <Tile
           icon="✉"
           title="Reply yourself"
           note="Text a customer from here."

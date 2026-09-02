@@ -325,3 +325,40 @@ had caught — see `docs/codebase.md`.
 
 **~20 steps left**, none of which block a pilot except deployment — and deployment is blocked by the
 carrier test, not by code.
+
+---
+
+## Update — 2026-08-31 · Document import and deterministic answers are done
+
+Steps 104-113. Full per-file reasoning in `docs/codebase.md`; this is the state change only.
+
+**Shipped.** `businesses.knowledge` column · knowledge validation in `shared-types` ·
+`extractCatalogue` on both adapters and the fake · `ImportService` (PDF text in memory, never stored) ·
+`POST /import/document|text|apply` · the review screen · `matchKnowledge` · the conversation wiring ·
+`GET`/`PUT /knowledge` and the answers screen. 304 tests, typecheck, lint and build clean.
+
+**Closed off the old list:** nothing here was on it — this was new work agreed this session.
+
+### Still open, and now more precisely
+
+1. **The carrier forwarding test.** Unchanged and still the go/no-go on the whole design.
+2. **No prompt has run against a real model.** Now two prompts, not one. For import specifically, the
+   unproven part is whether the model returns usable `sourceExcerpt` values. That field is the entire
+   safety argument for the review screen — a blank one turns it into a rubber stamp — so this is a
+   **pre-pilot gate**, not a nice-to-have. One paste of a real price list with `ANTHROPIC_API_KEY` set
+   closes it.
+3. **Unanswered questions are logged, not stored.** When a caller asks something the knowledge base
+   cannot answer, `ConversationsService` logs it at debug and moves on. Surfacing those to the owner is
+   how they learn which answer to add next, and it wants a column plus a place on the lead screen.
+4. **Nothing bounds how many questions one caller can have answered deterministically.** Each costs no
+   model call, and `SendCapService` is a per-business daily cap rather than a per-conversation one.
+5. **No stemming beyond a trailing plural**, so "do you police check your staff" misses
+   "are you police checked". A false negative costing one model call — recorded so it is not
+   rediscovered as a bug.
+6. **A post-completion follow-up starts a new conversation**, so a question asked after the quote goes
+   to the model rather than the knowledge base. Correct-by-accident rather than by design: the
+   first-reply gate is doing it. Worth revisiting if follow-up questions turn out to be common.
+7. **`businesses` settings API and UI** beyond `/knowledge`. Three pilots can still be configured
+   with SQL.
+8. **Deploy, CI, Sentry.** Unchanged. The currency guard and the GSM-7 assertions only run where jest
+   runs, so CI is what makes them real.

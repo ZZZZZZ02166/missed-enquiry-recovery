@@ -101,8 +101,8 @@ missed-enquiry-recovery/
 └── docker-compose.yml     # Postgres + Redis (persistent)
 ```
 
-**API modules (10):** `auth`, `businesses`, `services`, `telephony`, `calls`, `conversations`, `leads`,
-`notifications`, `jobs`, `common` (+ `prisma`).
+**API modules (11):** `auth`, `businesses`, `services`, `telephony`, `calls`, `conversations`, `leads`,
+`notifications`, `jobs`, `imports`, `common` (+ `prisma`).
 
 **Tables (12):** `businesses`, `users`, `phone_numbers`, `services`, `customers`, `calls`,
 `conversations`, `messages`, `leads`, `attachments`, `suppressions`, `webhook_events`.
@@ -181,11 +181,20 @@ Verified in a real browser against a running API and Postgres, not only in tests
 typecheck, lint and build clean across four packages.
 
 **Modules built:** `auth`, `services`, `leads`, `telephony`, `calls`, `conversations`, `notifications`,
-`jobs`, `common`, `prisma`. **Dashboard:** sign-in, expired-link, inbox, lead detail, services settings.
+`jobs`, `imports`, `common`, `prisma`. **Dashboard:** sign-in, expired-link, inbox, lead detail,
+services settings, document import, answers settings.
+
+**Document import and deterministic answers are complete** (steps 104-113, `docs/codebase.md`). An
+owner uploads a PDF or pastes text, one model call proposes services and answers, they review each row
+beside the sentence it came from, tick which prices callers may hear, and approve. After that a caller
+asking a common question gets the owner's exact words with **no model call** — verified end to end in
+`full-journey.spec.ts`. Two knowledge invariants: an imported price is never customer-facing until the
+owner ticks it, and a currency figure can never enter through an answer.
 
 **Still open — see `docs/remaining-plan.md` for the full list:**
 
-- `businesses` settings API and UI (three pilots can be configured with SQL)
+- `businesses` settings API and UI (three pilots can be configured with SQL). `GET`/`PUT /knowledge`
+  exists and lives in `imports`; the rest of the business settings do not.
 - Conversation thread view and manual reply
 - `attachments` — the 12th table, photo upload by tokenised link
 - Deploy, CI, Sentry
@@ -196,6 +205,13 @@ typecheck, lint and build clean across four packages.
 1. **The carrier forwarding test** (`docs/carrier-forwarding-test.md`) is still unresolved and is still a
    go/no-go on the whole design. If AU carriers do not preserve the original caller's number on a
    forwarded leg, there is nobody to text.
-2. **Extraction has never run against a real model.** Every conversation test uses `FakeLlmProvider`.
+2. **The import prompt has run live; the conversation prompt has not.** `CATALOGUE_SYSTEM_PROMPT` was
+   verified against GPT on 2026-08-31 — prices, pricing types and `sourceExcerpt` all correct, and it
+   surfaced a real GSM-7 bug now fixed (`docs/codebase.md`, "The first live model run").
+   `EXTRACTION_SYSTEM_PROMPT` still only ever runs against `FakeLlmProvider`, so the conversation path
+   is unproven against a real model.
+
+   **`LLM_PROVIDER` must be set explicitly.** It defaults to `anthropic`, so an `.env` carrying only
+   `OPENAI_API_KEY` silently runs the fake: every import returns zero services and nothing errors.
 
 

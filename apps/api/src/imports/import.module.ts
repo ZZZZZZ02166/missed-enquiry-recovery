@@ -5,6 +5,7 @@ import { PrismaModule } from '../prisma/prisma.module';
 import { ServicesModule } from '../services/services.module';
 import { ImportController } from './import.controller';
 import { ImportService } from './import.service';
+import { KnowledgeController } from './knowledge.controller';
 
 /**
  * Document import.
@@ -20,10 +21,13 @@ import { ImportService } from './import.service';
  * `ServicesModule` for `ServicesService.create`, so an approved row goes through exactly
  * the validation a hand-typed one does. `AuthModule` for `SessionGuard`. No exports:
  * nothing else in the application imports.
+ *
+ * `KnowledgeController` lives here too: import is what creates the answers and that
+ * controller is what corrects them. One feature, one module.
  */
 @Module({
   imports: [PrismaModule, AuthModule, ServicesModule, ConversationsModule],
-  controllers: [ImportController],
+  controllers: [ImportController, KnowledgeController],
   providers: [ImportService],
 })
 export class ImportModule {}

@@ -10,6 +10,7 @@ import { LeadsService } from '../../leads/leads.service';
 import { SendCapService } from '../../telephony/send-cap.service';
 import type { LlmTurn } from '../../conversations/llm.provider';
 import type { CollectedAnswers } from '../../conversations/question-flow';
+import { readKnowledge } from 'shared-types';
 import { PrismaService } from '../../prisma/prisma.service';
 import { MAX_LIST_SEGMENTS } from '../../services/service-options';
 import { Prisma, type MessagePurpose } from '../../generated/prisma/client';
@@ -113,7 +114,7 @@ export class InboundMessageProcessor {
 
     const message = await this.prisma.db.message.findFirst({
       where: { businessId, id: messageId },
-      include: { business: { select: { name: true, pricesIncludeGst: true } } },
+      include: { business: { select: { name: true, pricesIncludeGst: true, knowledge: true } } },
     });
 
     if (!message) {
@@ -217,6 +218,10 @@ export class InboundMessageProcessor {
       priorTurns: await this.priorTurns(businessId, message.customerId, message.createdAt),
       catalogue: await this.activeCatalogue(businessId),
       pricesIncludeGst: message.business.pricesIncludeGst,
+      // Read through `readKnowledge` rather than cast: the column is untyped JSON and a
+      // malformed blob must degrade to "we had no answer for that" — which this flow
+      // already handles — rather than throw and fail every conversation for the business.
+      knowledge: readKnowledge(message.business.knowledge),
     });
 
     if (decision.awaitingField && conversation.awaitingField) {

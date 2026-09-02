@@ -5745,3 +5745,349 @@ that make them reachable.
 **Watch out for.** `POST /import/document` has no `@Body()` DTO, so the global `ValidationPipe` does not
 run on it — multipart fields arrive unvalidated. That is fine while the only thing read is
 `file.buffer`; the moment a field is added to that route it needs validating by hand or by a DTO.
+
+#### `apps/api/src/imports/import.http.spec.ts`
+
+**Step 109** · 2026-08-30
+
+**What it does.** Eighteen integration tests over real HTTP and a real database, built around the three
+failures this feature could plausibly cause rather than around its happy path.
+
+**Why it is written this way.**
+
+- **The PDF is built, not committed.** `buildPdf(lines)` emits a genuinely valid PDF — correct xref
+  offsets and all — so the scanned-document case is *the same file with its text removed*. A binary
+  fixture would leave "is this failing because it is a scan, or because it is a different file"
+  unanswerable, which is the question the test exists to answer.
+- **Three tests pin properties that would each have been an incident:** a proposal can never come back
+  with the price switched on, however emphatically the document is worded; an over-sized batch is
+  refused with **zero** rows created; and a currency figure in an answer is refused *before* any service
+  is written, so a rejected answer cannot leave a half-written catalogue behind.
+- **`showPriceAutomatically` is tested twice, at two layers.** Over HTTP the DTO rejects a non-boolean;
+  against the service directly, a truthy non-`true` value is still stored as false. Testing only the
+  wire would leave the coercion — the actual guard — unexercised.
+- **The in-flight lock is tested deterministically**, not by racing two requests. `GatedFake` holds the
+  model call open and signals when it has genuinely entered the handler, so the second request is known
+  to arrive while the first holds the lock.
+
+### Three test bugs, and one that mattered
+
+All three failures on first run were in the test, not the code — but the third was worth the trip:
+
+1. `/paste/i` does not match "pasting". Two assertions, both wrong about English.
+2. The issue code is `NAME_DUPLICATE`, not `DUPLICATE_NAME`. Guessed instead of read.
+3. **`knowledge: undefined` in a Prisma update means "leave this column alone", not "set it to null".**
+   The `afterEach` cleanup silently did nothing, so answers leaked from one test into the next — and
+   the leak surfaced as a *failure in a later test* while the test that caused it passed. Fixed with
+   `Prisma.DbNull`. Worth recording because the same mistake in product code would be a cleanup or a
+   reset that reports success and clears nothing, which is the shape of every silent-loss bug in
+   rule 13.
+
+#### `apps/web/src/app/settings/import/page.tsx`
+
+**Step 110** · 2026-08-30
+
+**What it does.** Upload a PDF or paste text, review what the model found, edit it, choose which prices
+callers may hear, import. Three states in one component: upload, review, done.
+
+**Why it is written this way.**
+
+- **This screen exists to be doubted.** A model read the owner's document and it can have misread it, so
+  the job is not to present a result — it is to make a wrong result obvious in the two seconds an owner
+  will actually spend looking. Everything below follows from that.
+- **Every row shows the sentence it came from**, not behind a disclosure. A price misread from
+  "from $28.00 per room" is glaring beside its source and invisible without it. This is the single
+  difference between a review screen and a rubber stamp.
+- **"Tell callers this price" starts off on every row**, and the hint says why: an unticked price still
+  reaches the owner's lead, so leaving it off costs nothing and turning it on wrongly costs a job quoted
+  at the wrong price. The client never carries the model's value for this field — `toDrafts` hardcodes
+  `false` regardless of what came back.
+- **Rows the server flagged start unticked**, so a broken row is a thing the owner opts back in after
+  fixing rather than a wall between them and the import button.
+- **Only included rows can block the button.** An excluded broken row is not a problem; it is a row the
+  owner decided against. Getting this backwards would make one unfixable row block the whole import.
+- **Validation is the same `shared-types` module the server runs**, so a row this screen accepts is a
+  row the API accepts, and the 422 it would return carries the same issue objects this file already
+  renders.
+- **The file input clears itself after each choice.** Without it, choosing the same file twice fires no
+  change event and a retry after an error looks like a dead button.
+
+**The two sibling edits.** `lib/api.ts` gained `postForm` and the import response types; the empty
+services catalogue and the hub both link here, because a page nothing links to is as inert as a module
+nothing imports.
+
+**`postForm` is not `post` with a different body.** A `FormData` body must be sent with **no**
+`Content-Type` header — the browser generates one carrying the multipart boundary, and any value set by
+hand replaces it with a boundary-less header the server cannot parse. `request` now tests
+`instanceof FormData` rather than accepting a sentinel header value, which was the first version and was
+worse: it relied on `undefined` in a headers object being dropped, and `undefined` can serialise as the
+string "undefined".
+
+**Verified in a real browser**, against the running API and Postgres — not only in tests:
+
+- A scanned PDF (a real, valid, text-free PDF) renders *"We could not read any text out of that PDF
+  (1 page). It is most likely a scan or photos of pages rather than a document. Copy the text and paste
+  it in instead."* — the page count included.
+- A non-PDF renders *"That file is not a PDF we can open…"*.
+- The only console error is the expected 400; Chrome logs every non-2xx fetch.
+
+**Watch out for.** The happy path — a document that produces proposals — has **not** been exercised
+against a real model. Every test uses `FakeLlmProvider`, so `CATALOGUE_SYSTEM_PROMPT` and
+`CATALOGUE_JSON_SCHEMA` have never been sent to Claude or OpenAI. Whether the model returns usable
+`sourceExcerpt` values in particular is unproven, and that field is the whole review story.
+
+#### `apps/api/src/services/knowledge-matcher.ts` and `knowledge-matcher.spec.ts`
+
+**Step 111** · 2026-08-31
+
+**What it does.** Decides, without calling a model, whether a caller's message is one of the questions
+the owner has already answered — and refuses whenever it is not certain. 23 adversarial tests.
+
+**Why it is written this way.**
+
+- **The asymmetry sets every threshold.** Refusing costs one model call, which is the path the product
+  already takes today. Matching wrongly sends the owner's answer about insurance to someone asking about
+  parking. So `MIN_CONFIDENCE` is 65 against `matchService`'s 55, and a near-tie is never broken.
+- **Deliberately not the same scorer as `service-matcher`.** The mechanics are the same shape; the
+  tuning is not, because they read different kinds of English. A catalogue is short noun phrases where
+  "price" and "job" carry no signal; a knowledge base is questions, where "what is your minimum job"
+  turns on exactly those words. One shared noise vocabulary would mean every tuning fix for one degraded
+  the other. `normalise` is shared, because that part genuinely is identical.
+- **The model is not involved at all** — not to write the reply, not to choose the entry. That preserves
+  the property the architecture rests on (every customer-facing word is owner-authored or produced by
+  deterministic code) and means an `LlmUnavailableError` no longer takes the answer down with it.
+
+### Two bugs found by probing, not by the tests I wrote
+
+The suite passed 19/19 on the first run, which for fuzzy logic is evidence the tests are too easy rather
+than that the code is right. A throwaway probe over thirty unplanned messages found two real defects:
+
+1. **A compound question was half-answered with full confidence.** "Are you insured and do you bring
+   supplies?" matched the supplies entry at 91. Coverage was 0.67 — over the threshold — and no
+   threshold that still admits ordinary phrasing would have caught it.
+2. **A vaguer message ranked above a more specific one.** "saturday" matched; "do you work saturday"
+   refused. Coverage was measured per *phrase*, and "work" and "saturday" live in different aliases of
+   the same entry, so no single phrase could account for both.
+
+**Both came from one wrong idea**, and the fix is `admissible`, which gates each entry before scoring
+with two rules that catch different things and are not redundant:
+
+- **A word belonging distinctively to a *different* entry means the caller asked about that too.** This
+  detects the compound question directly rather than hoping a ratio catches it.
+- **Most of what the caller said must be vocabulary this entry knows** — measured against question and
+  aliases together. This catches "2 bed 2 bath in Southbank, and do you bring supplies?", where the
+  unexplained words appear in *no* entry and so the first rule cannot see them.
+
+Fixing it also removed two false negatives for free: "what suburbs do you cover" and "do i need to
+provide products" now match.
+
+**One test had to change**, and the direction matters: the old ambiguity case now refuses as a *compound
+question*, which is a stronger refusal than "ambiguous" — it does not reach scoring at all. The test was
+asserting the weaker outcome, so it was retargeted at the route ambiguity is actually reachable by:
+`validateKnowledge` forbids two entries sharing a *question*, but nothing stops one entry's alias
+colliding with another entry's question.
+
+**Watch out for.**
+
+- **A bare "saturday" still matches the weekends entry.** If the conversation has just asked which day
+  suits, that is a date answer, not a question. The matcher cannot know — the defence is at the
+  conversation layer, which only consults it when no required field is outstanding. That gate is
+  load-bearing, not belt-and-braces.
+- **No stemming beyond a trailing plural.** "do you police check your staff" does not match "are you
+  police checked". A false negative, which costs one model call, and the alternative — a real stemmer —
+  would fold "cleaning" and "cleaner" together, which for a business selling both is exactly the
+  distinction that must survive.
+
+#### `apps/api/src/conversations/conversations.service.ts` — answering without the model
+
+**Step 112** · 2026-08-31
+
+**What it does.** `answerFromKnowledge` sits before `extractFields` and, when the caller has asked a
+question the owner already answered, replies with the owner's exact words and no model call. Wired at
+two call sites, with `inbound-message.processor.ts` loading `businesses.knowledge` and
+`full-journey.spec.ts` proving the whole path.
+
+**Why it is written this way.**
+
+- **The reply is the owner's words, verbatim.** Nothing rewrites, summarises or generates around them —
+  the same guarantee `quoteMessage` gives for figures, extended to prose. The model is not asked to
+  write the reply *or* to choose the entry.
+- **Nothing about the conversation moves.** Not `collected`, not `questionsAsked`, not the question
+  flow, not the outstanding menu. Answering a question is not progress through an enquiry, and treating
+  it as though it were would skip a question the owner needs answered.
+- **`createLead` is a hard `false`, not the usual comparison.** The compiler proves it: gate 2 already
+  returned for the only state in which a lead is created. Written as a constant so it cannot read as an
+  oversight — a question is not an enquiry.
+- **`quote: null` cannot erase a recorded quote.** `quoteColumns` writes no columns for a null quote,
+  the same as every other non-quoting branch. Checked rather than assumed, because a branch that
+  silently blanks a figure the customer was already told is exactly the shape of a rule 13 bug.
+- **An unsendable stored answer falls back to the model** rather than failing the turn. `knowledge` is a
+  JSON column that predates its own validation and can be written by hand; the customer gets a reply
+  either way.
+
+### The feature was dead code, and only wiring it end to end showed that
+
+Three findings, in the order they surfaced, each from running the journey rather than from reading it:
+
+1. **The first gate closed the feature permanently.** Requiring no outstanding required field sounded
+   careful. In practice a field is outstanding for nearly the whole conversation — and the moment one is
+   not, after `COMPLETE`, a follow-up message starts a *new* conversation with nothing collected, so the
+   gate shut again. The branch could never fire in production.
+2. **The best case for the feature was explicitly excluded.** `advance` returns early for a pending
+   `LIST`, so a caller replying "do you bring your own supplies?" instead of a number got
+   *"Sorry, please reply with one number only"*. That is the single most valuable case there is, and it
+   now runs — but only after `resolveSelection` has already ruled the reply out as a selection, so a
+   valid "2" can never be diverted. The menu stays outstanding, so their next reply can still be the
+   number.
+3. **"We are waiting on a field" was the wrong question.** The right one is "does this look like an
+   answer to what we asked?", and `looksLikeAQuestion` says so directly — a question mark, or an opening
+   word only a question uses. A bare "saturday" is a date answer; "do you work saturdays?" is not. The
+   blunt version would have refused every question asked while any field was outstanding, which is
+   almost all of them.
+
+**Both gates that survive are load-bearing and neither is belt-and-braces:** the first-reply gate stops
+a lead being created with nothing in it, and the question-form gate contains the matcher's known
+weakness. Two tests pin them — a question answered mid-menu, and a bare "supplies" that must be treated
+as a failed menu reply instead.
+
+**A finding about the API, not the conversation.** `POST /import/apply` rejects a proposal echoed back
+verbatim, because proposals carry `problems` and the global `forbidNonWhitelisted` refuses unknown
+fields rather than stripping them. That is the deliberate posture from `main.ts` — an unknown field is a
+mistake worth hearing about — so a client sends what it means to save. The review screen already does;
+the journey test now does too, with a comment saying why.
+
+**Watch out for.** Nothing bounds how many questions one caller can have answered this way. Each is a
+real answer to a real question and costs no model call, and `SendCapService` is the ceiling that
+actually matters — but it is a per-business daily cap, not a per-conversation one.
+
+#### `apps/api/src/imports/knowledge.controller.ts` and `apps/web/src/app/settings/knowledge/page.tsx`
+
+**Step 113** · 2026-08-31
+
+**What it does.** `GET /knowledge` and `PUT /knowledge`, plus the screen that lists, edits, adds and
+deletes the answers. Seven HTTP tests.
+
+**Why it is written this way.**
+
+- **`PUT` replaces the whole list**, for the same reason `PUT /services/order` takes the whole list: the
+  rules that matter — no duplicate questions, no more than forty — are properties of the *set* and
+  cannot be checked against one row. A per-entry endpoint would validate each edit against a list it
+  could not see. It also makes "delete the duplicate and fix the row it collided with" one action
+  instead of two saves with an invalid state between them.
+- **Deleting is omission.** The list sent is the list stored, which is the only semantics that matches
+  a screen where the owner edits a whole page and presses Save once.
+- **Ids survive an edit** and are minted for new rows, so the screen can add a row without inventing an
+  id and an entry stays the same entry across a rename.
+- **`GET` returns entries that would no longer validate.** `readKnowledge` drops what it cannot *read*
+  but keeps what is merely invalid, so an over-long answer written before the limit existed still shows
+  up with an error on it. A screen that silently hid a row the SMS flow might still try to send would be
+  worse than one showing a row that needs fixing.
+- **It lives in `ImportModule`, not a `businesses` module.** Import creates these answers and this
+  corrects them; they are one feature. A `businesses` module holding one column would be a folder
+  pretending to be a boundary. It moves when there is a second thing in it.
+- **The screen states what the field is.** These are the only words the system sends that the owner
+  wrote and no code composed — a price sentence is assembled by `quoteMessage`, a question comes from
+  the question flow — so the label is "What we send back, exactly as written" and the character count is
+  framed as *one text message* or *two* rather than as an arbitrary number.
+- **Save is disabled unless something changed**, compared against what the server last returned, so a
+  row edited and edited back is correctly not dirty.
+
+**Verified in a real browser** against the running API and Postgres: the empty state offers both import
+and hand-writing, a written answer saved and came back with an id, the nav shows Answers, and a currency
+figure typed into an answer was refused with 422 `ANSWER_HAS_CURRENCY` — **while the previously stored
+answer survived untouched**, which is the property that matters: a rejected save cannot destroy what was
+already there. The test row was removed afterwards.
+
+### The first live model run — 2026-08-31
+
+Until this point every test used `FakeLlmProvider` and `CATALOGUE_SYSTEM_PROMPT` had never been sent to
+a real model. Run against **GPT (`gpt-5.6`) through `OpenAiLlmProvider`**, twice by text and once from a
+generated PDF.
+
+**What it proved.** `sourceExcerpt` comes back populated on **every** row. That was the open question and
+it is the entire safety argument for the review screen — without it the screen is a rubber stamp. Also:
+the four pricing types are read correctly (`from $280` → `STARTING_FROM 28000`, `$40 per room` →
+`PER_UNIT 4000` with `unitLabel: "room"`, `$70 flat` → `FIXED 7000`, "quoted on inspection" →
+`MANUAL_QUOTE` with no figure), every price came back with `showPriceAutomatically: false`, and
+`rejected` was empty. ~750 input / ~1100-1400 output tokens, 15-21s.
+
+**What it found — a bug no fake could have.** The model wrote an **em dash** and a **curly apostrophe**
+into an answer it was transcribing from text that contained neither ("equipment - you don't need"). Both
+are outside GSM-7, so the row arrived flagged `UNSUPPORTED_CHARACTERS`, telling the owner to "use basic
+punctuation only" about characters they never typed and cannot visually distinguish. Almost every real
+import would have arrived with rows already broken.
+
+Fixed at `finaliseCatalogue`'s single text choke point with `normaliseToGsm7`, which **maps lookalikes
+and stops there** — a dash stays a dash, so no meaning changes, while a genuine emoji or accented word
+still survives to be caught by validation and shown to the owner rather than silently deleted. Applied
+to names, descriptions, questions, answers and aliases; **not** to `sourceExcerpt`, which is evidence and
+keeps the document's own characters. Re-run against the live model afterwards: **zero non-GSM-7
+characters, zero flagged rows.** Pinned by a test using the exact strings the model produced.
+
+**A configuration footgun worth recording.** `LLM_PROVIDER` defaults to `anthropic`, so an `.env` with a
+valid `OPENAI_API_KEY` and no `LLM_PROVIDER` line silently runs the **fake** — every import returns zero
+services and nothing errors. The factory does warn at boot, which is the right design, but a warning in a
+dev server's stdout is easy to miss. `.env.example` should carry `LLM_PROVIDER=` with both values listed.
+
+### Browser cross-check against the live model — 2026-08-31
+
+The API restarted with `LLM_PROVIDER=openai` (boot log: *"Using OpenAiLlmProvider — extraction requests
+will be BILLED"*), then the whole feature driven through Chrome rather than through tests.
+
+**A real PDF uploaded through the file picker** produced four services with all four pricing types read
+correctly, four answers, a source excerpt on every row, no warnings, and
+`showPriceAutomatically: false` on every priced service.
+
+**The batch pre-check fired for real.** The business already had four services; importing four more hit
+the six-active ceiling and was refused with *"You have 8. Turn 2 of them off."* — and a follow-up query
+confirmed **four services and zero answers still stored**. This is the partial-application failure the
+whole-batch validation exists to prevent, reproduced end to end rather than argued for.
+
+**The price tick is the only route to a customer-facing figure.** One price was ticked before importing;
+it saved with `showPriceAutomatically: true` and every other service saved `false`.
+
+**The answers screen** rendered the imported entries with their aliases and excerpts, Save correctly
+disabled until something changed, a typed-in `$80` blocked at the keystroke with the GST explanation and
+Save re-disabled, and Discard restoring the stored text exactly.
+
+**Only three console errors**, all deliberate: a favicon 404, the 422 from the ceiling rejection, and the
+400 from a scanned PDF.
+
+**One improvement found, and only by using real data.** The stored knowledge was matched against
+seventeen realistic caller phrasings. All eight refusals were correct — compound question, job enquiry,
+field data, a bare "Tuesday" — but *"do I need to provide anything?"* was refused against an entry whose
+vocabulary already contained "provide", because "anything" counted as unexplained content and sank the
+coverage test. Indefinite placeholders (`anything`, `something`, `anywhere`, `somewhere`) now join the
+noise list: they stand in for the thing being asked about and are never the thing itself, so they cannot
+identify which question is meant. 17/17 after, with a test pinning it.
+
+#### `apps/web/src/components/AppShell.tsx` — Import gets a rail entry
+
+**Step 114** · 2026-09-01
+
+**What it does.** Adds `/settings/import` to the navigation rail and splits it into two halves with a
+desktop-only group label.
+
+**Why it is written this way.**
+
+- **Import earned a place of its own.** It was reachable only from a hub tile and the empty services
+  screen, which is backwards: it is the fastest route from "nothing configured" to a working catalogue,
+  and a screen that exists only behind another screen is one most owners never find. The hub tile stays,
+  because it is contextual — it changes wording when the catalogue is empty — but it is no longer the
+  only door.
+- **Two halves, not five flat items.** Hub and Leads are the daily work; Services, Answers and Import
+  are what the system knows about the business. Flat, the three settings screens read as equal choices
+  to the thing an owner actually opens the app for. A hairline and one small word say "these are set up
+  once" without a sentence of instruction.
+- **The label is desktop-only and `aria-hidden`.** On the phone bottom bar there is no room and no need
+  — five icons read fine on their own, and a heading in a thumb bar eats space the tap targets need.
+  Hidden with `display: none` rather than visually-hidden because it is decoration: announcing "Set up"
+  between two links adds nothing when heard one item at a time.
+- **The heading changed from "Import your services" to "Import from a document."** The old one undersold
+  the screen — the answers it reads out of a handbook are half of what an owner gets — and now that the
+  rail names the destination, the heading should name the action.
+
+**Verified in a browser at three widths.** Desktop 1512px: rail 76px, Import present and marked
+`aria-current` when open, group label visible. Phone 375px and **320px**: label hidden, all five items
+fit with **no horizontal overflow** (312px used of 320) and every tap target still at the 44px minimum.
+The narrow case was the one worth checking — a fifth item is exactly what pushes a bottom bar over.

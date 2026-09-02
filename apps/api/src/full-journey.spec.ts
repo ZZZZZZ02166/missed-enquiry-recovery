@@ -1,16 +1,18 @@
 import { INestApplication, ValidationPipe } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import request from 'supertest';
+import { readKnowledge } from 'shared-types';
 import { AuthModule } from './auth/auth.module';
 import { AuthService } from './auth/auth.service';
 import { SESSION_COOKIE } from './auth/cookies';
 import { SuppressionsService } from './calls/suppressions.service';
 import { ConversationsService } from './conversations/conversations.service';
-import { FakeLlmProvider } from './conversations/llm.provider';
+import { FakeLlmProvider, LLM_PROVIDER } from './conversations/llm.provider';
 import type { Queue } from 'bullmq';
 import { InboundMessageProcessor } from './jobs/processors/inbound-message.processor';
 import type { NotifyOwnerJobData } from './jobs/queues';
 import { NotifyOwnerProcessor } from './jobs/processors/notify-owner.processor';
+import { ImportModule } from './imports/import.module';
 import { LeadsModule } from './leads/leads.module';
 import { LeadsService } from './leads/leads.service';
 import { PrismaService } from './prisma/prisma.service';
@@ -58,8 +60,12 @@ describe('the whole journey', () => {
 
   beforeAll(async () => {
     const moduleRef = await Test.createTestingModule({
-      imports: [AuthModule, ServicesModule, LeadsModule],
-    }).compile();
+      imports: [AuthModule, ServicesModule, LeadsModule, ImportModule],
+    })
+      // The same fake the conversation uses, so one counter covers both paths.
+      .overrideProvider(LLM_PROVIDER)
+      .useValue(llm)
+      .compile();
     app = moduleRef.createNestApplication();
     app.useGlobalPipes(new ValidationPipe({ whitelist: true, forbidNonWhitelisted: true, transform: true }));
     await app.init();
@@ -149,7 +155,53 @@ describe('the whole journey', () => {
     expect(list.body).toHaveLength(3);
   });
 
-  it('2 — the first reply gets the numbered menu, built from that catalogue', async () => {
+  it('2 — the owner imports their handbook and approves the answers', async () => {
+    // The model reads the document once. This lands in `catalogueRequests`, not
+    // `requests` — the two counters are separate precisely so the assertion in step 7
+    // keeps meaning what it means.
+    llm.respondToImportWith({
+      services: [],
+      knowledge: [
+        {
+          question: 'Do you bring your own supplies?',
+          aliases: ['do you bring products', 'do I need to provide anything'],
+          answer: 'Yes, we bring everything including vacuum, mop and all products.',
+          sourceExcerpt: 'Our team arrives fully equipped.',
+        },
+      ],
+    });
+
+    const proposal = await api().post('/import/text').set('Cookie', cookie)
+      .send({ text: 'Our team arrives fully equipped. You do not need to provide anything at all.' })
+      .expect(201);
+
+    expect(proposal.body.knowledge).toHaveLength(1);
+    // Nothing is stored by reading it.
+    const before = await prisma.unscoped.business.findUniqueOrThrow({ where: { id: businessId } });
+    expect(readKnowledge(before.knowledge)).toHaveLength(0);
+
+    // Mapped field by field rather than echoed back, and that is not incidental: a
+    // proposal carries `problems`, which `apply` does not accept, and the global
+    // `forbidNonWhitelisted` rejects the whole request rather than stripping it. That is
+    // the deliberate posture from `main.ts` — an unknown field is a mistake worth hearing
+    // about, not something to swallow — so a client sends what it means to save. The
+    // review screen does exactly this.
+    await api().post('/import/apply').set('Cookie', cookie)
+      .send({
+        services: [],
+        knowledge: proposal.body.knowledge.map(
+          (k: { question: string; aliases: string[]; answer: string }) => ({
+            question: k.question, aliases: k.aliases, answer: k.answer,
+          }),
+        ),
+      })
+      .expect(201);
+
+    const after = await prisma.unscoped.business.findUniqueOrThrow({ where: { id: businessId } });
+    expect(readKnowledge(after.knowledge)).toHaveLength(1);
+  });
+
+  it('3 — the first reply gets the numbered menu, built from that catalogue', async () => {
     llm.respondWith({});
     await reply('hi, I missed a call from you', 0);
 
@@ -159,9 +211,40 @@ describe('the whole journey', () => {
     expect(body).toContain('4. Other');
   });
 
-  it('3 — "1" selects the service, with no model call', async () => {
+  it('4 — a question instead of a menu number is answered in the owner\'s words, with no model call', async () => {
     const before = llm.requests.length;
-    await reply('1', 1000);
+    sms.reset();
+
+    await reply('do you bring your own supplies?', 1500);
+
+    // Word for word what the owner approved. Nothing rewrote it, summarised it, or
+    // generated around it — the same guarantee `quoteMessage` gives for figures.
+    expect(lastSms()).toBe('Yes, we bring everything including vacuum, mop and all products.');
+    // The whole point: the model was not consulted.
+    expect(llm.requests.length).toBe(before);
+
+    // And the menu is still outstanding, so their next reply can still be the number.
+    // Re-prompting here instead would have been strictly worse: they did not fail to
+    // pick, they asked something the owner had already answered.
+    const conversation = await prisma.db.conversation.findFirstOrThrow({ where: { businessId } });
+    expect(conversation.pendingChoice).not.toBeNull();
+  });
+
+  it('4b — a bare word that happens to name an answer is treated as a menu reply, not a question', async () => {
+    // The matcher's known weakness, and the gate that contains it. "supplies" scores as
+    // the supplies entry on its own — but a menu is outstanding, and a one-word reply
+    // with no question form is someone trying to answer it. Answering the FAQ here would
+    // strand them: they would never learn their reply was not a valid selection.
+    sms.reset();
+    await reply('supplies', 1750);
+
+    expect(lastSms()).toContain('one number only');
+    expect(lastSms()).not.toContain('vacuum');
+  });
+
+  it('5 — "1" selects the service, with no model call', async () => {
+    const before = llm.requests.length;
+    await reply('1', 2000);
 
     // The whole point of the strict numeric menu: choosing costs nothing and cannot be
     // misread.
@@ -172,12 +255,12 @@ describe('the whole journey', () => {
     expect((conversation.collected as Record<string, unknown>).serviceType).toBe('End-of-lease cleaning');
   });
 
-  it('4 — the remaining questions complete and the customer is quoted, GST-inclusive', async () => {
+  it('6 — the remaining questions complete and the customer is quoted, GST-inclusive', async () => {
     llm.respondWith({ suburb: 'Southbank', bedrooms: 2, bathrooms: 2 });
-    await reply('2 bed 2 bath in Southbank', 2000);
+    await reply('2 bed 2 bath in Southbank', 3000);
 
     llm.respondWith({ preferredDate: 'Wednesday' });
-    await reply('Wednesday works', 3000);
+    await reply('Wednesday works', 4000);
 
     const body = lastSms();
     // $280 entered ex-GST must reach the caller as $308 (ACL single-price rule), and a
@@ -186,7 +269,7 @@ describe('the whole journey', () => {
     expect(body).not.toContain('$280');
   });
 
-  it('5 — the lead records exactly what the customer was told', async () => {
+  it('7 — the lead records exactly what the customer was told', async () => {
     const lead = await prisma.db.lead.findFirstOrThrow({ where: { businessId } });
     expect(lead.quotedAmountCents).toBe(30800);
     expect(lead.quoteType).toBe('FROM');
@@ -197,7 +280,8 @@ describe('the whole journey', () => {
     expect((lead.quoteSnapshot as { priceCents: number }).priceCents).toBe(28000);
   });
 
-  it('6 — the owner is texted a lead with a working login link', async () => {
+
+  it('8 — the owner is texted a lead with a working login link', async () => {
     const lead = await prisma.db.lead.findFirstOrThrow({ where: { businessId } });
 
     // The conversation actually asked for the owner to be notified — not just that the
@@ -223,7 +307,7 @@ describe('the whole journey', () => {
     expect(await auth.consumeMagicLink(token)).toBeNull();
   });
 
-  it('7 — the owner opens the lead and marks it won', async () => {
+  it('9 — the owner opens the lead and marks it won', async () => {
     const lead = await prisma.db.lead.findFirstOrThrow({ where: { businessId } });
 
     const detail = await api().get(`/leads/${lead.id}`).set('Cookie', cookie).expect(200);
@@ -243,7 +327,7 @@ describe('the whole journey', () => {
     expect(won.body.customer.phoneE164).toBe(CUSTOMER);
   });
 
-  it('8 — every message sent to the customer was billable-safe', async () => {
+  it('10 — every message sent to the customer was billable-safe', async () => {
     const outbound = await prisma.db.message.findMany({
       where: { businessId, direction: 'OUTBOUND' },
       select: { body: true, segments: true, providerMessageSid: true },

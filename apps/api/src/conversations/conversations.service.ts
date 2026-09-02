@@ -1,6 +1,7 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
+import type { KnowledgeEntry } from 'shared-types';
 import type { ConversationState } from '../generated/prisma/client';
-import { segmentCount } from '../common/gsm7';
+import { assertSendable, segmentCount } from '../common/gsm7';
 import { quotedHandoffMessage, recoveryHandoffMessage } from '../notifications/templates';
 import {
   buildServiceList,
@@ -16,6 +17,7 @@ import {
   type CatalogueEntry,
   type PresentedOption,
 } from '../services/service-options';
+import { matchKnowledge } from '../services/knowledge-matcher';
 import { calculatePrice, type PriceResult, type PricingConfig } from '../services/price-calculator';
 import { quoteMessage } from '../services/quote-message';
 import { LLM_PROVIDER, type LlmProvider, type LlmTurn, type LlmUsage } from './llm.provider';
@@ -118,13 +120,20 @@ export interface AdvanceInput {
    * from what the owner typed.
    */
   pricesIncludeGst?: boolean;
+  /**
+   * The owner's approved answers, from `businesses.knowledge`.
+   *
+   * Optional, and absent means "do not try": a business that has imported nothing behaves
+   * exactly as it did before this existed.
+   */
+  knowledge?: readonly KnowledgeEntry[];
 }
 
 /**
  * Why we are replying. The processor uses this for logging and metrics; the customer
  * only ever sees `body`.
  */
-export type ReplyKind = 'question' | 'handoff' | 'menu' | 'reprompt';
+export type ReplyKind = 'question' | 'handoff' | 'menu' | 'reprompt' | 'answer';
 
 export interface ConversationDecision {
   /** The state to persist. */
@@ -197,6 +206,26 @@ export interface ConversationDecision {
 }
 
 /**
+ * Words that open a question.
+ *
+ * Used only to tell an unprompted question from an answer to something we just asked, so
+ * it needs to be right about "saturday" versus "do you work saturdays?" and nothing more
+ * subtle than that.
+ */
+const QUESTION_OPENERS = new Set([
+  'do', 'does', 'did', 'can', 'could', 'will', 'would', 'should', 'shall', 'may', 'might',
+  'must', 'are', 'is', 'am', 'was', 'were', 'have', 'has', 'had',
+  'what', 'whats', 'how', 'when', 'where', 'which', 'who', 'why', 'any', 'anyone',
+]);
+
+/** A question mark, or an opening word only a question uses. */
+function looksLikeAQuestion(text: string): boolean {
+  if (text.includes('?')) return true;
+  const first = text.trim().toLowerCase().replace(/[^a-z0-9\s]/g, ' ').split(/\s+/)[0];
+  return first !== undefined && QUESTION_OPENERS.has(first);
+}
+
+/**
  * Attribution for a turn decided without the model.
  *
  * Reported as real zeroes rather than omitted, so "this turn cost nothing" is visible in
@@ -236,6 +265,13 @@ export class ConversationsService {
       return this.resolveMenuReply(input, pending);
     }
 
+    // Also before extraction, and for a related reason: if this is a question the owner
+    // has already answered, there is nothing to extract and the answer is already
+    // written. Returns null — falling through to the model — on anything less than a
+    // certain match, which is most messages.
+    const answered = this.answerFromKnowledge(input, pending);
+    if (answered) return answered;
+
     const turns: LlmTurn[] = [
       ...(input.priorTurns ?? []),
       { role: 'customer', text: input.inboundText },
@@ -273,6 +309,129 @@ export class ConversationsService {
   }
 
   /**
+   * Answer a common question from the owner's own words, without calling a model.
+   *
+   * **Every gate here is about not answering.** The saving is real but modest; what makes
+   * this worth having is latency and resilience — an instant reply, and one that still
+   * works when the model provider is down. Neither is worth a single wrong answer, so
+   * this returns null unless it is certain, and null is the ordinary outcome.
+   *
+   * The gates, in the order they can fail. **Each one names a message that would
+   * otherwise be mistaken for a question**, which is the only way to read them:
+   *
+   * 1. **The business has answers.** Absent means behave exactly as before.
+   * 2. **This is not the first reply.** The first reply creates the lead and starts the
+   *    enquiry. Answering an FAQ instead would hand the owner a lead with nothing in it
+   *    and no question outstanding to fix that, so the enquiry has to begin before it can
+   *    be interrupted.
+   * 3. **We did not just ask them to describe the job.** A `DESCRIPTION` prompt is
+   *    outstanding, so this reply is that description — intercepting it would answer a
+   *    question they did not ask and discard what they did say.
+   * 4. **If a question of ours is outstanding, this must look like a question.** The
+   *    precise form of the gate that makes the matcher's known weakness safe: a bare
+   *    "saturday" scores as the weekends entry, and it is a date answer if we just asked
+   *    which day suits. Refusing *everything* while a field is outstanding was the first
+   *    version and it was far too blunt — a field is outstanding for nearly the whole
+   *    conversation, so "do you bring your own supplies?" asked while we wait on a suburb
+   *    would never have been answered. Requiring question form separates the two.
+   * 5. **The match is certain.** `matchKnowledge` refuses on ambiguity, on compound
+   *    questions, and on anything carrying content it cannot account for — which is what
+   *    keeps a reply mixing a question with field data out of here.
+   * 6. **The answer is sendable.** Validated at save, but `businesses.knowledge` is a
+   *    JSON column that predates its own validation and can be written by hand. An answer
+   *    that would throw in `assertSendable` falls through to the model rather than
+   *    failing the turn — the customer gets a reply either way.
+   *
+   * **What is deliberately *not* a gate: whether required fields are outstanding.** That
+   * was the first version and it made the whole feature dead code — caught only by wiring
+   * it end to end. Fields are outstanding for almost the entire life of a conversation,
+   * and the moment one is not, after completion, a follow-up message starts a *new*
+   * conversation with nothing collected and the gate closed again. It was also the wrong
+   * instrument: what it reached for is "this message is an answer, not a question", and
+   * gates 2-4 say that directly while the matcher's coverage rule handles the mixed
+   * message properly.
+   *
+   * Nothing about the conversation moves: not `collected`, not `questionsAsked`, not the
+   * question flow. Answering a question is not progress through the enquiry, and treating
+   * it as though it were would skip a question the owner needs answered.
+   */
+  private answerFromKnowledge(
+    input: AdvanceInput,
+    pending: PendingChoice | null,
+  ): ConversationDecision | null {
+    const { conversation } = input;
+    const knowledge = input.knowledge ?? [];
+
+    if (knowledge.length === 0) return null;
+    if (conversation.state === 'AWAITING_FIRST_REPLY') return null;
+    if (pending?.stage === 'DESCRIPTION') return null;
+    if (conversation.awaitingField !== null && !looksLikeAQuestion(input.inboundText)) return null;
+
+    const match = matchKnowledge(knowledge, input.inboundText);
+    if (match.reason !== 'matched' || match.entryId === null) {
+      // Logged rather than stored. An unanswered question is worth seeing — it is how the
+      // owner learns which answer to add next — but a column for it is a schema change
+      // with one reader, and `docs/remaining-plan.md` carries it as the follow-up.
+      this.logger.debug(
+        `No stored answer for an inbound message (reason=${match.reason}` +
+          `${match.tiedWith.length > 0 ? `, tied=${match.tiedWith.join(',')}` : ''})`,
+      );
+      return null;
+    }
+
+    const entry = knowledge.find((k) => k.id === match.entryId);
+    const answer = entry?.answer?.trim();
+    if (!entry || !answer) return null;
+
+    try {
+      assertSendable(answer, `knowledge answer ${entry.id}`, MAX_LIST_SEGMENTS);
+    } catch {
+      this.logger.warn(
+        `Stored answer ${entry.id} cannot be sent as SMS — falling back to the model. ` +
+          'It was almost certainly written directly to the database rather than through ' +
+          'the dashboard, which validates charset and length.',
+      );
+      return null;
+    }
+
+    this.logger.log(
+      `Answered from stored knowledge (entry=${entry.id}, confidence=${match.confidence}) — no model call`,
+    );
+
+    return {
+      ...NO_MODEL,
+      state: conversation.state,
+      collected: conversation.collected,
+      // Preserved, so whatever we asked is still outstanding after the detour. Cast the
+      // same way `attributableFields` does — the column is a plain string that round-trips
+      // through the database, and a value that is not a `FieldKey` was already unusable
+      // before this branch existed.
+      awaitingField: conversation.awaitingField as FieldKey | null,
+      questionsAsked: conversation.questionsAsked,
+      needsHuman: conversation.needsHuman,
+      needsHumanReason: conversation.needsHumanReason,
+      // The *parsed* value, preserved rather than cleared: this reply did not resolve or
+      // invalidate an outstanding choice, and clearing one would silently drop a menu the
+      // caller is still expected to answer. `conversation.pendingChoice` is the raw JSON
+      // column and is not the same type.
+      pendingChoice: pending,
+      selectedServiceId: conversation.selectedServiceId ?? null,
+      // The owner's words, verbatim. Nothing rewrites, summarises or generates around
+      // them — the same guarantee `quoteMessage` gives for figures.
+      reply: { kind: 'answer', body: answer },
+      // Always false, and the compiler proves it: gate 2 already returned for the only
+      // state in which a lead is created. Written as a constant rather than as the usual
+      // comparison so it cannot read as an oversight — a lead is never created by
+      // answering a question, because a question is not an enquiry.
+      createLead: false,
+      // Null does not erase a quote already recorded: `quoteColumns` writes no columns
+      // for a null quote. Same as every other non-quoting branch.
+      quote: null,
+      stillMissing: missingRequired(conversation.collected),
+    };
+  }
+
+  /**
    * A reply to the numbered menu. No model, no matcher, no inference.
    *
    * Every branch here either resolves to a service id that was on the list we sent, or
@@ -293,6 +452,17 @@ export class ConversationsService {
     const outcome = resolveSelection(input.inboundText, pending.options, pending.otherPosition);
 
     if (outcome.kind === 'invalid') {
+      // **The best case this feature has, and the first version excluded it.** A caller
+      // who replies to the menu with "do you bring your own supplies?" has not failed to
+      // pick a number — they have asked something the owner already answered. Answering
+      // it and leaving the menu outstanding is strictly better than re-prompting: they
+      // get their answer, and their next reply can still be the number.
+      //
+      // Only reachable once the selection is known to be invalid, so a valid "2" can
+      // never be diverted here.
+      const answered = this.answerFromKnowledge(input, pending);
+      if (answered) return answered;
+
       const reprompts = pending.reprompts + 1;
 
       // Nothing about the conversation moves. Not `collected`, not `selectedServiceId`,

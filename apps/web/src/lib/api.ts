@@ -37,6 +37,8 @@ export interface ApiIssue {
   code: string;
   message: string;
   serviceId: string | null;
+  /** Set instead of `serviceId` when the issue is about a stored answer. */
+  entryId: string | null;
   index: number | null;
 }
 
@@ -84,7 +86,12 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
       // every call is anonymous — which looks exactly like being logged out.
       credentials: 'include',
       headers: {
-        ...(init.body ? { 'Content-Type': 'application/json' } : {}),
+        // A `FormData` body is deliberately left without a content type: the browser
+        // generates one carrying the multipart boundary, and any value set here would
+        // replace it with a boundary-less header the server cannot parse.
+        ...(init.body && !(init.body instanceof FormData)
+          ? { 'Content-Type': 'application/json' }
+          : {}),
         ...init.headers,
       },
     });
@@ -119,6 +126,8 @@ export const api = {
   put: <T>(path: string, body: unknown) =>
     request<T>(path, { method: 'PUT', body: JSON.stringify(body) }),
   delete: <T>(path: string) => request<T>(path, { method: 'DELETE' }),
+  /** A multipart upload. `request` leaves a `FormData` body's content type to the browser. */
+  postForm: <T>(path: string, form: FormData) => request<T>(path, { method: 'POST', body: form }),
 };
 
 // ---------------------------------------------------------------------------
@@ -196,4 +205,46 @@ export interface ServiceRow {
   requiresConfirmation: boolean;
   availability: Availability;
   sortOrder: number;
+}
+
+// ---------------------------------------------------------------------------
+// Document import.
+// ---------------------------------------------------------------------------
+
+/**
+ * A service the model believes it found.
+ *
+ * `sourceExcerpt` is the load-bearing field on the review screen. A price misread from
+ * "from $28.00 per room" is obvious beside the sentence it came from and invisible
+ * without it, which is the difference between a review screen and a rubber stamp.
+ */
+export interface ServiceProposal {
+  name: string;
+  description?: string;
+  pricingType: PricingType;
+  priceCents?: number;
+  unitLabel?: string;
+  sourceExcerpt: string;
+  showPriceAutomatically: false;
+  /** Owner-readable reasons this row cannot be saved yet. Empty means it is fine. */
+  problems: string[];
+}
+
+export interface KnowledgeProposal {
+  question: string;
+  aliases: string[];
+  answer: string;
+  sourceExcerpt: string;
+  problems: string[];
+}
+
+export interface ImportProposal {
+  services: ServiceProposal[];
+  knowledge: KnowledgeProposal[];
+  characters: number;
+}
+
+export interface ImportApplyResult {
+  servicesCreated: number;
+  knowledgeSaved: number;
 }

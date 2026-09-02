@@ -1,4 +1,5 @@
 import { Logger } from '@nestjs/common';
+import { normaliseToGsm7 } from '../common/gsm7';
 import { containsCurrency, parseExtraction, type ParsedExtraction } from './extraction';
 import type { CollectedAnswers } from './question-flow';
 
@@ -597,7 +598,31 @@ export function finaliseCatalogue(
   const body = raw as Record<string, unknown>;
   const rejected: string[] = [];
 
+  /**
+   * One model string, trimmed, length-checked and mapped into GSM-7 lookalikes.
+   *
+   * **The normalisation is not cosmetic.** A live import proved it: asked to transcribe
+   * "equipment - you don't need to provide anything", the model returned an em dash and a
+   * curly apostrophe. Neither is in GSM-7, so the answer would have been flagged
+   * `UNSUPPORTED_CHARACTERS` on the review screen — telling an owner to "use basic
+   * punctuation only" about text they never typed and cannot see the problem with. Left
+   * unfixed it would have made almost every import arrive with rows already broken.
+   *
+   * `normaliseToGsm7` maps lookalikes and stops there, deliberately: a dash is still a
+   * dash and a quote is still a quote, so nothing about the meaning changes. Anything
+   * genuinely outside the charset — an emoji, an accented word — survives to be caught by
+   * validation and shown to the owner, because silently deleting it would turn "Café
+   * cleaning" into "Caf cleaning" behind their back.
+   */
   const text = (value: unknown, max: number): string | undefined => {
+    if (typeof value !== 'string') return undefined;
+    const trimmed = normaliseToGsm7(value).trim();
+    return trimmed.length > 0 && trimmed.length <= max ? trimmed : undefined;
+  };
+
+  /** The document's own words, kept exactly. Never sent as SMS, so never normalised —
+   *  it is evidence, and evidence that has been tidied is worth less. */
+  const verbatim = (value: unknown, max: number): string | undefined => {
     if (typeof value !== 'string') return undefined;
     const trimmed = value.trim();
     return trimmed.length > 0 && trimmed.length <= max ? trimmed : undefined;
@@ -631,7 +656,7 @@ export function finaliseCatalogue(
       unitLabel: text(row.unitLabel, 24),
       // Kept even when empty — the review screen says "no source" rather than pretending
       // the model had one.
-      sourceExcerpt: text(row.sourceExcerpt, 400) ?? '',
+      sourceExcerpt: verbatim(row.sourceExcerpt, 400) ?? '',
     });
   }
 
@@ -647,10 +672,14 @@ export function finaliseCatalogue(
     knowledge.push({
       question,
       aliases: Array.isArray(row.aliases)
-        ? row.aliases.filter((a): a is string => typeof a === 'string' && a.trim().length > 0).slice(0, 8)
+        ? row.aliases
+            .filter((a): a is string => typeof a === 'string')
+            .map((a) => normaliseToGsm7(a).trim())
+            .filter((a) => a.length > 0)
+            .slice(0, 8)
         : [],
       answer,
-      sourceExcerpt: text(row.sourceExcerpt, 400) ?? '',
+      sourceExcerpt: verbatim(row.sourceExcerpt, 400) ?? '',
     });
   }
 

@@ -20,10 +20,31 @@ import { api, UnauthenticatedError, type Session } from '@/lib/api';
  * phone one-handed and the top of a modern screen is out of thumb reach.
  */
 
-const NAV = [
+/**
+ * The rail, in two halves.
+ *
+ * **Hub and Leads are the daily work; the rest is what the system knows about the
+ * business.** Splitting them matters more than it looks: an owner opens this app to deal
+ * with a lead, and three settings screens sitting flat alongside that make the two look
+ * like equal choices. The group label says "these are set up once" without a word of
+ * instruction.
+ *
+ * The label is desktop-only. On the phone bottom bar there is no room for it and no need
+ * — five icons in a row read fine, and a heading in a thumb bar would just eat the space
+ * the tap targets need.
+ */
+type NavItem = { href: string; icon: string; label: string } | { group: string };
+
+const NAV: NavItem[] = [
   { href: '/hub', icon: '◆', label: 'Hub' },
   { href: '/leads', icon: '☰', label: 'Leads' },
+  { group: 'Set up' },
   { href: '/settings/services', icon: '⚙', label: 'Services' },
+  { href: '/settings/knowledge', icon: '?', label: 'Answers' },
+  // Import earns a place of its own rather than living as a tile on the hub. It is the
+  // fastest route from "nothing configured" to a working catalogue, and a screen that
+  // only exists behind another screen is one most owners never find.
+  { href: '/settings/import', icon: '⇪', label: 'Import' },
 ];
 
 export function AppShell({ children }: { children: React.ReactNode }) {
@@ -66,20 +87,29 @@ export function AppShell({ children }: { children: React.ReactNode }) {
   return (
     <div className="shell">
       <nav className="rail" aria-label="Main">
-        {NAV.map((item) => (
-          <Link
-            key={item.href}
-            href={item.href}
-            aria-current={
-              pathname === item.href || (item.href !== '/hub' && pathname.startsWith(item.href))
-                ? 'page'
-                : undefined
-            }
-          >
-            <span className="rail-icon" aria-hidden="true">{item.icon}</span>
-            {item.label}
-          </Link>
-        ))}
+        {NAV.map((item) =>
+          'group' in item ? (
+            // Presentational only. It is not a heading element because it labels nothing
+            // a screen reader can scope to, and announcing it would interrupt a list of
+            // links with a word that adds nothing when heard one item at a time.
+            <span className="rail-group" key={item.group} aria-hidden="true">
+              {item.group}
+            </span>
+          ) : (
+            <Link
+              key={item.href}
+              href={item.href}
+              aria-current={
+                pathname === item.href || (item.href !== '/hub' && pathname.startsWith(item.href))
+                  ? 'page'
+                  : undefined
+              }
+            >
+              <span className="rail-icon" aria-hidden="true">{item.icon}</span>
+              {item.label}
+            </Link>
+          ),
+        )}
       </nav>
       <main className="page">{children}</main>
     </div>

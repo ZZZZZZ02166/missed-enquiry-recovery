@@ -1,5 +1,6 @@
 'use client';
 
+import Link from 'next/link';
 import { useEffect, useState } from 'react';
 import {
   MAX_ACTIVE_SERVICES,
@@ -187,9 +188,14 @@ function Catalogue() {
             Until you add some, callers are asked to describe what they need in their own
             words and nothing is priced automatically.
           </p>
-          <button className="btn btn-primary" disabled={busy} onClick={() => void run(() => api.post('/services/seed-defaults'))}>
-            Start with the usual four
-          </button>
+          <div className="btn-row" style={{ justifyContent: 'center' }}>
+            <button className="btn btn-primary" disabled={busy} onClick={() => void run(() => api.post('/services/seed-defaults'))}>
+              Start with the usual four
+            </button>
+            {/* The empty catalogue is exactly where an owner who has a price list should
+                be offered the shortcut, rather than being left to type it out. */}
+            <Link className="btn" href="/settings/import">Import from a document</Link>
+          </div>
         </div>
       ) : null}
 

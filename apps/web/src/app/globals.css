@@ -152,6 +152,15 @@ a {
   line-height: 1;
 }
 
+/*
+  Hidden on the phone bar, where there is no room for it and five icons read fine on
+  their own. `display: none` rather than visually-hidden: it is decoration, so there is
+  nothing worth keeping for a screen reader either.
+*/
+.rail-group {
+  display: none;
+}
+
 .page {
   width: 100%;
   max-width: 52rem;
@@ -174,6 +183,20 @@ a {
   }
   .rail a {
     width: 100%;
+  }
+  .rail-group {
+    display: block;
+    /* A hairline above the label does the grouping; the word only names it. Together they
+       are quieter than either a heavier rule or a louder label would be on a 76px rail. */
+    margin: 0.6rem 0.35rem 0.1rem;
+    padding-top: 0.6rem;
+    border-top: 1px solid rgb(255 255 255 / 12%);
+    color: rgb(255 255 255 / 38%);
+    font-size: 0.56rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    text-align: center;
   }
   .page {
     padding: 1.6rem 1.6rem 3rem calc(76px + 1.6rem);
